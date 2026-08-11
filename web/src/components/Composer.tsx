@@ -8,30 +8,10 @@ import {
 } from "react";
 import { translate } from "../i18n";
 import type { Attachment, SessionUsage } from "../types";
-const isPdfFile = (file: File): boolean =>
-  file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
 const readFile = async (file: File): Promise<Attachment | null> => {
-  if (isPdfFile(file)) {
-    const dataUrl = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () =>
-        resolve(typeof reader.result === "string" ? reader.result : "");
-      reader.onerror = () =>
-        reject(reader.error ?? new Error("could not read file"));
-      reader.readAsDataURL(file);
-    });
-    return { kind: "pdf", name: file.name, data_url: dataUrl };
-  }
   const text = await file.text();
   return { kind: "text", name: file.name, text };
 };
-const getSettings = async (): Promise<{
-  pdf_max_pages?: number;
-  pdf_max_mb?: number;
-}> => ({});
-const inspectPdf = async (
-  _dataUrl: string,
-): Promise<{ ok: boolean; pages?: number; error?: string }> => ({ ok: true });
 const formatTokens = (value: number) => String(value);
 const totalTokens = (value: SessionUsage) =>
   Object.values(value?.byModel ?? {}).reduce(
@@ -315,54 +295,11 @@ export function Composer(props: Props) {
   const recordingTime = `${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")}`;
 
   // Attach-time PDF thresholds (Settings → Token savings): a PDF over the user's page or
-  // size limit is REJECTED with a visible notice — never attached, never silently dropped.
-  // The rationale is token cost: a big PDF re-rides every turn of the conversation.
   const addFiles = async (files: FileList | File[]) => {
-    const list = Array.from(files);
-    let maxPages = 20;
-    let maxMb = 10;
-    if (list.some(isPdfFile)) {
-      try {
-        const s = await getSettings();
-        if (s.pdf_max_pages) maxPages = s.pdf_max_pages;
-        if (s.pdf_max_mb) maxMb = s.pdf_max_mb;
-      } catch {
-        /* offline settings fetch — fall back to defaults */
-      }
-    }
-    const accepted: File[] = [];
-    for (const file of list) {
-      if (isPdfFile(file) && file.size > maxMb * 1024 * 1024) {
-        showAttachNotice(
-          `${file.name} skipped — ${(file.size / 1024 / 1024).toFixed(1)} MB is over your ${maxMb} MB limit (Settings → Token savings)`,
-        );
-        continue;
-      }
-      accepted.push(file);
-    }
-    const read = (await Promise.all(accepted.map(readFile))).filter(
+    const read = (await Promise.all(Array.from(files).map(readFile))).filter(
       (attachment): attachment is Attachment => attachment !== null,
     );
-    const next: Attachment[] = [];
-    for (const a of read) {
-      if (a.kind === "pdf" && a.data_url) {
-        const info = await inspectPdf(a.data_url).catch(() => null);
-        if (info?.ok && (info.pages ?? 0) > maxPages) {
-          showAttachNotice(
-            `${a.name} skipped — ${info.pages} pages is over your ${maxPages}-page limit (Settings → Token savings)`,
-          );
-          continue;
-        }
-        if (info && !info.ok) {
-          showAttachNotice(
-            `${a.name} skipped — ${info.error || "could not read PDF"}`,
-          );
-          continue;
-        }
-      }
-      next.push(a);
-    }
-    if (next.length) setAttachments((a) => mergeAttachments(a, next));
+    if (read.length) setAttachments((a) => mergeAttachments(a, read));
   };
 
   const needsModel = props.modelReady === false;
@@ -976,21 +913,135 @@ export function PlusMenu({
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const wrapRef = useRef<HTMLSpanElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [menuStyle, setMenuStyle] = useState<{
+    top: number;
+    left: number;
+    maxHeight: number;
+  } | null>(null);
+  const [openSubmenu, setOpenSubmenu] = useState<string | null>(null);
+  const [submenuStyle, setSubmenuStyle] = useState<{
+    top: number;
+    left: number;
+    maxHeight: number;
+  } | null>(null);
+  const submenuRef = useRef<HTMLDivElement>(null);
+  const submenuTriggerRefs = useRef<Record<string, HTMLButtonElement | null>>(
+    {},
+  );
+  const openSubmenuRef = useRef<string | null>(null);
+  openSubmenuRef.current = openSubmenu;
+  const closeMenu = (restoreFocus = true) => {
+    onOpenChange(false);
+    if (restoreFocus) triggerRef.current?.focus();
+  };
   useEffect(() => {
     if (!open) return;
     const close = (event: MouseEvent) => {
-      if (!wrapRef.current?.contains(event.target as Node)) onOpenChange(false);
+      if (!wrapRef.current?.contains(event.target as Node)) closeMenu();
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        if (openSubmenuRef.current) {
+          const submenu = openSubmenuRef.current;
+          setOpenSubmenu(null);
+          submenuTriggerRefs.current[submenu]?.focus();
+        } else {
+          closeMenu();
+        }
+      }
     };
     document.addEventListener("mousedown", close);
-    return () => document.removeEventListener("mousedown", close);
-  }, [open, onOpenChange]);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", escape);
+    };
+  }, [open, openSubmenu]);
+  useLayoutEffect(() => {
+    if (!open || !menuRef.current || !triggerRef.current) return;
+    const trigger = triggerRef.current.getBoundingClientRect();
+    const menu = menuRef.current.getBoundingClientRect();
+    const margin = 8;
+    const maxHeight = Math.max(80, window.innerHeight - margin * 2);
+    const height = Math.min(menu.height, maxHeight);
+    const left = Math.min(
+      Math.max(margin, trigger.left),
+      Math.max(margin, window.innerWidth - menu.width - margin),
+    );
+    const above = trigger.top - menu.height - 6;
+    const top =
+      above >= margin
+        ? above
+        : Math.min(
+            trigger.bottom + 6,
+            Math.max(margin, window.innerHeight - height - margin),
+          );
+    setMenuStyle({ top, left, maxHeight });
+    menuRef.current
+      .querySelector<HTMLButtonElement>("button:not(:disabled)")
+      ?.focus();
+  }, [open, assets.length, secrets.length]);
+  useEffect(() => {
+    if (!openSubmenu) return;
+    const trigger = submenuTriggerRefs.current[openSubmenu];
+    if (trigger && submenuRef.current) {
+      const triggerRect = trigger.getBoundingClientRect();
+      const submenuRect = submenuRef.current.getBoundingClientRect();
+      const margin = 8;
+      const gap = 4;
+      const maxHeight = Math.max(80, window.innerHeight - margin * 2);
+      const height = Math.min(submenuRect.height, maxHeight);
+      const left =
+        triggerRect.right + gap + submenuRect.width <=
+        window.innerWidth - margin
+          ? triggerRect.right + gap
+          : Math.max(margin, triggerRect.left - submenuRect.width - gap);
+      const top = Math.min(
+        Math.max(margin, triggerRect.top),
+        Math.max(margin, window.innerHeight - height - margin),
+      );
+      setSubmenuStyle({ top, left, maxHeight });
+    }
+    submenuRef.current
+      ?.querySelector<HTMLButtonElement>("button:not(:disabled)")
+      ?.focus();
+  }, [openSubmenu]);
   const upload = () => {
-    onOpenChange(false);
+    closeMenu();
     fileRef.current?.click();
   };
   const assetItems = assets.filter((asset) =>
     ["agents", "knowledge", "playbook", "skill"].includes(asset.kind),
   );
+  const categories = [
+    {
+      kind: "agents",
+      label: "Rules",
+      reference: "@AGENTS.md",
+      icon: "shield" as const,
+    },
+    {
+      kind: "knowledge",
+      label: "Knowledge",
+      reference: "@Knowledge",
+      icon: "inbox" as const,
+    },
+    {
+      kind: "playbook",
+      label: "Playbooks",
+      reference: "@Playbook",
+      icon: "board" as const,
+    },
+    {
+      kind: "skill",
+      label: "Skills",
+      reference: "@Skill",
+      icon: "wrench" as const,
+    },
+  ];
   return (
     <span className="plus-menu-wrap" ref={wrapRef}>
       <input
@@ -1005,70 +1056,175 @@ export function PlusMenu({
         }}
       />
       <button
+        ref={triggerRef}
         className="icon-btn"
         type="button"
         aria-label="更多功能"
         title="更多功能"
+        aria-expanded={open}
+        aria-haspopup="menu"
         onClick={() => onOpenChange(!open)}
       >
         +
       </button>
       {open && (
-        <div className="plus-menu">
+        <div
+          ref={menuRef}
+          className="plus-menu"
+          role="menu"
+          style={menuStyle ?? undefined}
+        >
           {onUpload && (
-            <button type="button" onClick={upload}>
-              <span className="pm-icon">＋</span>
-              上传附件
+            <button type="button" role="menuitem" onClick={upload}>
+              <Icon name="file" size={15} className="pm-icon" />
+              Upload attachment
             </button>
           )}
           <div className="pm-divider" />
-          {[
-            { kind: "agents", label: "规则", reference: "@AGENTS.md" },
-            { kind: "knowledge", label: "知识库", reference: "@Knowledge" },
-            { kind: "playbook", label: "运行手册", reference: "@Playbook" },
-            { kind: "skill", label: "技能", reference: "@Skill" },
-          ].map((category) => {
+          {categories.map((category) => {
             const matching = assetItems.filter(
               (asset) => asset.kind === category.kind,
             );
-            return matching.length > 0 ? (
-              matching.map((asset) => (
+            const hasSubmenu = matching.length > 0;
+            return (
+              <div className="pm-group" key={category.kind}>
                 <button
+                  ref={(element) => {
+                    submenuTriggerRefs.current[category.kind] = element;
+                  }}
                   type="button"
-                  key={`${asset.kind}:${asset.title}`}
-                  onClick={() => onInsert(`@${asset.kind}:${asset.title}`)}
+                  role="menuitem"
+                  aria-haspopup={hasSubmenu ? "menu" : undefined}
+                  aria-expanded={hasSubmenu && openSubmenu === category.kind}
+                  onKeyDown={(event) => {
+                    if (
+                      hasSubmenu &&
+                      (event.key === "Enter" || event.key === "ArrowRight")
+                    ) {
+                      event.preventDefault();
+                      setOpenSubmenu(category.kind);
+                    }
+                  }}
+                  onClick={() => {
+                    if (hasSubmenu) {
+                      setOpenSubmenu((value) =>
+                        value === category.kind ? null : category.kind,
+                      );
+                    } else {
+                      closeMenu(false);
+                      onInsert(category.reference);
+                    }
+                  }}
                 >
-                  <span className="pm-icon">@</span>
-                  {category.label}: {asset.title}
+                  <Icon name={category.icon} size={15} className="pm-icon" />
+                  <span>{category.label}</span>
+                  {hasSubmenu && (
+                    <Icon
+                      name="chevronRight"
+                      size={13}
+                      className="pm-chevron"
+                    />
+                  )}
                 </button>
-              ))
-            ) : (
-              <button
-                type="button"
-                key={category.kind}
-                onClick={() => onInsert(category.reference)}
-              >
-                <span className="pm-icon">@</span>
-                {category.label}
-              </button>
+                {hasSubmenu && openSubmenu === category.kind && (
+                  <div
+                    ref={submenuRef}
+                    className="pm-submenu"
+                    role="menu"
+                    aria-label={`${category.label} items`}
+                    style={submenuStyle ?? undefined}
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape" || event.key === "ArrowLeft") {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        setOpenSubmenu(null);
+                        submenuTriggerRefs.current[category.kind]?.focus();
+                      }
+                    }}
+                  >
+                    {matching.map((asset) => (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        key={`${asset.kind}:${asset.title}`}
+                        onClick={() => {
+                          closeMenu(false);
+                          onInsert(`@${asset.kind}:${asset.title}`);
+                        }}
+                      >
+                        <Icon name="file" size={14} className="pm-icon" />
+                        {asset.title}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             );
           })}
           <div className="pm-divider" />
           {secrets.length > 0 ? (
-            secrets.map((secret) => (
+            <div className="pm-group">
               <button
+                ref={(element) => {
+                  submenuTriggerRefs.current.secrets = element;
+                }}
                 type="button"
-                key={secret.name}
-                onClick={() => onInsert(`secret:session:${secret.name}`)}
+                role="menuitem"
+                aria-haspopup="menu"
+                aria-expanded={openSubmenu === "secrets"}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === "ArrowRight") {
+                    event.preventDefault();
+                    setOpenSubmenu("secrets");
+                  }
+                }}
+                onClick={() =>
+                  setOpenSubmenu((value) =>
+                    value === "secrets" ? null : "secrets",
+                  )
+                }
               >
-                <span className="pm-icon">⌕</span>
-                密钥：{secret.name}
+                <Icon name="shield" size={15} className="pm-icon" />
+                <span>Secrets</span>
+                <Icon name="chevronRight" size={13} className="pm-chevron" />
               </button>
-            ))
+              {openSubmenu === "secrets" && (
+                <div
+                  ref={submenuRef}
+                  className="pm-submenu"
+                  role="menu"
+                  aria-label="Secrets items"
+                  style={submenuStyle ?? undefined}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape" || event.key === "ArrowLeft") {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setOpenSubmenu(null);
+                      submenuTriggerRefs.current.secrets?.focus();
+                    }
+                  }}
+                >
+                  {secrets.map((secret) => (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      key={secret.name}
+                      onClick={() => {
+                        closeMenu(false);
+                        onInsert(`secret:session:${secret.name}`);
+                      }}
+                    >
+                      <Icon name="shield" size={14} className="pm-icon" />
+                      {secret.name}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           ) : (
-            <button type="button" disabled>
-              <span className="pm-icon">⌕</span>
-              密钥引用（暂无已配置密钥）
+            <button type="button" role="menuitem" disabled>
+              <Icon name="shield" size={15} className="pm-icon" />
+              Secrets
             </button>
           )}
         </div>

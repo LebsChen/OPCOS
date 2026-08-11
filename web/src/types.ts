@@ -120,12 +120,12 @@ export interface SessionInfo {
   project_id?: string | null;
 }
 
-// Attachments (images, PDFs, text files) sent with a user message.
+// Image and text attachments sent with a user message.
 export interface Attachment {
-  kind: "image" | "text" | "pdf";
+  kind: "image" | "text";
   name: string;
   mime?: string;
-  data_url?: string; // images + PDFs
+  data_url?: string; // images
   text?: string; // text files
 }
 
