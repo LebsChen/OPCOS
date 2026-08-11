@@ -268,7 +268,6 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
   let work: Extract<TimelineNode, { kind: "work" }> | null = null;
   let workStarted = 0;
   let workEnded = 0;
-  let sleepPending = false;
   let pendingThought:
     | { row: Extract<TimelineNode, { kind: "work" }>["rows"][number] }
     | undefined;
@@ -380,7 +379,6 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     if (!type) continue;
     const data = payload(event);
     if (type === "user_message" || type === "initial_user_message") {
-      sleepPending = false;
       flush(event.created_at_ms);
       nodes.push({
         kind: "user",
@@ -468,7 +466,12 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         String(data.stop_reason ?? "").toLowerCase() === "finished"
       ) {
         flush(event.created_at_ms);
-        sleepPending = true;
+        nodes.push({
+          kind: "notice",
+          text: "Turn complete — waiting for your next instruction",
+          tone: "info",
+          noticeKind: "turn_finished",
+        });
       }
     } else if (
       [
@@ -970,7 +973,6 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     }
   }
   flush(workEnded || events.at(-1)?.created_at_ms || workStarted);
-  if (sleepPending) nodes.push({ kind: "sleep", text: "OPCOS went to sleep" });
   return nodes;
 }
 

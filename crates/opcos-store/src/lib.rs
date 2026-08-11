@@ -5826,13 +5826,17 @@ impl SqliteStore {
     }
 
     pub fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), StoreError> {
-        self.connection
+        let changed = self
+            .connection
             .lock()
             .expect("sqlite mutex poisoned")
             .execute(
                 "UPDATE sessions SET mode=?1, updated_at=?2 WHERE session_id=?3",
                 params![mode, Utc::now().to_rfc3339(), session_id],
             )?;
+        if changed == 0 {
+            return Err(StoreError::SessionNotFound(session_id.into()));
+        }
         Ok(())
     }
 
@@ -6850,6 +6854,50 @@ mod tests {
         let session = store.load_session("status-session").unwrap().unwrap();
         assert_eq!(session.run_state, "error");
         assert_eq!(session.stop_reason, "host_unavailable");
+    }
+
+    #[test]
+    fn session_mode_updates_and_missing_sessions_fail_loudly() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let now = Utc::now();
+        store
+            .save_session(&SessionRecord {
+                session_id: "mode-session".into(),
+                workspace: "/workspace".into(),
+                model: "test".into(),
+                mode: "Auto".into(),
+                harness: "builtin".into(),
+                title: "Mode".into(),
+                extra_roots: vec![],
+                grants: serde_json::json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: serde_json::json!({}),
+                host_id: "host".into(),
+                provider: None,
+                external_session_id: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                created_at: now,
+                updated_at: now,
+                project_id: None,
+                agent_id: None,
+            })
+            .unwrap();
+
+        store
+            .update_session_mode("mode-session", "Interactive")
+            .unwrap();
+        assert_eq!(
+            store.load_session("mode-session").unwrap().unwrap().mode,
+            "Interactive"
+        );
+        assert!(matches!(
+            store.update_session_mode("missing-session", "Interactive"),
+            Err(StoreError::SessionNotFound(id)) if id == "missing-session"
+        ));
     }
 
     #[test]

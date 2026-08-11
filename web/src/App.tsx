@@ -28,6 +28,7 @@ import {
   errorMessage,
   effectiveRunningState,
   mergeSessionsPreservingOptimistic,
+  normalizeSession,
   pendingQuestionFromPayload,
   reconcileRunningState,
   redactApproval,
@@ -11246,7 +11247,7 @@ function AppContent() {
   const setSelected = (
     next: Session | null | ((current: Session | null) => Session | null),
   ) => {
-    const resolved =
+    const rawResolved =
       typeof next === "function"
         ? next(
             selectedSessionFromList(
@@ -11255,6 +11256,7 @@ function AppContent() {
             ) ?? lastSelectedSessionRef.current,
           )
         : next;
+    const resolved = rawResolved ? normalizeSession(rawResolved) : null;
     if (!resolved) {
       if (typeof next === "function") return;
       selectedIdRef.current = undefined;
@@ -11571,7 +11573,7 @@ function AppContent() {
   const refresh = async () => {
     const [
       nextHosts,
-      nextSessions,
+      rawNextSessions,
       nextAssets,
       nextProviders,
       nextSecrets,
@@ -11585,6 +11587,7 @@ function AppContent() {
       command<InboxRecord[]>("list_inbox"),
     ]);
     setHosts(nextHosts);
+    const nextSessions = rawNextSessions.map(normalizeSession);
     const optimisticSessionIds = new Set(optimisticSessionIdsRef.current);
     const nextSelectedId = reconcileSelectedIdAfterRefresh(
       selectedIdRef.current ?? null,
@@ -12093,19 +12096,21 @@ function AppContent() {
       text.split(/\r?\n/, 1)[0].trim().slice(0, 80) || "New session";
     try {
       setRunning(true);
-      const next = await command<Session>("create_session", {
-        title,
-        hostId: homeHostId,
-        model: homeModel || "auto",
-        provider: homeProvider || null,
-        mode: homeMode,
-        harness: homeHarness,
-        workspace: homeWorkspace || null,
-        systemPrompt:
-          [homeRole ? `你的角色是：${homeRole}` : "", homeSystemPrompt]
-            .filter(Boolean)
-            .join("\n\n") || null,
-      });
+      const next = normalizeSession(
+        await command<Session>("create_session", {
+          title,
+          hostId: homeHostId,
+          model: homeModel || "auto",
+          provider: homeProvider || null,
+          mode: homeMode,
+          harness: homeHarness,
+          workspace: homeWorkspace || null,
+          systemPrompt:
+            [homeRole ? `你的角色是：${homeRole}` : "", homeSystemPrompt]
+              .filter(Boolean)
+              .join("\n\n") || null,
+        }),
+      );
       setSelected(next);
       setSurface("session");
       setHomeInput("");

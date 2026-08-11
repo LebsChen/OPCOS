@@ -12,6 +12,8 @@ import {
   reconcileRunningState,
   effectiveRunningState,
   mergeSessionsPreservingOptimistic,
+  normalizePermissionMode,
+  normalizeSession,
   reconcileSelectedIdAfterRefresh,
   selectedSessionFromList,
   sessionViewSelection,
@@ -22,6 +24,24 @@ import {
 } from "./gui";
 
 describe("GUI boundary behavior", () => {
+  it("normalizes persisted permission modes at the frontend boundary", () => {
+    expect(normalizePermissionMode("Interactive")).toBe("interactive");
+    expect(normalizePermissionMode("Auto")).toBe("auto");
+    expect(normalizePermissionMode("Discuss")).toBe("discuss");
+    expect(normalizePermissionMode("future-mode")).toBe("future-mode");
+    expect(
+      normalizeSession({
+        id: "s",
+        title: "task",
+        host_id: "h",
+        host_name: "Host",
+        model: "auto",
+        mode: "Interactive",
+        harness: "builtin",
+      }).mode,
+    ).toBe("interactive");
+  });
+
   it("matches project agents to existing sessions without inferring hierarchy", () => {
     const agents = [
       {
