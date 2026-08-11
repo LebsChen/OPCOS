@@ -13667,7 +13667,6 @@ async fn ide_url(
         .ide_auth_cookies(&folder_uri)
         .await
         .map_err(|error| error.to_string())?;
-    eprintln!("remote IDE bootstrap returned {} cookies", cookies.len());
     let host = url
         .host_str()
         .ok_or_else(|| "Remote Web IDE URL has no host".to_owned())?;
@@ -13685,7 +13684,6 @@ async fn ide_url(
             .set_cookie(cookie)
             .map_err(|error| format!("Could not set remote IDE cookie: {error}"))?;
     }
-    eprintln!("remote IDE cookies planted for host origin");
     Ok(url.to_string())
 }
 
