@@ -11878,7 +11878,10 @@ function AppContent() {
         setRunning((previous) =>
           reconcileRunningState(previous, { kind: "turn_done", runState }),
         );
-        if (payload.session_id) {
+        if (
+          payload.session_id &&
+          payload.session_id === selectedIdRef.current
+        ) {
           void command<
             Array<{
               session_id: string;

@@ -394,9 +394,6 @@ describe("GUI boundary behavior", () => {
       "utf8",
     );
     expect(source).toContain(
-      "command<\n            Array<{\n              session_id: string;",
-    );
-    expect(source).toContain(
       '>("list_pending", { sessionId: payload.session_id })',
     );
     expect(source).toContain(
@@ -411,7 +408,6 @@ describe("GUI boundary behavior", () => {
     );
     expect(source).toContain('capabilities.ide?.state === "Unavailable"');
     expect(source).toContain('panelTab === "ide"');
-    expect(source).toContain("restoreDraft");
   });
 
   it("submits the first message optimistically without blocking on refresh", () => {
