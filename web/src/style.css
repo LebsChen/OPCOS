@@ -1555,12 +1555,45 @@ h3 {
   justify-content: center;
   max-width: none;
 }
+.session-title-trigger,
+.session-title-input {
+  width: min(460px, 100%);
+  min-width: 0;
+  max-width: 100%;
+  font: inherit;
+  line-height: 1.2;
+}
+.session-title-trigger {
+  display: block;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.session-title-trigger:focus-visible,
+.session-title-input:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+.session-title-input {
+  box-sizing: border-box;
+  height: 18px;
+  padding: 0 2px;
+  border: 1px solid var(--color-accent);
+  border-radius: 3px;
+  background: var(--column-surface);
+  color: var(--color-ink);
+}
 .app.session-layout .main-chat {
   padding-top: var(--session-header-height, 52px);
   background: var(--column-surface);
 }
 .app.session-layout .main-scroll {
-  padding: 24px 32px;
+  padding: 24px 37px;
 }
 .app.session-layout .composer-wrap {
   padding-right: 32px;
