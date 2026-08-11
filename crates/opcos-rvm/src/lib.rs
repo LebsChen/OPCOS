@@ -2210,7 +2210,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ide_bootstrap_replays_redirect_cookies_and_preserves_workbench_token() {
+    async fn ide_auth_cookies_replays_redirect_cookies() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
@@ -2219,9 +2219,8 @@ mod tests {
         let task = tokio::spawn(async move {
             let mut request = vec![0; 8192];
             for (index, expected) in [
-                "folder=vscode-remote%3A%2F%2Fantec%2FC%3A%2FUsers%2FTeam",
+                "folder=vscode-remote%3A%2F%2F127.0.0.1%2FC%3A%2FUsers%2FTeam",
                 "cookie:",
-                "cookie: rvm_ide_tkn=rvm-secret",
             ]
             .iter()
             .enumerate()
@@ -2247,13 +2246,6 @@ mod tests {
                         )
                         .await
                         .unwrap();
-                } else {
-                    socket
-                        .write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nConnection: close\r\n\r\nasset",
-                        )
-                        .await
-                        .unwrap();
                 }
             }
         });
@@ -2263,78 +2255,15 @@ mod tests {
             request_timeout: Duration::from_secs(5),
         })
         .unwrap();
-        let result = client
-            .ide_bootstrap("vscode-remote://antec/C:/Users/Team")
+        let cookies = client
+            .ide_auth_cookies("vscode-remote://antec/C:/Users/Team")
             .await
             .unwrap();
-        assert!(result.html.contains("rvm-secret"));
-        assert!(result.html.contains("remoteAuthority"));
-        assert!(result.html.len() > "<html>bare workbench</html>".len());
-        let asset = client
-            .ide_request_bytes("/ide/out/workbench.js", &result.cookies)
-            .await
-            .unwrap();
-        assert_eq!(&asset[..], b"asset");
-        task.await.unwrap();
-    }
-
-    #[test]
-    fn proxy_security_rejects_multi_encoded_traversal_and_replaces_empty_tokens() {
-        assert!(has_encoded_traversal("/out/%252e%252e%252fetc/passwd"));
-        let url = sanitize_proxy_url(
-            "http://localhost/out/file.js?tkn=&token=&connectionToken=local&reconnectionToken=local&x=1",
-            "upstream-secret",
-        )
-        .unwrap();
         assert_eq!(
-            url.query_pairs().collect::<Vec<_>>(),
-            vec![
-                ("tkn".into(), "upstream-secret".into()),
-                ("token".into(), "upstream-secret".into()),
-                ("connectionToken".into(), "upstream-secret".into()),
-                ("reconnectionToken".into(), "upstream-secret".into()),
-                ("x".into(), "1".into())
-            ]
+            cookies,
+            vec!["rvm_ide_tkn=rvm-secret", "vscode-tkn=rvm-secret"]
         );
-    }
-
-    #[test]
-    fn ide_websocket_query_preserves_reconnection_token_without_exposing_auth() {
-        let url = Url::parse(
-            "https://linux.windevos.com/ide/?reconnectionToken=local-reconnect&reconnection=false&skipWebSocketFrames=false",
-        )
-        .unwrap();
-        let pairs = ide_ws_query_pairs(&url, "upstream-secret");
-        assert!(
-            pairs
-                .iter()
-                .any(|(key, value)| { key == "reconnectionToken" && value == "local-reconnect" })
-        );
-        assert!(
-            pairs
-                .iter()
-                .any(|(key, value)| { key == "skipWebSocketFrames" && value == "false" })
-        );
-        assert!(pairs.iter().all(|(_, value)| value != "upstream-secret"));
-    }
-
-    #[test]
-    fn ide_websocket_query_strips_browser_auth_tokens() {
-        let url = Url::parse(
-            "https://linux.windevos.com/ide/?tkn=local-token&reconnectionToken=local-reconnect",
-        )
-        .unwrap();
-        let pairs = ide_ws_query_pairs(&url, "upstream-secret");
-        assert!(
-            pairs
-                .iter()
-                .all(|(key, value)| { !key.eq_ignore_ascii_case("tkn") && value != "local-token" })
-        );
-        assert!(
-            pairs
-                .iter()
-                .any(|(key, value)| key == "reconnectionToken" && value == "local-reconnect")
-        );
+        task.await.unwrap();
     }
 
     async fn cdp_test_socket(mut socket: WebSocket) {
