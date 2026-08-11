@@ -10103,6 +10103,75 @@ type FileChange = {
   edits: Array<Record<string, unknown>>;
 };
 
+function LayoutSplitter({
+  label,
+  value,
+  onChange,
+  onCollapse,
+  collapseThreshold,
+  maxValue,
+  className,
+}: {
+  label: string;
+  value: number;
+  onChange: (value: number) => void;
+  onCollapse?: () => void;
+  collapseThreshold?: number;
+  maxValue?: number;
+  className?: string;
+}) {
+  const applyValue = (next: number) => {
+    const bounded =
+      maxValue === undefined ? next : Math.min(next, Math.max(1, maxValue));
+    if (collapseThreshold !== undefined && bounded <= collapseThreshold) {
+      onCollapse?.();
+      return true;
+    }
+    onChange(bounded);
+    return false;
+  };
+  return (
+    <div
+      className={`layout-splitter${className ? ` ${className}` : ""}`}
+      role="separator"
+      aria-label={label}
+      aria-orientation="vertical"
+      aria-valuenow={Math.round(value)}
+      tabIndex={0}
+      onKeyDown={(event) => {
+        if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+        event.preventDefault();
+        applyValue(value + (event.key === "ArrowLeft" ? -16 : 16));
+      }}
+      onPointerDown={(event) => {
+        event.preventDefault();
+        try {
+          event.currentTarget.setPointerCapture(event.pointerId);
+        } catch {
+          // Synthetic pointer events used by automated checks have no active pointer.
+        }
+        const startX = event.clientX;
+        const startValue = value;
+        const direction = label.includes("right") ? -1 : 1;
+        let stop = () => {};
+        const move = (moveEvent: PointerEvent) => {
+          if (
+            applyValue(startValue + direction * (moveEvent.clientX - startX))
+          ) {
+            stop();
+          }
+        };
+        stop = () => {
+          window.removeEventListener("pointermove", move);
+          window.removeEventListener("pointerup", stop);
+        };
+        window.addEventListener("pointermove", move);
+        window.addEventListener("pointerup", stop, { once: true });
+      }}
+    />
+  );
+}
+
 function ChangesPane({ selected }: { selected: Session }) {
   const [items, setItems] = useState<FileChange[]>([]);
   const [gitDiff, setGitDiff] = useState<Record<string, unknown> | null>(null);
@@ -10500,6 +10569,8 @@ function SessionRightPanel({
   onCollapsedChange,
   width,
   onWidthChange,
+  maxWidth,
+  onCollapse,
   eventRefreshKey,
   transcript,
   focusTabRequest,
@@ -10514,6 +10585,8 @@ function SessionRightPanel({
   onCollapsedChange?: (collapsed: boolean) => void;
   width: number;
   onWidthChange: (width: number) => void;
+  maxWidth: number;
+  onCollapse: () => void;
   eventRefreshKey: string;
   transcript: TimelineEvent[];
   focusTabRequest?: { tab: PanelTab; requestId: number } | null;
@@ -10829,28 +10902,14 @@ function SessionRightPanel({
         </div>
       )}
       {!collapsed && (
-        <div
+        <LayoutSplitter
+          label="Resize right session panel"
+          value={width}
+          collapseThreshold={260}
+          maxValue={maxWidth}
+          onCollapse={onCollapse}
           className="session-panel-resizer"
-          role="separator"
-          aria-label="Resize session panel"
-          onPointerDown={(event) => {
-            event.currentTarget.setPointerCapture(event.pointerId);
-            const startX = event.clientX;
-            const startWidth = width;
-            const move = (moveEvent: PointerEvent) => {
-              const next = Math.min(
-                460,
-                Math.max(308, startWidth + startX - moveEvent.clientX),
-              );
-              onWidthChange(next);
-            };
-            const stop = () => {
-              window.removeEventListener("pointermove", move);
-              window.removeEventListener("pointerup", stop);
-            };
-            window.addEventListener("pointermove", move);
-            window.addEventListener("pointerup", stop, { once: true });
-          }}
+          onChange={onWidthChange}
         />
       )}
       <div className="icon-rail session-icon-rail">
@@ -11276,7 +11335,17 @@ function AppContent() {
   }, [transcript, effectiveRunning]);
   const [drawerCollapsed, setDrawerCollapsed] = useState(false);
   const [rightPanelWidth, setRightPanelWidth] = useState(() =>
-    Math.min(Math.round(window.innerWidth * 0.3), 460),
+    Math.max(
+      1,
+      Number(localStorage.getItem("opcos:session-right-width:v1")) ||
+        Math.round(window.innerWidth * 0.3),
+    ),
+  );
+  const [navWidth, setNavWidth] = useState(() =>
+    Math.max(
+      1,
+      Number(localStorage.getItem("opcos:session-nav-width:v1")) || 276,
+    ),
   );
   const [navCollapsed, setNavCollapsed] = useState(
     () => localStorage.getItem(NAV_COLLAPSED_KEY) === "1",
@@ -11286,6 +11355,13 @@ function AppContent() {
     setNavCollapsed(next);
     localStorage.setItem(NAV_COLLAPSED_KEY, next ? "1" : "0");
   };
+  useEffect(() => {
+    localStorage.setItem(
+      "opcos:session-right-width:v1",
+      String(rightPanelWidth),
+    );
+    localStorage.setItem("opcos:session-nav-width:v1", String(navWidth));
+  }, [navWidth, rightPanelWidth]);
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "b") {
@@ -12076,6 +12152,7 @@ function AppContent() {
       style={
         {
           "--right-panel-width": `${drawerCollapsed ? 44 : rightPanelWidth}px`,
+          "--nav-panel-width": `${navCollapsed ? 56 : navWidth}px`,
         } as CSSProperties
       }
     >
@@ -12160,6 +12237,21 @@ function AppContent() {
         collapsed={navCollapsed}
         onCollapse={toggleNav}
       />
+      {surface === "session" && selected && !navCollapsed && (
+        <LayoutSplitter
+          label="Resize left session list"
+          value={navWidth}
+          collapseThreshold={180}
+          maxValue={
+            window.innerWidth -
+            (drawerCollapsed ? 44 : rightPanelWidth) -
+            6 -
+            320
+          }
+          onCollapse={toggleNav}
+          onChange={setNavWidth}
+        />
+      )}
       <main className="main">
         {surface === "project" && selectedProject ? (
           <ProjectBoard
@@ -12794,6 +12886,10 @@ function AppContent() {
           onCollapsedChange={setDrawerCollapsed}
           width={rightPanelWidth}
           onWidthChange={setRightPanelWidth}
+          maxWidth={
+            window.innerWidth - (navCollapsed ? 56 : navWidth) - 6 - 320
+          }
+          onCollapse={() => setDrawerCollapsed(true)}
         />
       )}
     </div>

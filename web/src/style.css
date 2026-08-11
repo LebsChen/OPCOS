@@ -59,10 +59,10 @@ button:disabled {
   grid-template-columns: 276px minmax(0, 1fr) var(--right-panel-width, 360px);
   height: 100vh;
   overflow: hidden;
-  background: var(--color-panel);
+  background: var(--column-surface);
 }
 .app.session-layout {
-  grid-template-columns: 276px minmax(320px, 1fr);
+  grid-template-columns: var(--nav-panel-width, 276px) 6px minmax(320px, 1fr);
 }
 .app.session-layout > .main {
   margin-right: 0;
@@ -100,8 +100,11 @@ button:disabled {
   flex-direction: column;
   min-height: 0;
   border-right: 1px solid var(--color-line);
-  background: var(--panel);
+  background: var(--column-surface);
   color: var(--ink);
+}
+.app.session-layout:not(.nav-collapsed) .sidebar {
+  border-right: 0;
 }
 /* Cloud-Dev-style collapsed navigation stays in the layout as an icon rail. */
 .app.nav-collapsed {
@@ -109,6 +112,9 @@ button:disabled {
 }
 .app.nav-collapsed.session-layout {
   grid-template-columns: 56px minmax(320px, 1fr);
+}
+.app.nav-collapsed.session-layout > .main {
+  grid-column: 2;
 }
 .app.nav-collapsed.session-layout.session-drawer-collapsed {
   grid-template-columns: 56px minmax(320px, 1fr);
@@ -171,6 +177,7 @@ button:disabled {
   padding: 0 18px;
   font-size: 16px;
   letter-spacing: -0.02em;
+  border-bottom: 1px solid var(--color-line);
 }
 .brand-wordmark {
   display: flex;
@@ -405,9 +412,35 @@ select:focus {
   background: var(--paper);
 }
 .app.session-layout > .main {
-  grid-column: 2;
+  grid-column: 3;
   grid-row: 1;
   min-width: 0;
+  background: var(--column-surface);
+}
+.layout-splitter {
+  position: relative;
+  z-index: 8;
+  width: 6px;
+  min-width: 6px;
+  cursor: col-resize;
+  background: transparent;
+  touch-action: none;
+  user-select: none;
+}
+.layout-splitter::before {
+  content: "";
+  position: absolute;
+  inset: 0 2px;
+  background: var(--color-line);
+}
+.layout-splitter:hover,
+.layout-splitter:focus-visible {
+  outline: none;
+  background: var(--color-accent-soft);
+}
+.layout-splitter:hover::before,
+.layout-splitter:focus-visible::before {
+  background: var(--color-accent);
 }
 .main-topbar {
   position: relative;
@@ -1108,7 +1141,7 @@ h3 {
 .right-rail {
   min-width: 0;
   overflow: hidden;
-  background: var(--panel);
+  background: var(--column-surface);
   padding: 0;
 }
 
@@ -1138,7 +1171,7 @@ h3 {
   flex: 1;
   display: flex;
   flex-direction: column;
-  background: var(--panel);
+  background: var(--column-surface);
 }
 .icon-rail,
 .session-icon-rail {
@@ -1154,7 +1187,7 @@ h3 {
   overflow-y: auto;
   overflow-x: hidden;
   border-left: 1px solid var(--color-line);
-  background: var(--panel);
+  background: var(--column-surface);
 }
 .session-icon-rail::-webkit-scrollbar {
   width: 0;
@@ -1230,19 +1263,21 @@ h3 {
   top: 0;
   left: 0;
   bottom: 0;
-  width: 7px;
-  margin-left: -3px;
+  width: 12px;
+  margin-left: -6px;
   cursor: col-resize;
-  z-index: 2;
+  z-index: 8;
   background: transparent;
+  touch-action: none;
+  user-select: none;
 }
 .session-panel-resizer::before {
   content: "";
   position: absolute;
   top: 0;
   bottom: 0;
-  left: 3px;
-  width: 1px;
+  left: 5px;
+  width: 2px;
   background: var(--color-line);
 }
 .session-panel-resizer:hover {
@@ -1481,22 +1516,41 @@ h3 {
 /* Session chat uses the OpenWorker topbar/workspace geometry. The session drawer remains
    OPCOS-specific; its width is the only layout value supplied by the adapter. */
 .app.session-layout .main-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   position: absolute;
   inset: 0 0 auto 0;
   height: 48px;
   min-height: 0;
   padding: 0 14px 0 20px;
   border-bottom: 0;
-  background: color-mix(in srgb, var(--paper) 72%, transparent);
+  background: var(--column-surface);
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   z-index: 6;
 }
+.app.session-layout .main-topbar-side {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  min-width: 32px;
+}
+.app.session-layout .main-title {
+  min-width: 0;
+  flex: 1;
+}
 .app.session-layout .main-chat {
   padding-top: 48px;
+  background: var(--column-surface);
 }
 .app.session-layout .main-scroll {
-  padding: 24px 22px;
+  padding: 24px 32px;
+}
+.app.session-layout .composer-wrap {
+  padding-right: 32px;
+  padding-left: 32px;
 }
 .rail-section {
   padding: 15px 14px;
