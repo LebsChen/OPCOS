@@ -979,7 +979,10 @@ body {
 .approval-option-row:hover,
 .approval-option-row:focus-visible {
   color: var(--accent);
-  outline: none;
+}
+.approval-option-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 .approval-option-row:disabled {
   color: var(--faint);
@@ -1033,7 +1036,10 @@ body {
 .transcript-question-close:hover,
 .transcript-question-close:focus-visible {
   color: var(--ink);
-  outline: none;
+}
+.transcript-question-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 .transcript-question-collapsed {
   display: flex;
