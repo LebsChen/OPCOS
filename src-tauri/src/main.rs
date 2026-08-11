@@ -13524,11 +13524,20 @@ async fn run_computer_use(
 fn parse_computer_use_arguments(
     arguments: &Value,
 ) -> Result<(ComputerUseAction, Option<ScreenBounds>), String> {
-    let action = arguments
+    let action_value = arguments
         .get("action")
-        .filter(|value| value.is_object())
-        .cloned()
-        .unwrap_or_else(|| arguments.clone());
+        .ok_or_else(|| "computer_use action is required".to_owned())?;
+    let action = if action_value.is_object() {
+        action_value.clone()
+    } else {
+        let mut flat = arguments
+            .as_object()
+            .cloned()
+            .ok_or_else(|| "computer_use arguments must be an object".to_owned())?;
+        flat.remove("screen_width");
+        flat.remove("screen_height");
+        Value::Object(flat)
+    };
     let action = serde_json::from_value(action).map_err(|error| error.to_string())?;
     let width = arguments.get("screen_width").and_then(Value::as_u64);
     let height = arguments.get("screen_height").and_then(Value::as_u64);
@@ -29848,6 +29857,41 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn computer_use_arguments_accept_flat_nested_and_report_missing_action() {
+        let (flat, bounds) = parse_computer_use_arguments(&json!({
+            "action": "left_click",
+            "coordinate": [10, 20],
+            "screen_width": 800,
+            "screen_height": 600
+        }))
+        .unwrap();
+        assert_eq!(
+            flat,
+            ComputerUseAction::LeftClick {
+                coordinate: [10, 20]
+            }
+        );
+        assert_eq!(
+            bounds,
+            Some(ScreenBounds {
+                width: 800,
+                height: 600
+            })
+        );
+
+        let (nested, _) = parse_computer_use_arguments(&json!({
+            "action": {"action": "screenshot"}
+        }))
+        .unwrap();
+        assert_eq!(nested, ComputerUseAction::Screenshot);
+
+        assert_eq!(
+            parse_computer_use_arguments(&json!({"coordinate": [1, 2]})).unwrap_err(),
+            "computer_use action is required"
+        );
+    }
 
     #[tokio::test]
     async fn mcp_turn_deadline_returns_without_cancelling_background_work() {

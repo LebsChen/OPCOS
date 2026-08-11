@@ -11943,13 +11943,15 @@ function AppContent() {
         (payload.kind === "notice" &&
           String(payload.payload?.kind) === "approval_pending")
       ) {
-        void command<TimelineEvent[]>("read_session_events", {
-          sessionId: selected?.id,
-        })
-          .then((items) =>
-            setTranscript((current) => mergeEvents(current, items)),
-          )
-          .catch(onError);
+        if (selected) {
+          void command<TimelineEvent[]>("read_session_events", {
+            sessionId: selected.id,
+          })
+            .then((items) =>
+              setTranscript((current) => mergeEvents(current, items)),
+            )
+            .catch(onError);
+        }
       }
       if (payload.kind === "coordination_approval_pending") {
         void command<InboxRecord[]>("list_inbox").then(setInbox).catch(onError);

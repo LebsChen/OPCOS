@@ -1,4 +1,6 @@
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+#[cfg(test)]
+use chrono::Duration as ChronoDuration;
+use chrono::{DateTime, Utc};
 use ring::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
     digest,
@@ -2596,8 +2598,6 @@ impl SqliteStore {
                 statement.query_row([idempotency_key], action_ledger_from_row)?
             };
             let was_failed = existing.status == "failed";
-            let lease_cutoff =
-                (Utc::now() - ChronoDuration::seconds(ACTION_IN_FLIGHT_LEASE_SECONDS)).to_rfc3339();
             let lease_expired = existing.status == "in_flight"
                 && DateTime::parse_from_rfc3339(&existing.started_at)
                     .ok()
@@ -2607,14 +2607,14 @@ impl SqliteStore {
                             .num_seconds()
                             >= ACTION_IN_FLIGHT_LEASE_SECONDS
                     });
-            connection.execute(
-                "UPDATE action_ledger SET status='in_flight', attempts=attempts+1,
-                 started_at=?1, updated_at=?1, finished_at=NULL
-                 WHERE idempotency_key=?2 AND
-                       (status='failed' OR
-                        (status='in_flight' AND started_at <= ?3))",
-                params![now, idempotency_key, lease_cutoff],
-            )?;
+            if was_failed || lease_expired {
+                connection.execute(
+                    "UPDATE action_ledger SET status='in_flight', attempts=attempts+1,
+                     started_at=?1, updated_at=?1, finished_at=NULL
+                     WHERE action_id=?2 AND status IN ('failed', 'in_flight')",
+                    params![now, existing.action_id],
+                )?;
+            }
             let mut statement = connection.prepare(
                 "SELECT action_id,action_type,platform,account_id,idempotency_key,external_id,
                         status,result_summary,error_summary,attempts,started_at,finished_at,

@@ -6516,26 +6516,55 @@ fn computer_use_parameters_schema() -> Value {
         "minItems": 2,
         "maxItems": 2
     });
+    let variant = |action: &str, fields: Vec<(&str, Value)>| {
+        let mut properties = serde_json::Map::new();
+        properties.insert("action".into(), json!({"const": action}));
+        let mut required = vec!["action".to_owned()];
+        for (name, schema) in fields {
+            properties.insert(name.into(), schema);
+            required.push(name.to_owned());
+        }
+        properties.insert(
+            "screen_width".into(),
+            json!({"type": "integer", "minimum": 1}),
+        );
+        properties.insert(
+            "screen_height".into(),
+            json!({"type": "integer", "minimum": 1}),
+        );
+        json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": false
+        })
+    };
     json!({
-        "type": "object",
-        "properties": {
-            "action": {"type": "string", "enum": [
-                "screenshot", "cursor_position", "wait", "key", "hold_key",
-                "type", "mouse_move", "scroll", "left_click", "right_click",
-                "middle_click", "double_click", "triple_click", "left_click_drag",
-                "left_mouse_down", "left_mouse_up"
-            ]},
-            "key": {"type": "string"},
-            "text": {"type": "string"},
-            "coordinate": coordinate.clone(),
-            "coordinate2": coordinate.clone(),
-            "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
-            "amount": {"type": "integer"},
-            "screen_width": {"type": "integer", "minimum": 1, "description": "Optional when omitted; derived from a screenshot."},
-            "screen_height": {"type": "integer", "minimum": 1, "description": "Optional when omitted; derived from a screenshot."}
-        },
-        "required": ["action"],
-        "additionalProperties": false
+        "oneOf": [
+            variant("screenshot", vec![]),
+            variant("cursor_position", vec![]),
+            variant("wait", vec![]),
+            variant("key", vec![("key", json!({"type": "string"}))]),
+            variant("hold_key", vec![("key", json!({"type": "string"}))]),
+            variant("type", vec![("text", json!({"type": "string"}))]),
+            variant("mouse_move", vec![("coordinate", coordinate.clone())]),
+            variant("scroll", vec![
+                ("coordinate", coordinate.clone()),
+                ("direction", json!({"type": "string", "enum": ["up", "down", "left", "right"]})),
+                ("amount", json!({"type": "integer"})),
+            ]),
+            variant("left_click", vec![("coordinate", coordinate.clone())]),
+            variant("right_click", vec![("coordinate", coordinate.clone())]),
+            variant("middle_click", vec![("coordinate", coordinate.clone())]),
+            variant("double_click", vec![("coordinate", coordinate.clone())]),
+            variant("triple_click", vec![("coordinate", coordinate.clone())]),
+            variant("left_click_drag", vec![
+                ("coordinate", coordinate.clone()),
+                ("coordinate2", coordinate.clone()),
+            ]),
+            variant("left_mouse_down", vec![("coordinate", coordinate.clone())]),
+            variant("left_mouse_up", vec![("coordinate", coordinate.clone())]),
+        ]
     })
 }
 
@@ -7019,13 +7048,13 @@ fn filter_allowed_tools(
     allowed: Option<&HashSet<String>>,
     external_allowed: Option<&HashSet<String>>,
 ) -> Vec<Value> {
-    if allowed.is_some() || external_allowed.is_some() {
+    if let Some(allowed) = allowed {
         tools.retain(|tool| {
             tool.get("function")
                 .and_then(|function| function.get("name"))
                 .and_then(Value::as_str)
                 .is_some_and(|name| {
-                    allowed.is_some_and(|items| items.contains(name))
+                    allowed.contains(name)
                         || external_allowed.is_some_and(|items| items.contains(name))
                         || matches!(
                             name,
@@ -7320,6 +7349,29 @@ mod tests {
                 Some(&HashSet::new()),
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn external_allowlist_without_builtin_allowlist_does_not_filter_builtins() {
+        let tools = filter_allowed_tools(tool_definitions(), None, Some(&HashSet::new()));
+        assert_eq!(tools.len(), tool_definitions().len());
+    }
+
+    #[test]
+    fn computer_use_schema_requires_coordinate_for_left_click() {
+        let schema = computer_use_parameters_schema();
+        let variants = schema["oneOf"].as_array().unwrap();
+        let left_click = variants
+            .iter()
+            .find(|variant| variant["properties"]["action"]["const"] == "left_click")
+            .unwrap();
+        assert!(
+            left_click["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "coordinate")
         );
     }
 
