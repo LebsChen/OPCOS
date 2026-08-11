@@ -1535,11 +1535,11 @@ h3 {
   background: var(--column-surface);
 }
 .app.session-layout .main-scroll {
-  padding: 24px 27px;
+  padding: 24px 32px;
 }
 .app.session-layout .composer-wrap {
-  padding-right: 27px;
-  padding-left: 27px;
+  padding-right: 32px;
+  padding-left: 32px;
 }
 .rail-section {
   padding: 15px 14px;
