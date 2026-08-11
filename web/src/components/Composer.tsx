@@ -109,7 +109,7 @@ interface Props {
   onSend: (text: string, attachments?: Attachment[]) => void | Promise<void>;
   onPendingQuestionAnswer?: (text: string) => void | Promise<void>;
   pendingQuestion?: boolean;
-  onSteer?: (text: string, attachments?: Attachment[]) => void;
+  onSteer?: (text: string, attachments?: Attachment[]) => void | Promise<void>;
   onInterrupt: () => void;
   assets?: Array<{ kind: string; title: string }>;
   secrets?: Array<{ name: string }>;
@@ -358,13 +358,25 @@ export function Composer(props: Props) {
       dictationBusy
     )
       return;
+    const draftText = text;
+    const draftAttachments = attachments;
+    const restoreDraft = () => {
+      setText(draftText);
+      setAttachments(draftAttachments);
+      const match = draftText.match(/^\/([^\s]*)$/);
+      setSlashQuery(match ? match[1].toLowerCase() : null);
+    };
+    const clearDraft = () => {
+      setSlashQuery(null);
+      setText("");
+      setAttachments([]);
+    };
     if (props.onPendingQuestionAnswer) {
+      clearDraft();
       try {
         await props.onPendingQuestionAnswer(expandSlashCommand(t));
-        setSlashQuery(null);
-        setText("");
-        setAttachments([]);
       } catch (error) {
+        restoreDraft();
         showAttachNotice(
           error instanceof Error ? error.message : "Answer submission failed.",
         );
@@ -379,10 +391,15 @@ export function Composer(props: Props) {
       return;
     }
     if (route === "steer") {
-      props.onSteer!(t, attachments);
-      setSlashQuery(null);
-      setText("");
-      setAttachments([]);
+      clearDraft();
+      try {
+        await props.onSteer!(t, attachments);
+      } catch (error) {
+        restoreDraft();
+        showAttachNotice(
+          error instanceof Error ? error.message : "Message submission failed.",
+        );
+      }
       return;
     }
     // No model connected: keep the draft (don't drop it) and send the user to setup instead.
@@ -390,12 +407,11 @@ export function Composer(props: Props) {
       props.onConnectModel?.();
       return;
     }
+    clearDraft();
     try {
       await props.onSend(expandSlashCommand(t), attachments);
-      setSlashQuery(null);
-      setText("");
-      setAttachments([]);
     } catch (error) {
+      restoreDraft();
       showAttachNotice(
         error instanceof Error ? error.message : "Message submission failed.",
       );
