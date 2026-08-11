@@ -44,6 +44,8 @@ import {
   buildTimeline,
   latestPlan,
   mergeEvents,
+  optimisticUserMessageEvent,
+  OPTIMISTIC_USER_EVENT_PREFIX,
   type TimelineEvent,
 } from "./timeline";
 import {
@@ -11229,6 +11231,7 @@ function AppContent() {
   const [sessionTitleDraft, setSessionTitleDraft] = useState("");
   const titleEditingRef = useRef(false);
   const previousRunningRef = useRef(false);
+  const submittingSessionIdRef = useRef<string | undefined>(undefined);
   useEffect(() => {
     titleEditingRef.current = false;
     setEditingSessionTitle(false);
@@ -11614,10 +11617,12 @@ function AppContent() {
   useEffect(() => {
     const currentGeneration = ++generation.current;
     setTranscript([]);
-    setLiveTranscript([]);
+    const submittingSelectedSession =
+      submittingSessionIdRef.current === selected?.id;
+    if (!submittingSelectedSession) setLiveTranscript([]);
     setPendingQuestion(null);
     setPendingApproval(null);
-    setRunning(false);
+    if (!submittingSelectedSession) setRunning(false);
     if (!selected) return;
     void Promise.all([
       command<TimelineEvent[]>("read_session_events", {
@@ -11668,7 +11673,8 @@ function AppContent() {
           });
         }
         setTranscript(mergeEvents([], items));
-        setLiveTranscript([]);
+        if (submittingSessionIdRef.current !== selected.id)
+          setLiveTranscript([]);
       })
       .catch((reason) => {
         if (generation.current === currentGeneration)
@@ -11790,6 +11796,8 @@ function AppContent() {
       }
       if (payload.kind === "turn_done") {
         setLiveTranscript([]);
+        if (submittingSessionIdRef.current === payload.session_id)
+          submittingSessionIdRef.current = undefined;
         const runState =
           typeof payload.payload.run_state === "string"
             ? payload.payload.run_state
@@ -12029,7 +12037,12 @@ function AppContent() {
       setSelected(next);
       setSurface("session");
       setHomeInput("");
-      await refresh();
+      submittingSessionIdRef.current = next.id;
+      setLiveTranscript((items) =>
+        mergeEvents(items, optimisticUserMessageEvent(next.id, text), true),
+      );
+      setRunning(true);
+      void refresh().catch(onError);
       let requestText = text;
       if (homeAttachment) {
         const path = await uploadTextAttachmentForSession(
@@ -12043,6 +12056,13 @@ function AppContent() {
         request: { session_id: next.id, text: requestText },
       });
     } catch (reason) {
+      const failedSessionId = submittingSessionIdRef.current;
+      if (failedSessionId) submittingSessionIdRef.current = undefined;
+      setLiveTranscript((items) =>
+        items.filter(
+          (event) => !event.event_id.startsWith(OPTIMISTIC_USER_EVENT_PREFIX),
+        ),
+      );
       setRunning(false);
       onError(submitFailureMessage(reason));
     }
@@ -12072,12 +12092,28 @@ function AppContent() {
     attachments: Attachment[] = [],
   ): Promise<void> => {
     if (!selected) return;
+    const sessionId = selected.id;
+    submittingSessionIdRef.current = sessionId;
+    setLiveTranscript((items) =>
+      mergeEvents(
+        items,
+        optimisticUserMessageEvent(sessionId, text, attachments),
+        true,
+      ),
+    );
     setRunning(true);
     try {
       await command("submit_turn", {
-        request: { session_id: selected.id, text, attachments },
+        request: { session_id: sessionId, text, attachments },
       });
     } catch (reason) {
+      if (submittingSessionIdRef.current === sessionId)
+        submittingSessionIdRef.current = undefined;
+      setLiveTranscript((items) =>
+        items.filter(
+          (event) => !event.event_id.startsWith(OPTIMISTIC_USER_EVENT_PREFIX),
+        ),
+      );
       setRunning(false);
       onError(submitFailureMessage(reason));
       throw new Error(submitFailureMessage(reason));

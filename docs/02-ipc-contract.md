@@ -12,7 +12,7 @@
 | `delete_host`     | `host_id`                                                        | `()`                                                                                   | host 不存在时报错，并删除关联 secrets。                                                                                                                                    |
 | `start_surface`   | `host_id`, `surface`, `cols?`, `rows?`, `cwd?`                   | 本地 relay port `u16`                                                                  | `surface` 只接受 `pty` / `vnc` / `cdp`；绑定本地 relay 失败时报错。                                                                                                        |
 | `ide_bootstrap`   | `session_id`, `folder_uri`                                       | `IdeBootstrap`                                                                         | `folder_uri` 必须以 `vscode-remote://` 开头；session/远程读取失败显式报错。                                                                                                |
-| `start_ide_proxy` | `session_id`, `folder_uri`                                       | 本地 proxy port `u16`                                                                  | `folder_uri` 前缀、listener 或远端 proxy 失败显式报错。                                                                                                                    |
+| `ide_url`         | `session_id`, `folder_uri`                                       | 远端 IDE URL                                                                            | 返回远端 IDE URL，`folder_uri` 前缀或远端请求失败显式报错；前端直接加载该 URL，不再启动本地 IDE proxy。                                                                     |
 | `create_session`  | `title`, `host_id`, `model?`, `provider?`, `mode?`, `workspace?` | `SessionView`                                                                          | host 不存在时报 `remote host not found; session was not created`。                                                                                                         |
 | `list_sessions`   | 无                                                               | `SessionView[]`                                                                        | 数据库错误转字符串。                                                                                                                                                       |
 | `read_transcript` | `session_id`                                                     | `[{kind,payload}]`，pending approval 转为 `kind=approval`，tool call 按 `call_id` 合并 | store 读取失败报错；approval arguments 先脱敏；store 对无 result 且无 pending 的工具保留 `status=unresolved`，adapter 按活跃引擎覆盖为 `running`，否则返回 `interrupted`。 |
@@ -129,7 +129,7 @@ Cloud-Dev 的 PTY 做法是动态事件名 `term-data-{id}`（byte array）与 `
 - `submit_turn`、`run_schedule`、`run_blueprint`、`git_workflow`、`export_assets`、`import_assets` 和 `discover_remote_assets` 可能持续网络/执行时间；invoke 只返回最终状态，过程通过事件或 worklog 查询。
 - `steering` 立即返回，但完成由后台 task 发 `turn_done`；前端不能把 invoke resolve 当作 turn 完成。
 - `interrupt` 立即请求 engine 停止，停止完成仍由 engine/event 状态确认。
-- `start_surface` 和 `start_ide_proxy` 只返回 relay port；真正 socket 生命周期由本地 relay task 管理。
+- `start_surface` 只返回 relay port；真正 socket 生命周期由本地 relay task 管理。`ide_url` 返回远端 IDE URL，前端直接加载。
 - `mcp_tools` 是远程 `tools/list` 请求；若 server 长时间无响应，必须受 client timeout 约束，具体 timeout 当前未确认。
 
 同一 session 的 `submit_turn`、`resolve_approval`、`interrupt` 必须串行化或由 engine 保证顺序；否则会出现审批已解决但旧 turn 又发 `turn_done` 的竞态［推断］。

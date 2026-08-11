@@ -365,6 +365,17 @@ describe("GUI boundary behavior", () => {
     expect(source).not.toContain('<PlannedPane title="Editor">');
   });
 
+  it("submits the first message optimistically without blocking on refresh", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain("optimisticUserMessageEvent");
+    expect(source).toContain("submittingSessionIdRef");
+    expect(source).toContain("void refresh().catch(onError)");
+    expect(source).toContain('command("submit_turn"');
+  });
+
   it("uses the server-provided direct IDE URL", () => {
     const source = readFileSync(
       fileURLToPath(new URL("./App.tsx", import.meta.url)),
