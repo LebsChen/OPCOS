@@ -13,6 +13,30 @@ export const TRANSIENT_TIMELINE_EVENT_TYPES = [
   "tool_call_delta",
 ] as const;
 
+export const OPTIMISTIC_USER_EVENT_PREFIX = "optimistic-user:";
+
+export function optimisticUserMessageEvent(
+  sessionId: string,
+  text: string,
+  attachments: Attachment[] = [],
+): TimelineEvent {
+  const createdAt = Date.now();
+  return {
+    type: "user_message",
+    event_id: `${OPTIMISTIC_USER_EVENT_PREFIX}${createdAt}-${Math.random().toString(36).slice(2)}`,
+    created_at_ms: createdAt,
+    timestamp: new Date(createdAt).toISOString(),
+    session_id: sessionId,
+    working_event: {
+      event_type: "user_message",
+      payload: {
+        message: text,
+        ...(attachments.length > 0 ? { attachments } : {}),
+      },
+    },
+  };
+}
+
 export function lastActivityLabel(
   rows: Array<{ activityLabel?: boolean; label: string }>,
 ) {
@@ -104,6 +128,32 @@ function eventType(event: TimelineEvent): string {
     typeof (working as Record<string, unknown>).event_type === "string"
     ? String((working as Record<string, unknown>).event_type)
     : "";
+}
+
+function eventSessionId(event: TimelineEvent): string | undefined {
+  for (const value of [
+    event.session_id,
+    payload(event).session_id,
+    typeof event.working_event === "object" && event.working_event
+      ? (event.working_event as Record<string, unknown>).session_id
+      : undefined,
+  ]) {
+    if (typeof value === "string" && value) return value;
+  }
+  return undefined;
+}
+
+export function optimisticUserMessageMatches(
+  event: TimelineEvent,
+  sessionId: string,
+  text: string,
+): boolean {
+  if (!event.event_id.startsWith(OPTIMISTIC_USER_EVENT_PREFIX)) return false;
+  return (
+    eventSessionId(event) === sessionId &&
+    String(payload(event).message ?? payload(event).text ?? "").trim() ===
+      text.trim()
+  );
 }
 
 function toolLabel(tool: string, args: unknown): string {
@@ -254,7 +304,31 @@ export function mergeEvents(
     if (event.event_id) seen.add(event.event_id);
     return true;
   });
-  return unique
+  const realUserMessages = unique.filter(
+    (event) =>
+      !event.event_id.startsWith(OPTIMISTIC_USER_EVENT_PREFIX) &&
+      (eventType(event) === "user_message" ||
+        eventType(event) === "initial_user_message"),
+  );
+  const withoutReplacedOptimistic = unique.filter((event) => {
+    if (!event.event_id.startsWith(OPTIMISTIC_USER_EVENT_PREFIX)) return true;
+    const optimisticText = String(
+      payload(event).message ?? payload(event).text ?? "",
+    ).trim();
+    const optimisticSessionId = eventSessionId(event);
+    return !realUserMessages.some((real) => {
+      const realSessionId = eventSessionId(real);
+      return (
+        (optimisticSessionId === undefined ||
+          realSessionId === undefined ||
+          optimisticSessionId === realSessionId) &&
+        real.created_at_ms >= event.created_at_ms &&
+        String(payload(real).message ?? payload(real).text ?? "").trim() ===
+          optimisticText
+      );
+    });
+  });
+  return withoutReplacedOptimistic
     .map((event, index) => ({ event, index }))
     .sort(
       (a, b) =>

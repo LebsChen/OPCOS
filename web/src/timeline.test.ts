@@ -11,6 +11,8 @@ import {
   buildTimeline,
   latestPlan,
   mergeEvents,
+  optimisticUserMessageEvent,
+  OPTIMISTIC_USER_EVENT_PREFIX,
   TRANSIENT_TIMELINE_EVENT_TYPES,
   lastActivityLabel,
   type TimelineEvent,
@@ -21,6 +23,85 @@ const saved = persisted as TimelineEvent[];
 const opcos = opcosEvents as TimelineEvent[];
 
 describe("single event-log timeline", () => {
+  it("replaces an optimistic user message with the persisted event", () => {
+    const optimistic = optimisticUserMessageEvent("session-1", "  Hello  ");
+    const persisted: TimelineEvent = {
+      type: "user_message",
+      event_id: "persisted-user",
+      created_at_ms: optimistic.created_at_ms + 1,
+      session_id: "session-1",
+      working_event: {
+        event_type: "user_message",
+        payload: { message: "Hello" },
+      },
+    };
+    expect(optimistic.event_id).toContain(OPTIMISTIC_USER_EVENT_PREFIX);
+    expect(mergeEvents([optimistic], persisted, true)).toEqual([persisted]);
+  });
+
+  it("does not replace an optimistic message from another session", () => {
+    const optimistic = optimisticUserMessageEvent("session-1", "Hello");
+    const persisted: TimelineEvent = {
+      type: "user_message",
+      event_id: "other-session-user",
+      created_at_ms: optimistic.created_at_ms + 1,
+      session_id: "session-2",
+      working_event: {
+        event_type: "user_message",
+        payload: { message: "Hello" },
+      },
+    };
+    expect(mergeEvents([optimistic], persisted, true)).toEqual([
+      optimistic,
+      persisted,
+    ]);
+  });
+
+  it("retains an optimistic message when the persisted text differs", () => {
+    const optimistic = optimisticUserMessageEvent("session-1", "Hello");
+    const persisted: TimelineEvent = {
+      type: "user_message",
+      event_id: "different-text-user",
+      created_at_ms: optimistic.created_at_ms + 1,
+      session_id: "session-1",
+      working_event: {
+        event_type: "user_message",
+        payload: { message: "Goodbye" },
+      },
+    };
+    expect(mergeEvents([optimistic], persisted, true)).toEqual([
+      optimistic,
+      persisted,
+    ]);
+  });
+
+  it("replaces an optimistic message with an initial user event", () => {
+    const optimistic = optimisticUserMessageEvent("session-1", "Hello");
+    const persisted: TimelineEvent = {
+      type: "initial_user_message",
+      event_id: "initial-user",
+      created_at_ms: optimistic.created_at_ms + 1,
+      session_id: "session-1",
+      message: " Hello ",
+    };
+    expect(mergeEvents([optimistic], persisted, true)).toEqual([persisted]);
+  });
+
+  it("keeps a newer optimistic duplicate until its matching event arrives", () => {
+    const optimistic = optimisticUserMessageEvent("session-1", "continue");
+    const previous: TimelineEvent = {
+      type: "user_message",
+      event_id: "previous-user",
+      created_at_ms: optimistic.created_at_ms - 1,
+      session_id: "session-1",
+      message: " continue ",
+    };
+    expect(mergeEvents([previous, optimistic], [], true)).toEqual([
+      previous,
+      optimistic,
+    ]);
+  });
+
   it("shows one live tail action while a turn is running", () => {
     const nodes = buildTimeline(
       [
