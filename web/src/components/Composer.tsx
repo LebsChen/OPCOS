@@ -8,30 +8,10 @@ import {
 } from "react";
 import { translate } from "../i18n";
 import type { Attachment, SessionUsage } from "../types";
-const isPdfFile = (file: File): boolean =>
-  file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
 const readFile = async (file: File): Promise<Attachment | null> => {
-  if (isPdfFile(file)) {
-    const dataUrl = await new Promise<string>((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () =>
-        resolve(typeof reader.result === "string" ? reader.result : "");
-      reader.onerror = () =>
-        reject(reader.error ?? new Error("could not read file"));
-      reader.readAsDataURL(file);
-    });
-    return { kind: "pdf", name: file.name, data_url: dataUrl };
-  }
   const text = await file.text();
   return { kind: "text", name: file.name, text };
 };
-const getSettings = async (): Promise<{
-  pdf_max_pages?: number;
-  pdf_max_mb?: number;
-}> => ({});
-const inspectPdf = async (
-  _dataUrl: string,
-): Promise<{ ok: boolean; pages?: number; error?: string }> => ({ ok: true });
 const formatTokens = (value: number) => String(value);
 const totalTokens = (value: SessionUsage) =>
   Object.values(value?.byModel ?? {}).reduce(
@@ -315,54 +295,11 @@ export function Composer(props: Props) {
   const recordingTime = `${Math.floor(recordingSeconds / 60)}:${String(recordingSeconds % 60).padStart(2, "0")}`;
 
   // Attach-time PDF thresholds (Settings → Token savings): a PDF over the user's page or
-  // size limit is REJECTED with a visible notice — never attached, never silently dropped.
-  // The rationale is token cost: a big PDF re-rides every turn of the conversation.
   const addFiles = async (files: FileList | File[]) => {
-    const list = Array.from(files);
-    let maxPages = 20;
-    let maxMb = 10;
-    if (list.some(isPdfFile)) {
-      try {
-        const s = await getSettings();
-        if (s.pdf_max_pages) maxPages = s.pdf_max_pages;
-        if (s.pdf_max_mb) maxMb = s.pdf_max_mb;
-      } catch {
-        /* offline settings fetch — fall back to defaults */
-      }
-    }
-    const accepted: File[] = [];
-    for (const file of list) {
-      if (isPdfFile(file) && file.size > maxMb * 1024 * 1024) {
-        showAttachNotice(
-          `${file.name} skipped — ${(file.size / 1024 / 1024).toFixed(1)} MB is over your ${maxMb} MB limit (Settings → Token savings)`,
-        );
-        continue;
-      }
-      accepted.push(file);
-    }
-    const read = (await Promise.all(accepted.map(readFile))).filter(
+    const read = (await Promise.all(Array.from(files).map(readFile))).filter(
       (attachment): attachment is Attachment => attachment !== null,
     );
-    const next: Attachment[] = [];
-    for (const a of read) {
-      if (a.kind === "pdf" && a.data_url) {
-        const info = await inspectPdf(a.data_url).catch(() => null);
-        if (info?.ok && (info.pages ?? 0) > maxPages) {
-          showAttachNotice(
-            `${a.name} skipped — ${info.pages} pages is over your ${maxPages}-page limit (Settings → Token savings)`,
-          );
-          continue;
-        }
-        if (info && !info.ok) {
-          showAttachNotice(
-            `${a.name} skipped — ${info.error || "could not read PDF"}`,
-          );
-          continue;
-        }
-      }
-      next.push(a);
-    }
-    if (next.length) setAttachments((a) => mergeAttachments(a, next));
+    if (read.length) setAttachments((a) => mergeAttachments(a, read));
   };
 
   const needsModel = props.modelReady === false;
@@ -976,16 +913,61 @@ export function PlusMenu({
 }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const wrapRef = useRef<HTMLSpanElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const [menuStyle, setMenuStyle] = useState<{
+    top: number;
+    left: number;
+    maxHeight: number;
+  } | null>(null);
+  const closeMenu = (restoreFocus = true) => {
+    onOpenChange(false);
+    if (restoreFocus) triggerRef.current?.focus();
+  };
   useEffect(() => {
     if (!open) return;
     const close = (event: MouseEvent) => {
-      if (!wrapRef.current?.contains(event.target as Node)) onOpenChange(false);
+      if (!wrapRef.current?.contains(event.target as Node)) closeMenu();
+    };
+    const escape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeMenu();
+      }
     };
     document.addEventListener("mousedown", close);
-    return () => document.removeEventListener("mousedown", close);
-  }, [open, onOpenChange]);
+    document.addEventListener("keydown", escape);
+    return () => {
+      document.removeEventListener("mousedown", close);
+      document.removeEventListener("keydown", escape);
+    };
+  }, [open]);
+  useLayoutEffect(() => {
+    if (!open || !menuRef.current || !triggerRef.current) return;
+    const trigger = triggerRef.current.getBoundingClientRect();
+    const menu = menuRef.current.getBoundingClientRect();
+    const margin = 8;
+    const maxHeight = Math.max(80, window.innerHeight - margin * 2);
+    const height = Math.min(menu.height, maxHeight);
+    const left = Math.min(
+      Math.max(margin, trigger.left),
+      Math.max(margin, window.innerWidth - menu.width - margin),
+    );
+    const above = trigger.top - menu.height - 6;
+    const top =
+      above >= margin
+        ? above
+        : Math.min(
+            trigger.bottom + 6,
+            Math.max(margin, window.innerHeight - height - margin),
+          );
+    setMenuStyle({ top, left, maxHeight });
+    menuRef.current
+      .querySelector<HTMLButtonElement>("button:not(:disabled)")
+      ?.focus();
+  }, [open, assets.length, secrets.length]);
   const upload = () => {
-    onOpenChange(false);
+    closeMenu();
     fileRef.current?.click();
   };
   const assetItems = assets.filter((asset) =>
@@ -1005,18 +987,26 @@ export function PlusMenu({
         }}
       />
       <button
+        ref={triggerRef}
         className="icon-btn"
         type="button"
         aria-label="更多功能"
         title="更多功能"
+        aria-expanded={open}
+        aria-haspopup="menu"
         onClick={() => onOpenChange(!open)}
       >
         +
       </button>
       {open && (
-        <div className="plus-menu">
+        <div
+          ref={menuRef}
+          className="plus-menu"
+          role="menu"
+          style={menuStyle ?? undefined}
+        >
           {onUpload && (
-            <button type="button" onClick={upload}>
+            <button type="button" role="menuitem" onClick={upload}>
               <span className="pm-icon">＋</span>
               上传附件
             </button>
@@ -1035,8 +1025,12 @@ export function PlusMenu({
               matching.map((asset) => (
                 <button
                   type="button"
+                  role="menuitem"
                   key={`${asset.kind}:${asset.title}`}
-                  onClick={() => onInsert(`@${asset.kind}:${asset.title}`)}
+                  onClick={() => {
+                    closeMenu(false);
+                    onInsert(`@${asset.kind}:${asset.title}`);
+                  }}
                 >
                   <span className="pm-icon">@</span>
                   {category.label}: {asset.title}
@@ -1045,8 +1039,12 @@ export function PlusMenu({
             ) : (
               <button
                 type="button"
+                role="menuitem"
                 key={category.kind}
-                onClick={() => onInsert(category.reference)}
+                onClick={() => {
+                  closeMenu(false);
+                  onInsert(category.reference);
+                }}
               >
                 <span className="pm-icon">@</span>
                 {category.label}
@@ -1058,15 +1056,19 @@ export function PlusMenu({
             secrets.map((secret) => (
               <button
                 type="button"
+                role="menuitem"
                 key={secret.name}
-                onClick={() => onInsert(`secret:session:${secret.name}`)}
+                onClick={() => {
+                  closeMenu(false);
+                  onInsert(`secret:session:${secret.name}`);
+                }}
               >
                 <span className="pm-icon">⌕</span>
                 密钥：{secret.name}
               </button>
             ))
           ) : (
-            <button type="button" disabled>
+            <button type="button" role="menuitem" disabled>
               <span className="pm-icon">⌕</span>
               密钥引用（暂无已配置密钥）
             </button>

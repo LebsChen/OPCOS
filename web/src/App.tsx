@@ -11398,6 +11398,7 @@ function AppContent() {
   const [showAllHomeModels, setShowAllHomeModels] = useState(false);
   const [homeInput, setHomeInput] = useState("");
   const [homePlusOpen, setHomePlusOpen] = useState(false);
+  const [homeAdvancedOpen, setHomeAdvancedOpen] = useState(false);
   const [homeAttachment, setHomeAttachment] = useState<File | null>(null);
   const [homeHostId, setHomeHostId] = useState("");
   const [homeProvider, setHomeProvider] = useState("");
@@ -12665,8 +12666,8 @@ function AppContent() {
           <div className="home">
             <div className="home-inner">
               <div className="home-greeting">OPCOS</div>
-              <div className="composer-wrap">
-                <div className="composer-card hero">
+              <div className="composer-wrap home-composer-wrap">
+                <div className="composer-card hero home-composer-card">
                   <textarea
                     value={homeInput}
                     placeholder="告诉 OPCOS 你想完成什么…"
@@ -12696,7 +12697,7 @@ function AppContent() {
                       </span>
                     </div>
                   )}
-                  <div className="composer-row">
+                  <div className="composer-row home-critical-row">
                     <PlusMenu
                       open={homePlusOpen}
                       onOpenChange={setHomePlusOpen}
@@ -12714,82 +12715,120 @@ function AppContent() {
                         setHomePlusOpen(false);
                       }}
                     />
-                    <select
-                      className="chip"
-                      title="Agent 模板"
-                      value={homeAgentTemplateId}
-                      onChange={(event) => {
-                        const id = event.target.value;
-                        setHomeAgentTemplateId(id);
-                        const template = homeAgentTemplates.find(
-                          (item) => item.id === id,
-                        );
-                        if (!template) {
-                          setHomeRole("");
-                          setHomeSystemPrompt("");
-                          return;
-                        }
-                        try {
-                          const content = JSON.parse(template.content) as {
-                            role?: string;
-                            provider?: string;
-                            model?: string;
-                            harness?: string;
-                            mode?: string;
-                            system_prompt?: string;
-                          };
-                          setHomeRole(content.role || "");
-                          setHomeProvider(content.provider || "");
-                          setHomeModel(
-                            content.model && content.model !== "auto"
-                              ? content.model
-                              : (models.find((model) => !model.likely_non_chat)
-                                  ?.id ??
-                                  models[0]?.id ??
-                                  "auto"),
-                          );
-                          setHomeHarness(content.harness || "builtin");
-                          setHomeMode(content.mode || "Auto");
-                          setHomeSystemPrompt(content.system_prompt || "");
-                        } catch {
-                          onError("Agent 模板内容不是有效 JSON");
-                        }
-                      }}
-                    >
-                      <option value="">Agent 模板</option>
-                      {homeAgentTemplates.map((template) => (
-                        <option key={template.id} value={template.id}>
-                          {template.name}
-                        </option>
-                      ))}
-                    </select>
-                    <input
-                      className="chip"
-                      title="角色"
-                      value={homeRole}
-                      onChange={(event) => setHomeRole(event.target.value)}
-                      placeholder="Role"
-                    />
-                    <select
-                      className="chip"
-                      title="Harness"
-                      value={homeHarness}
-                      onChange={(event) => setHomeHarness(event.target.value)}
-                    >
-                      {(harnessOptions.length
-                        ? harnessOptions
-                        : [{ id: "builtin", label: "Builtin", available: true }]
-                      ).map((option) => (
-                        <option
-                          key={option.id}
-                          value={option.id}
-                          disabled={!option.available}
-                        >
-                          {option.label}
-                          {!option.available ? " (unavailable)" : ""}
-                        </option>
-                      ))}
-                    </select>
+                    <div className="home-advanced">
+                      <button
+                        className="home-advanced-toggle"
+                        type="button"
+                        aria-expanded={homeAdvancedOpen}
+                        onClick={() => setHomeAdvancedOpen((value) => !value)}
+                      >
+                        <span>
+                          {homeAdvancedOpen ? "Hide advanced" : "Advanced"}
+                        </span>
+                        <span className="home-advanced-summary">
+                          {homeAgentTemplateId || "No template"} ·{" "}
+                          {homeRole || "No role"} · {homeHarness || "Builtin"}
+                        </span>
+                        <span aria-hidden="true">
+                          {homeAdvancedOpen ? "⌃" : "⌄"}
+                        </span>
+                      </button>
+                      {homeAdvancedOpen && (
+                        <div className="home-advanced-fields">
+                          <select
+                            className="chip"
+                            title="Agent 模板"
+                            value={homeAgentTemplateId}
+                            onChange={(event) => {
+                              const id = event.target.value;
+                              setHomeAgentTemplateId(id);
+                              const template = homeAgentTemplates.find(
+                                (item) => item.id === id,
+                              );
+                              if (!template) {
+                                setHomeRole("");
+                                setHomeSystemPrompt("");
+                                return;
+                              }
+                              try {
+                                const content = JSON.parse(
+                                  template.content,
+                                ) as {
+                                  role?: string;
+                                  provider?: string;
+                                  model?: string;
+                                  harness?: string;
+                                  mode?: string;
+                                  system_prompt?: string;
+                                };
+                                setHomeRole(content.role || "");
+                                setHomeProvider(content.provider || "");
+                                setHomeModel(
+                                  content.model && content.model !== "auto"
+                                    ? content.model
+                                    : (models.find(
+                                        (model) => !model.likely_non_chat,
+                                      )?.id ??
+                                        models[0]?.id ??
+                                        "auto"),
+                                );
+                                setHomeHarness(content.harness || "builtin");
+                                setHomeMode(content.mode || "Auto");
+                                setHomeSystemPrompt(
+                                  content.system_prompt || "",
+                                );
+                              } catch {
+                                onError("Agent 模板内容不是有效 JSON");
+                              }
+                            }}
+                          >
+                            <option value="">Agent 模板</option>
+                            {homeAgentTemplates.map((template) => (
+                              <option key={template.id} value={template.id}>
+                                {template.name}
+                              </option>
+                            ))}
+                          </select>
+                          <input
+                            className="chip"
+                            title="角色"
+                            value={homeRole}
+                            onChange={(event) =>
+                              setHomeRole(event.target.value)
+                            }
+                            placeholder="Role"
+                          />
+                          <select
+                            className="chip"
+                            title="Harness"
+                            value={homeHarness}
+                            onChange={(event) =>
+                              setHomeHarness(event.target.value)
+                            }
+                          >
+                            {(harnessOptions.length
+                              ? harnessOptions
+                              : [
+                                  {
+                                    id: "builtin",
+                                    label: "Builtin",
+                                    available: true,
+                                  },
+                                ]
+                            ).map((option) => (
+                              <option
+                                key={option.id}
+                                value={option.id}
+                                disabled={!option.available}
+                              >
+                                {option.label}
+                                {!option.available ? " (unavailable)" : ""}
+                              </option>
+                            ))}
+                          </select>
+                        </div>
+                      )}
+                    </div>
                     <select
                       className="chip"
                       title="绑定主机"
@@ -12840,15 +12879,6 @@ function AppContent() {
                           </option>
                         ))}
                     </select>
-                    {models.some((model) => model.likely_non_chat) && (
-                      <button
-                        className="chip"
-                        type="button"
-                        onClick={() => setShowAllHomeModels((value) => !value)}
-                      >
-                        {showAllHomeModels ? "收起非对话" : "显示全部模型"}
-                      </button>
-                    )}
                     <select
                       className="chip"
                       title="模式"
