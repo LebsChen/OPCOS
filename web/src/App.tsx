@@ -2577,10 +2577,14 @@ function SurfaceView({
         );
       }
     } else if (tab === "ide" && !ideUrl && !ideError) {
+      if (!selected.workspace) {
+        setIdeError("Remote IDE workspace is not configured for this session.");
+        return;
+      }
       setBusy(true);
       void command<string>("ide_url", {
         sessionId: selected.id,
-        folderUri: selected.workspace || "/workspace",
+        folderUri: selected.workspace,
       })
         .then(setIdeUrl)
         .catch((error) => {

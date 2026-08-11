@@ -352,6 +352,10 @@ describe("GUI boundary behavior", () => {
     );
     expect(source).toContain("ws://127.0.0.1:${port}");
     expect(source).toContain('command<string>("ide_url"');
+    expect(source).toContain("Remote IDE workspace is not configured");
+    expect(source).not.toContain(
+      'folderUri: selected.workspace || "/workspace"',
+    );
     expect(source).toContain("src={ideUrl}");
     expect(source).not.toMatch(/Authorization:\s*Bearer/i);
   });
