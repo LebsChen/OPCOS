@@ -738,6 +738,32 @@ function RailIcon({
           <line x1="3" y1="18" x2="3.01" y2="18" />
         </svg>
       );
+    case "progress":
+      return (
+        <svg {...s}>
+          <circle cx="12" cy="12" r="9" />
+          <path d="m8 12 2.5 2.5L16 9" />
+        </svg>
+      );
+    case "tasks":
+      return (
+        <svg {...s}>
+          <rect x="4" y="4" width="16" height="16" rx="2" />
+          <path d="m8 9 1.5 1.5L12 8" />
+          <line x1="13.5" y1="9.5" x2="17" y2="9.5" />
+          <path d="m8 14 1.5 1.5L12 13" />
+          <line x1="13.5" y1="14.5" x2="17" y2="14.5" />
+        </svg>
+      );
+    case "agents":
+      return (
+        <svg {...s}>
+          <circle cx="9" cy="8" r="3" />
+          <circle cx="17" cy="10" r="2.5" />
+          <path d="M3.5 20a5.5 5.5 0 0 1 11 0" />
+          <path d="M14 19a4 4 0 0 1 6.5-3" />
+        </svg>
+      );
     case "sparkle":
       return (
         <svg {...s}>
@@ -10631,9 +10657,9 @@ function SessionRightPanel({
     { id: "info", label: "Info", icon: "info" },
     { id: "shell", label: "Shell", icon: "terminal" },
     { id: "changes", label: "Changes", icon: "diff" },
-    { id: "progress", label: "Progress", icon: "list" },
-    { id: "tasks", label: "Tasks", icon: "list" },
-    { id: "agents", label: "Agents", icon: "list" },
+    { id: "progress", label: "Progress", icon: "progress" },
+    { id: "tasks", label: "Tasks", icon: "tasks" },
+    { id: "agents", label: "Agents", icon: "agents" },
     { id: "artifacts", label: "Artifacts", icon: "file" },
     { id: "pr", label: "PR", icon: "branch" },
     { id: "insights", label: "Insights", icon: "sparkle" },
@@ -10642,7 +10668,7 @@ function SessionRightPanel({
     informationTabs.splice(3, 0, {
       id: "worklog",
       label: "Worklog",
-      icon: "list",
+      icon: "progress",
     });
   }
   const workspaceTabs: Array<{
