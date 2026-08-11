@@ -354,7 +354,7 @@ describe("GUI boundary behavior", () => {
     expect(source).toContain(
       '{opened.includes("desktop") && panelTab === "desktop" && (',
     );
-    expect(source).toContain('<SurfaceView\n                  tab="desktop"');
+    expect(source).toContain('capabilities.vnc?.state === "Unavailable"');
     expect(source).toContain(
       '{opened.includes("ide") && panelTab === "ide" && (',
     );
@@ -363,6 +363,51 @@ describe("GUI boundary behavior", () => {
     );
     expect(source).not.toContain('<PlannedPane title="Desktop">');
     expect(source).not.toContain('<PlannedPane title="Editor">');
+  });
+
+  it("gates remote surfaces by session capabilities and keeps approvals keyed", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain('"session_capabilities"');
+    expect(source).toContain('capabilities.browser?.state === "Unavailable"');
+    expect(source).toContain("Object.values(pendingApprovals)");
+    expect(source).toContain("delete next[callId]");
+  });
+
+  it("restores failed home submissions into the session composer", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain("setRestoredComposerDraft({ text, nonce:");
+    expect(source).toContain(
+      "restoreDraft={restoredComposerDraft || undefined}",
+    );
+    expect(source).toContain("setHomeInput(text)");
+  });
+
+  it("reconciles approvals from the backend when a turn ends", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain(
+      '>("list_pending", { sessionId: payload.session_id })',
+    );
+    expect(source).toContain(
+      'item.tool !== "ask_user" && item.state !== "resolved"',
+    );
+  });
+
+  it("gates the editor by the remote IDE capability", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain('capabilities.ide?.state === "Unavailable"');
+    expect(source).toContain('panelTab === "ide"');
   });
 
   it("submits the first message optimistically without blocking on refresh", () => {

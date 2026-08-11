@@ -1183,6 +1183,7 @@ pub struct TurnEngine<P, S, E> {
     hook_context: Mutex<Vec<String>>,
     failed_tool_calls: Mutex<HashMap<String, FailedToolCall>>,
     external_tools: Mutex<Vec<Value>>,
+    external_allowed_tools: Mutex<HashSet<String>>,
     progressive_tool_disclosure: AtomicBool,
     described_tools: Mutex<HashSet<String>>,
     allowed_tools: Mutex<Option<HashSet<String>>>,
@@ -1463,6 +1464,7 @@ where
             hook_context: Mutex::new(Vec::new()),
             failed_tool_calls: Mutex::new(HashMap::new()),
             external_tools: Mutex::new(Vec::new()),
+            external_allowed_tools: Mutex::new(HashSet::new()),
             progressive_tool_disclosure: AtomicBool::new(false),
             described_tools: Mutex::new(HashSet::new()),
             allowed_tools: Mutex::new(None),
@@ -1543,6 +1545,10 @@ where
 
     pub async fn append_external_tools(&self, tools: impl IntoIterator<Item = Value>) {
         self.external_tools.lock().await.extend(tools);
+    }
+
+    pub async fn set_external_allowed_tools(&self, tools: impl IntoIterator<Item = String>) {
+        *self.external_allowed_tools.lock().await = tools.into_iter().collect();
     }
 
     pub fn set_progressive_tool_disclosure(&self, enabled: bool) {
@@ -3241,9 +3247,11 @@ has failed {} times and the last error code was {}",
                         tools.extend(external.iter().cloned().map(mcp_tool_definition));
                     }
                     let allowed = self.allowed_tools.try_lock().ok();
+                    let external_allowed = self.external_allowed_tools.try_lock().ok();
                     tools = filter_allowed_tools(
                         tools,
                         allowed.as_ref().and_then(|value| value.as_ref()),
+                        external_allowed.as_deref(),
                     );
                     for (kind, prefix) in CONNECTOR_TOOL_PREFIXES {
                         if !self.connector_tools_enabled(kind) {
@@ -3936,11 +3944,7 @@ has failed {} times and the last error code was {}",
         };
         let mut target = mutating_api_target.as_deref().unwrap_or(&target);
         if call.name == "computer_use" {
-            let action = call
-                .arguments
-                .get("action")
-                .and_then(|value| value.get("action"))
-                .and_then(Value::as_str);
+            let action = computer_use_action_name(&call.arguments);
             if action == Some("screenshot") {
                 risk = ToolRisk::External;
             } else {
@@ -6512,81 +6516,64 @@ fn computer_use_parameters_schema() -> Value {
         "minItems": 2,
         "maxItems": 2
     });
-    let no_args = |action: &str| {
+    let variant = |action: &str, fields: Vec<(&str, Value)>| {
+        let mut properties = serde_json::Map::new();
+        properties.insert("action".into(), json!({"const": action}));
+        let mut required = vec!["action".to_owned()];
+        for (name, schema) in fields {
+            properties.insert(name.into(), schema);
+            required.push(name.to_owned());
+        }
+        properties.insert(
+            "screen_width".into(),
+            json!({"type": "integer", "minimum": 1}),
+        );
+        properties.insert(
+            "screen_height".into(),
+            json!({"type": "integer", "minimum": 1}),
+        );
         json!({
             "type": "object",
-            "properties": {"action": {"const": action}},
-            "required": ["action"],
-            "additionalProperties": false
-        })
-    };
-    let coordinate_action = |action: &str| {
-        json!({
-            "type": "object",
-            "properties": {"action": {"const": action}, "coordinate": coordinate.clone()},
-            "required": ["action", "coordinate"],
+            "properties": properties,
+            "required": required,
             "additionalProperties": false
         })
     };
     json!({
-        "type": "object",
-        "properties": {
-            "action": {
-                "oneOf": [
-                    no_args("screenshot"),
-                    no_args("cursor_position"),
-                    no_args("wait"),
-                    {
-                        "type": "object",
-                        "properties": {"action": {"const": "key"}, "key": {"type": "string"}},
-                        "required": ["action", "key"], "additionalProperties": false
-                    },
-                    {
-                        "type": "object",
-                        "properties": {"action": {"const": "hold_key"}, "key": {"type": "string"}},
-                        "required": ["action", "key"], "additionalProperties": false
-                    },
-                    {
-                        "type": "object",
-                        "properties": {"action": {"const": "type"}, "text": {"type": "string"}},
-                        "required": ["action", "text"], "additionalProperties": false
-                    },
-                    coordinate_action("mouse_move"),
-                    {
-                        "type": "object",
-                        "properties": {
-                            "action": {"const": "scroll"},
-                            "coordinate": coordinate.clone(),
-                            "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
-                            "amount": {"type": "integer"}
-                        },
-                        "required": ["action", "coordinate", "direction", "amount"],
-                        "additionalProperties": false
-                    },
-                    coordinate_action("left_click"),
-                    coordinate_action("right_click"),
-                    coordinate_action("middle_click"),
-                    coordinate_action("double_click"),
-                    coordinate_action("triple_click"),
-                    {
-                        "type": "object",
-                        "properties": {
-                            "action": {"const": "left_click_drag"},
-                            "coordinate": coordinate.clone(),
-                            "coordinate2": coordinate.clone()
-                        },
-                        "required": ["action", "coordinate", "coordinate2"],
-                        "additionalProperties": false
-                    },
-                    coordinate_action("left_mouse_down"),
-                    coordinate_action("left_mouse_up")
-                ]
-            },
-            "screen_width": {"type": "integer", "minimum": 1, "description": "Optional when omitted; derived from a screenshot."},
-            "screen_height": {"type": "integer", "minimum": 1, "description": "Optional when omitted; derived from a screenshot."}
-        },
-        "required": ["action"],
-        "additionalProperties": false
+        "oneOf": [
+            variant("screenshot", vec![]),
+            variant("cursor_position", vec![]),
+            variant("wait", vec![]),
+            variant("key", vec![("key", json!({"type": "string"}))]),
+            variant("hold_key", vec![("key", json!({"type": "string"}))]),
+            variant("type", vec![("text", json!({"type": "string"}))]),
+            variant("mouse_move", vec![("coordinate", coordinate.clone())]),
+            variant("scroll", vec![
+                ("coordinate", coordinate.clone()),
+                ("direction", json!({"type": "string", "enum": ["up", "down", "left", "right"]})),
+                ("amount", json!({"type": "integer"})),
+            ]),
+            variant("left_click", vec![("coordinate", coordinate.clone())]),
+            variant("right_click", vec![("coordinate", coordinate.clone())]),
+            variant("middle_click", vec![("coordinate", coordinate.clone())]),
+            variant("double_click", vec![("coordinate", coordinate.clone())]),
+            variant("triple_click", vec![("coordinate", coordinate.clone())]),
+            variant("left_click_drag", vec![
+                ("coordinate", coordinate.clone()),
+                ("coordinate2", coordinate.clone()),
+            ]),
+            variant("left_mouse_down", vec![("coordinate", coordinate.clone())]),
+            variant("left_mouse_up", vec![("coordinate", coordinate.clone())]),
+        ]
+    })
+}
+
+fn computer_use_action_name(arguments: &Value) -> Option<&str> {
+    arguments.get("action").and_then(Value::as_str).or_else(|| {
+        arguments
+            .get("action")
+            .and_then(|value| value.get("action"))
+            .and_then(Value::as_str)
     })
 }
 
@@ -7056,7 +7043,11 @@ pub fn work_queue_tool_definitions() -> Vec<Value> {
     ]
 }
 
-fn filter_allowed_tools(mut tools: Vec<Value>, allowed: Option<&HashSet<String>>) -> Vec<Value> {
+fn filter_allowed_tools(
+    mut tools: Vec<Value>,
+    allowed: Option<&HashSet<String>>,
+    external_allowed: Option<&HashSet<String>>,
+) -> Vec<Value> {
     if let Some(allowed) = allowed {
         tools.retain(|tool| {
             tool.get("function")
@@ -7064,6 +7055,7 @@ fn filter_allowed_tools(mut tools: Vec<Value>, allowed: Option<&HashSet<String>>
                 .and_then(Value::as_str)
                 .is_some_and(|name| {
                     allowed.contains(name)
+                        || external_allowed.is_some_and(|items| items.contains(name))
                         || matches!(
                             name,
                             "tool_search"
@@ -7320,7 +7312,7 @@ mod tests {
             "propose_plan".to_owned(),
             "ask_user".to_owned(),
         ]);
-        let tools = filter_allowed_tools(tool_definitions(), Some(&allowed));
+        let tools = filter_allowed_tools(tool_definitions(), Some(&allowed), None);
         let names = tools
             .iter()
             .filter_map(|tool| {
@@ -7335,6 +7327,58 @@ mod tests {
         assert!(!names.contains("run_shell"));
         assert!(!names.contains("write_file"));
         assert!(!names.contains("list_dir"));
+    }
+
+    #[test]
+    fn external_mcp_tools_require_the_external_allowlist() {
+        let external = mcp_tool_definition(json!({
+            "name": "search",
+            "qualified_name": "server__search",
+            "inputSchema": {"type": "object"}
+        }));
+        let tools = filter_allowed_tools(
+            vec![external.clone()],
+            Some(&HashSet::from(["read_file".to_owned()])),
+            Some(&HashSet::from(["server__search".to_owned()])),
+        );
+        assert_eq!(tools, vec![external]);
+        assert!(
+            filter_allowed_tools(
+                vec![mcp_tool_definition(json!({"name": "search"}))],
+                Some(&HashSet::from(["read_file".to_owned()])),
+                Some(&HashSet::new()),
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn external_allowlist_without_builtin_allowlist_does_not_filter_builtins() {
+        let tools = filter_allowed_tools(tool_definitions(), None, Some(&HashSet::new()));
+        assert_eq!(tools.len(), tool_definitions().len());
+    }
+
+    #[test]
+    fn computer_use_schema_requires_coordinate_for_left_click() {
+        let schema = computer_use_parameters_schema();
+        let variants = schema["oneOf"].as_array().unwrap();
+        let left_click = variants
+            .iter()
+            .find(|variant| variant["properties"]["action"]["const"] == "left_click")
+            .unwrap();
+        assert!(
+            left_click["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "coordinate")
+        );
+    }
+
+    #[test]
+    fn host_mcp_tools_use_the_mcp_provider_name() {
+        let tool = mcp_tool_definition(json!({"name": "host_search"}));
+        assert_eq!(tool["function"]["name"], "mcp:host_search");
     }
 
     #[test]
@@ -7605,6 +7649,22 @@ mod tests {
         assert_eq!(tool_risk("browser_screenshot"), ToolRisk::Read);
         assert_eq!(tool_risk("browser_set_viewport"), ToolRisk::Read);
         assert_eq!(tool_risk("browser_click"), ToolRisk::External);
+    }
+
+    #[test]
+    fn computer_use_action_name_accepts_flat_and_nested_arguments() {
+        assert_eq!(
+            computer_use_action_name(&json!({"action": "screenshot"})),
+            Some("screenshot")
+        );
+        assert_eq!(
+            computer_use_action_name(&json!({"action": {"action": "screenshot"}})),
+            Some("screenshot")
+        );
+        assert_eq!(
+            computer_use_action_name(&json!({"action": "left_click"})),
+            Some("left_click")
+        );
     }
 
     #[test]
