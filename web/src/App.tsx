@@ -12203,9 +12203,9 @@ function AppContent() {
     if (!selected) throw new Error("Select a session before uploading.");
     return uploadTextAttachmentForSession(selected.id, file);
   };
-  const steer = (text: string) => {
+  const steer = async (text: string) => {
     if (!selected) return;
-    void command("steering", { sessionId: selected.id, text }).catch(onError);
+    await command("steering", { sessionId: selected.id, text });
   };
   const interrupt = async () => {
     if (!selected) return;
