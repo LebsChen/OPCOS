@@ -12233,57 +12233,59 @@ function AppContent() {
               </header>
               <div className="main-workspace">
                 <div className="main-chat">
-                  <div
-                    className="main-scroll"
-                    ref={transcriptScrollRef}
-                    onScroll={updateTranscriptScrollState}
-                  >
-                    <div ref={transcriptBottomRef}>
-                      <Transcript
-                        events={liveEvents}
-                        sessionId={selected.id}
-                        hostName={selected.host_name}
-                        running={effectiveRunning}
-                        onRetry={() => {
-                          void command("submit_turn", {
-                            request: { session_id: selected.id, text: "" },
-                          }).catch(onError);
-                        }}
-                        onQuestionAnswer={(callId, answer) => {
-                          void command("resolve_inbox", {
-                            sessionId: selected.id,
-                            callId,
-                            resolution: answer,
-                          }).catch(onError);
-                        }}
-                      />
-                    </div>
-                  </div>
-                  {showTranscriptJump && (
-                    <button
-                      className="transcript-jump-bottom"
-                      type="button"
-                      aria-label="Jump to latest conversation"
-                      title="Jump to latest conversation"
-                      onClick={jumpToTranscriptBottom}
+                  <div className="transcript-viewport">
+                    <div
+                      className="main-scroll"
+                      ref={transcriptScrollRef}
+                      onScroll={updateTranscriptScrollState}
                     >
-                      <svg
-                        aria-hidden="true"
-                        width="16"
-                        height="16"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                      >
-                        <path
-                          d="M6 9l6 6 6-6"
-                          stroke="currentColor"
-                          strokeWidth="1.8"
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
+                      <div ref={transcriptBottomRef}>
+                        <Transcript
+                          events={liveEvents}
+                          sessionId={selected.id}
+                          hostName={selected.host_name}
+                          running={effectiveRunning}
+                          onRetry={() => {
+                            void command("submit_turn", {
+                              request: { session_id: selected.id, text: "" },
+                            }).catch(onError);
+                          }}
+                          onQuestionAnswer={(callId, answer) => {
+                            void command("resolve_inbox", {
+                              sessionId: selected.id,
+                              callId,
+                              resolution: answer,
+                            }).catch(onError);
+                          }}
                         />
-                      </svg>
-                    </button>
-                  )}
+                      </div>
+                    </div>
+                    {showTranscriptJump && (
+                      <button
+                        className="transcript-jump-bottom"
+                        type="button"
+                        aria-label="Jump to latest conversation"
+                        title="Jump to latest conversation"
+                        onClick={jumpToTranscriptBottom}
+                      >
+                        <svg
+                          aria-hidden="true"
+                          width="16"
+                          height="16"
+                          viewBox="0 0 24 24"
+                          fill="none"
+                        >
+                          <path
+                            d="M6 9l6 6 6-6"
+                            stroke="currentColor"
+                            strokeWidth="1.8"
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                          />
+                        </svg>
+                      </button>
+                    )}
+                  </div>
                   {pendingApproval && (
                     <div className="transcript-interaction-card">
                       <ApprovalCard

@@ -547,6 +547,26 @@ body {
   line-height: 1.68;
   color: var(--ink);
 }
+.transcript .md {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.transcript .md :not(pre) > code {
+  overflow-wrap: anywhere;
+}
+.transcript .md pre,
+.transcript .md table {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+}
+.transcript-prose .md {
+  font-size: 14px;
+  line-height: 20px;
+}
 .md > :first-child {
   margin-top: 0;
 }
