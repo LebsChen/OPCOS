@@ -546,6 +546,15 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       ].includes(type)
     ) {
       continue;
+    } else if (type === "provider_waiting" || type === "provider_retrying") {
+      const activeWork = ensureWork(event.created_at_ms);
+      const message =
+        typeof data.message === "string" && data.message.trim()
+          ? data.message.trim()
+          : type === "provider_retrying"
+            ? `Retrying provider request (${String(data.attempt ?? "?")}/${String(data.max_attempts ?? "?")})`
+            : `Waiting for provider response (${String(data.elapsed_seconds ?? 0)}s)`;
+      activeWork.rows.push({ label: message, activityLabel: true });
     } else if (type === "steering_received" || type === "steering_applied") {
       const activeWork = ensureWork(event.created_at_ms);
       const iteration =
