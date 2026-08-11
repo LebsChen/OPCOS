@@ -45,7 +45,7 @@ import {
   latestPlan,
   mergeEvents,
   optimisticUserMessageEvent,
-  OPTIMISTIC_USER_EVENT_PREFIX,
+  optimisticUserMessageMatches,
   type TimelineEvent,
 } from "./timeline";
 import {
@@ -12017,6 +12017,7 @@ function AppContent() {
     if (!text || !homeHostId || running) return;
     const title =
       text.split(/\r?\n/, 1)[0].trim().slice(0, 80) || "New session";
+    let submittedSessionId: string | undefined;
     try {
       setRunning(true);
       const next = normalizeSession(
@@ -12034,6 +12035,7 @@ function AppContent() {
               .join("\n\n") || null,
         }),
       );
+      submittedSessionId = next.id;
       setSelected(next);
       setSurface("session");
       setHomeInput("");
@@ -12056,11 +12058,16 @@ function AppContent() {
         request: { session_id: next.id, text: requestText },
       });
     } catch (reason) {
-      const failedSessionId = submittingSessionIdRef.current;
-      if (failedSessionId) submittingSessionIdRef.current = undefined;
+      if (
+        submittedSessionId &&
+        submittingSessionIdRef.current === submittedSessionId
+      )
+        submittingSessionIdRef.current = undefined;
       setLiveTranscript((items) =>
         items.filter(
-          (event) => !event.event_id.startsWith(OPTIMISTIC_USER_EVENT_PREFIX),
+          (event) =>
+            !submittedSessionId ||
+            !optimisticUserMessageMatches(event, submittedSessionId, text),
         ),
       );
       setRunning(false);
@@ -12111,7 +12118,7 @@ function AppContent() {
         submittingSessionIdRef.current = undefined;
       setLiveTranscript((items) =>
         items.filter(
-          (event) => !event.event_id.startsWith(OPTIMISTIC_USER_EVENT_PREFIX),
+          (event) => !optimisticUserMessageMatches(event, sessionId, text),
         ),
       );
       setRunning(false);

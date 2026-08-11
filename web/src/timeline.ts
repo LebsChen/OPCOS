@@ -143,6 +143,19 @@ function eventSessionId(event: TimelineEvent): string | undefined {
   return undefined;
 }
 
+export function optimisticUserMessageMatches(
+  event: TimelineEvent,
+  sessionId: string,
+  text: string,
+): boolean {
+  if (!event.event_id.startsWith(OPTIMISTIC_USER_EVENT_PREFIX)) return false;
+  return (
+    eventSessionId(event) === sessionId &&
+    String(payload(event).message ?? payload(event).text ?? "").trim() ===
+      text.trim()
+  );
+}
+
 function toolLabel(tool: string, args: unknown): string {
   const values =
     args && typeof args === "object"
@@ -309,13 +322,13 @@ export function mergeEvents(
         (optimisticSessionId === undefined ||
           realSessionId === undefined ||
           optimisticSessionId === realSessionId) &&
+        real.created_at_ms >= event.created_at_ms &&
         String(payload(real).message ?? payload(real).text ?? "").trim() ===
           optimisticText
       );
     });
   });
-  return unique
-    .filter((event) => withoutReplacedOptimistic.includes(event))
+  return withoutReplacedOptimistic
     .map((event, index) => ({ event, index }))
     .sort(
       (a, b) =>

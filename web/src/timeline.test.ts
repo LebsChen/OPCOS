@@ -87,6 +87,21 @@ describe("single event-log timeline", () => {
     expect(mergeEvents([optimistic], persisted, true)).toEqual([persisted]);
   });
 
+  it("keeps a newer optimistic duplicate until its matching event arrives", () => {
+    const optimistic = optimisticUserMessageEvent("session-1", "continue");
+    const previous: TimelineEvent = {
+      type: "user_message",
+      event_id: "previous-user",
+      created_at_ms: optimistic.created_at_ms - 1,
+      session_id: "session-1",
+      message: " continue ",
+    };
+    expect(mergeEvents([previous, optimistic], [], true)).toEqual([
+      previous,
+      optimistic,
+    ]);
+  });
+
   it("shows one live tail action while a turn is running", () => {
     const nodes = buildTimeline(
       [
