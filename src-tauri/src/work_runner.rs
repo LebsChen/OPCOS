@@ -582,6 +582,8 @@ async fn create_runner_session(
             external_session_id: None,
             run_state: "idle".into(),
             stop_reason: "none".into(),
+            terminal_cause: None,
+            provider_finish_reason: None,
             created_at: now,
             updated_at: now,
             project_id: Some(project_id.to_owned()),

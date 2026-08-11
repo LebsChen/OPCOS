@@ -452,6 +452,8 @@ mod tests {
                 external_session_id: None,
                 run_state: "error".into(),
                 stop_reason: "tool_preflight_error".into(),
+                terminal_cause: None,
+                provider_finish_reason: None,
                 created_at: "2024-01-01T00:00:00Z".parse().unwrap(),
                 updated_at: "2024-01-01T00:00:00Z".parse().unwrap(),
                 project_id: None,

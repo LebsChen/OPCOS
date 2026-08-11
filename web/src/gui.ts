@@ -18,6 +18,8 @@ export type Session = {
   workspace?: string;
   run_state?: string;
   stop_reason?: string;
+  terminal_cause?: string;
+  provider_finish_reason?: string;
   archived?: boolean;
   project_id?: string | null;
   agent_id?: string | null;
