@@ -103,6 +103,9 @@ button:disabled {
   background: var(--column-surface);
   color: var(--ink);
 }
+.app.session-layout:not(.nav-collapsed) .sidebar {
+  border-right: 0;
+}
 /* Cloud-Dev-style collapsed navigation stays in the layout as an icon rail. */
 .app.nav-collapsed {
   grid-template-columns: 56px minmax(0, 1fr) var(--right-panel-width, 360px);
