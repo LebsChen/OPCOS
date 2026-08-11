@@ -1543,9 +1543,6 @@ h3 {
   align-items: center;
   min-width: 32px;
 }
-.app.session-layout > .main > .main-topbar > .main-topbar-side:first-child {
-  min-width: 0;
-}
 .app.session-layout .main-title {
   position: static;
   min-width: 0;
