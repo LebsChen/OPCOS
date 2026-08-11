@@ -23,6 +23,19 @@ export type Session = {
   agent_id?: string | null;
 };
 
+export function normalizePermissionMode(mode: string): string {
+  const normalized = mode.trim().toLowerCase();
+  return ["auto", "custom", "discuss", "interactive", "plan"].includes(
+    normalized,
+  )
+    ? normalized
+    : mode;
+}
+
+export function normalizeSession(session: Session): Session {
+  return { ...session, mode: normalizePermissionMode(session.mode) };
+}
+
 export type ProjectAgent = {
   id: string;
   project_id: string;

@@ -579,13 +579,6 @@ export function Transcript({
               onAnswer={(answer) => onQuestionAnswer?.(node.callId, answer)}
             />
           );
-        if (node.kind === "sleep")
-          return (
-            <div className="transcript-sleep" key={index}>
-              <span className="transcript-sleep-dot" />
-              {node.text}
-            </div>
-          );
         if (node.kind === "notice")
           return (
             <div

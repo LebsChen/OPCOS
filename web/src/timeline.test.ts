@@ -83,8 +83,10 @@ describe("single event-log timeline", () => {
       resultSummary: undefined,
     });
     expect(nodes).toContainEqual({
-      kind: "sleep",
-      text: "OPCOS went to sleep",
+      kind: "notice",
+      text: "Turn complete — waiting for your next instruction",
+      tone: "info",
+      noticeKind: "turn_finished",
     });
     expect(buildTimeline(saved)).toEqual(nodes);
     const resumed = buildTimeline([
@@ -96,7 +98,11 @@ describe("single event-log timeline", () => {
         message: "Continue",
       },
     ] as TimelineEvent[]);
-    expect(resumed.some((node) => node.kind === "sleep")).toBe(false);
+    expect(
+      resumed.some(
+        (node) => node.kind === "notice" && node.noticeKind === "turn_finished",
+      ),
+    ).toBe(false);
   });
 
   it("derives the current task state from the timeline plan", () => {
