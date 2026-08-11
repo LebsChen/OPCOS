@@ -11774,12 +11774,13 @@ async fn session_external_tools(
                 .filter_map(|tool| Some((tool.get("name")?.as_str()?.to_owned(), tool.clone())));
             match state.database.lock() {
                 Ok(connection) => {
-                    tools.extend(select_mcp_tools(
-                        &connection,
-                        session_id,
-                        "host",
-                        candidates,
-                    ));
+                    let selected = select_mcp_tools(&connection, session_id, "host", candidates);
+                    allowed_names.extend(selected.iter().filter_map(|tool| {
+                        tool.get("name")
+                            .and_then(Value::as_str)
+                            .map(|name| format!("mcp:{name}"))
+                    }));
+                    tools.extend(selected);
                 }
                 Err(_) => {
                     errors.push("database lock poisoned while filtering host MCP tools".into())
@@ -11879,14 +11880,12 @@ async fn session_external_tools(
                 Vec::new()
             }
         };
-        if host_id == "local" {
-            allowed_names.extend(
-                selected
-                    .iter()
-                    .filter_map(|tool| tool.get("qualified_name")?.as_str())
-                    .map(str::to_owned),
-            );
-        }
+        allowed_names.extend(
+            selected
+                .iter()
+                .filter_map(|tool| tool.get("qualified_name")?.as_str())
+                .map(str::to_owned),
+        );
         tools.extend(selected);
     }
     Ok(SessionExternalTools {
@@ -11913,6 +11912,9 @@ async fn refresh_session_mcp_tools(
     )
     .await?;
     engine.set_external_tools(external.tools).await;
+    engine
+        .set_external_allowed_tools(external.allowed_names)
+        .await;
     for error in external.errors {
         let _ = state.mcp_notification_app.emit(
             "mcp-catalog-refresh-error",
@@ -12623,6 +12625,9 @@ async fn engine_for_with_context(
     )
     .await?;
     engine.set_external_tools(session_tools.tools).await;
+    engine
+        .set_external_allowed_tools(session_tools.allowed_names)
+        .await;
     for error in session_tools.errors {
         let _ = app.emit(
             "mcp-catalog-refresh-error",
@@ -12631,11 +12636,6 @@ async fn engine_for_with_context(
                 "error": error,
             }),
         );
-    }
-    if host_id == "local"
-        && let Some(allowed) = allowed_tools.as_mut()
-    {
-        allowed.extend(session_tools.allowed_names);
     }
     if let Some(allowed_tools) = allowed_tools {
         engine.set_allowed_tools(allowed_tools).await;
@@ -13526,9 +13526,10 @@ fn parse_computer_use_arguments(
 ) -> Result<(ComputerUseAction, Option<ScreenBounds>), String> {
     let action = arguments
         .get("action")
+        .filter(|value| value.is_object())
         .cloned()
-        .ok_or_else(|| "computer_use action is required".to_owned())
-        .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()))?;
+        .unwrap_or_else(|| arguments.clone());
+    let action = serde_json::from_value(action).map_err(|error| error.to_string())?;
     let width = arguments.get("screen_width").and_then(Value::as_u64);
     let height = arguments.get("screen_height").and_then(Value::as_u64);
     let bounds = match (width, height) {

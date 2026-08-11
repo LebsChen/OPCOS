@@ -354,7 +354,7 @@ describe("GUI boundary behavior", () => {
     expect(source).toContain(
       '{opened.includes("desktop") && panelTab === "desktop" && (',
     );
-    expect(source).toContain('<SurfaceView\n                  tab="desktop"');
+    expect(source).toContain('capabilities.vnc?.state === "Unavailable"');
     expect(source).toContain(
       '{opened.includes("ide") && panelTab === "ide" && (',
     );
@@ -363,6 +363,17 @@ describe("GUI boundary behavior", () => {
     );
     expect(source).not.toContain('<PlannedPane title="Desktop">');
     expect(source).not.toContain('<PlannedPane title="Editor">');
+  });
+
+  it("gates remote surfaces by session capabilities and keeps approvals keyed", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain('"session_capabilities"');
+    expect(source).toContain('capabilities.browser?.state === "Unavailable"');
+    expect(source).toContain("Object.values(pendingApprovals)");
+    expect(source).toContain("delete next[callId]");
   });
 
   it("submits the first message optimistically without blocking on refresh", () => {

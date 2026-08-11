@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ring::{
     aead::{self, Aad, LessSafeKey, Nonce, UnboundKey},
     digest,
@@ -15,6 +15,7 @@ use thiserror::Error;
 
 pub const TRANSIENT_SESSION_EVENT_TYPES: &[&str] =
     &["assistant_delta", "reasoning_delta", "tool_call_delta"];
+const ACTION_IN_FLIGHT_LEASE_SECONDS: i64 = 300;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -2595,11 +2596,24 @@ impl SqliteStore {
                 statement.query_row([idempotency_key], action_ledger_from_row)?
             };
             let was_failed = existing.status == "failed";
+            let lease_cutoff =
+                (Utc::now() - ChronoDuration::seconds(ACTION_IN_FLIGHT_LEASE_SECONDS)).to_rfc3339();
+            let lease_expired = existing.status == "in_flight"
+                && DateTime::parse_from_rfc3339(&existing.started_at)
+                    .ok()
+                    .is_some_and(|started_at| {
+                        Utc::now()
+                            .signed_duration_since(started_at.with_timezone(&Utc))
+                            .num_seconds()
+                            >= ACTION_IN_FLIGHT_LEASE_SECONDS
+                    });
             connection.execute(
                 "UPDATE action_ledger SET status='in_flight', attempts=attempts+1,
                  started_at=?1, updated_at=?1, finished_at=NULL
-                 WHERE idempotency_key=?2 AND status='failed'",
-                params![now, idempotency_key],
+                 WHERE idempotency_key=?2 AND
+                       (status='failed' OR
+                        (status='in_flight' AND started_at <= ?3))",
+                params![now, idempotency_key, lease_cutoff],
             )?;
             let mut statement = connection.prepare(
                 "SELECT action_id,action_type,platform,account_id,idempotency_key,external_id,
@@ -2608,7 +2622,7 @@ impl SqliteStore {
                  FROM action_ledger WHERE idempotency_key=?1",
             )?;
             let record = statement.query_row([idempotency_key], action_ledger_from_row)?;
-            Ok(if was_failed {
+            Ok(if was_failed || lease_expired {
                 ActionBeginResult::PreviouslyFailed {
                     action_id: record.action_id,
                     attempts: record.attempts,
@@ -7858,6 +7872,42 @@ mod tests {
                 .unwrap()
                 .contains("[REDACTED]")
         );
+    }
+
+    #[test]
+    fn action_ledger_reclaims_expired_in_flight_leases() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let first = store
+            .begin_action("ship", "market", "account-1", "idem-expired", None, None)
+            .unwrap();
+        let action_id = match first {
+            ActionBeginResult::Fresh(record) => record.action_id,
+            other => panic!("expected fresh, got {other:?}"),
+        };
+        let in_flight = store
+            .begin_action("ship", "market", "account-1", "idem-expired", None, None)
+            .unwrap();
+        assert!(matches!(in_flight, ActionBeginResult::InFlight { .. }));
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE action_ledger SET started_at=?1 WHERE action_id=?2",
+                params![
+                    (Utc::now() - ChronoDuration::seconds(ACTION_IN_FLIGHT_LEASE_SECONDS + 1))
+                        .to_rfc3339(),
+                    action_id
+                ],
+            )
+            .unwrap();
+        let reclaimed = store
+            .begin_action("ship", "market", "account-1", "idem-expired", None, None)
+            .unwrap();
+        assert!(matches!(
+            reclaimed,
+            ActionBeginResult::PreviouslyFailed { attempts: 2, .. }
+        ));
     }
 
     #[test]

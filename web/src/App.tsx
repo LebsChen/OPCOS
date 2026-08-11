@@ -7719,7 +7719,10 @@ function McpManage({
                 <IntegrationCard
                   icon={String(tool.name).slice(0, 1).toUpperCase()}
                   title={String(tool.name)}
-                  badge={{ label: "Enabled", tone: "success" }}
+                  badge={{
+                    label: tool.enabled === true ? "Enabled" : "Disabled",
+                    tone: tool.enabled === true ? "success" : "neutral",
+                  }}
                   description={`${String(tool.transport || "remote")} · ${String(tool.command || tool.url || "host-provided")}`}
                   actions={
                     <Button
@@ -10542,6 +10545,26 @@ function SessionRightPanel({
     null,
   );
   const [iterationEvents, setIterationEvents] = useState<TimelineEvent[]>([]);
+  const [capabilities, setCapabilities] = useState<
+    Record<string, { state?: string; reason?: string }>
+  >({});
+  useEffect(() => {
+    setCapabilities({});
+    void command<{
+      items?: Array<{ name: string; state: string; reason?: string | null }>;
+    }>("session_capabilities", { sessionId: selected.id })
+      .then((value) =>
+        setCapabilities(
+          Object.fromEntries(
+            (value.items || []).map((item) => [
+              item.name,
+              { state: item.state, reason: item.reason || undefined },
+            ]),
+          ),
+        ),
+      )
+      .catch(onError);
+  }, [selected.id]);
   useEffect(() => {
     if (!focusTabRequest) return;
     setPanelTab(focusTabRequest.tab);
@@ -10599,9 +10622,20 @@ function SessionRightPanel({
     label: string;
     icon: RailIconName;
   }> = [
-    { id: "desktop", label: "Desktop", icon: "monitor" },
+    ...(capabilities.vnc?.state === "Unavailable" &&
+    capabilities.computer_use?.state === "Unavailable" &&
+    panelTab !== "desktop"
+      ? []
+      : [
+          {
+            id: "desktop" as const,
+            label: "Desktop",
+            icon: "monitor" as const,
+          },
+        ]),
     { id: "ide", label: "Editor", icon: "code" },
-    ...(selected.host_id === "local"
+    ...(selected.host_id === "local" ||
+    (capabilities.pty?.state === "Unavailable" && panelTab !== "terminal")
       ? []
       : [
           {
@@ -10610,11 +10644,20 @@ function SessionRightPanel({
             icon: "terminal" as const,
           },
         ]),
-    ...(selected.host_id === "local"
+    ...(selected.host_id === "local" ||
+    (capabilities.browser?.state === "Unavailable" && panelTab !== "browser")
       ? []
       : [{ id: "browser" as const, label: "Browser", icon: "grid" as const }]),
   ];
   const tabs = [...informationTabs, ...workspaceTabs, ...remoteTabs];
+  const unavailableCapability =
+    panelTab === "browser" && capabilities.browser?.state === "Unavailable"
+      ? capabilities.browser
+      : panelTab === "desktop" &&
+          capabilities.vnc?.state === "Unavailable" &&
+          capabilities.computer_use?.state === "Unavailable"
+        ? capabilities.vnc
+        : null;
   const workspaceTabIds: PanelTab[] = [
     "review",
     "terminal",
@@ -10803,11 +10846,17 @@ function SessionRightPanel({
             )}
             {opened.includes("desktop") && panelTab === "desktop" && (
               <div className="session-pane">
-                <SurfaceView
-                  tab="desktop"
-                  selected={selected}
-                  onError={onError}
-                />
+                {unavailableCapability ? (
+                  <div className="rail-error">
+                    {unavailableCapability.reason || "Capability unavailable."}
+                  </div>
+                ) : (
+                  <SurfaceView
+                    tab="desktop"
+                    selected={selected}
+                    onError={onError}
+                  />
+                )}
               </div>
             )}
             {opened.includes("ide") && panelTab === "ide" && (
@@ -10835,11 +10884,18 @@ function SessionRightPanel({
                   key={item.id}
                   style={{ display: panelTab === item.id ? "flex" : "none" }}
                 >
-                  <SurfaceView
-                    tab={item.id as Exclude<SurfaceTab, "chat">}
-                    selected={selected}
-                    onError={onError}
-                  />
+                  {item.id === "browser" &&
+                  capabilities.browser?.state === "Unavailable" ? (
+                    <div className="rail-error">
+                      {capabilities.browser.reason || "Capability unavailable."}
+                    </div>
+                  ) : (
+                    <SurfaceView
+                      tab={item.id as Exclude<SurfaceTab, "chat">}
+                      selected={selected}
+                      onError={onError}
+                    />
+                  )}
                 </div>
               ))}
           </div>
@@ -11207,8 +11263,9 @@ function AppContent() {
     useState<PendingQuestion | null>(null);
   const [pendingQuestionCollapsed, setPendingQuestionCollapsed] =
     useState(false);
-  const [pendingApproval, setPendingApproval] =
-    useState<PendingApproval | null>(null);
+  const [pendingApprovals, setPendingApprovals] = useState<
+    Record<string, PendingApproval>
+  >({});
   useEffect(() => {
     setPendingQuestionCollapsed(false);
   }, [pendingQuestion?.callId]);
@@ -11621,7 +11678,7 @@ function AppContent() {
       submittingSessionIdRef.current === selected?.id;
     if (!submittingSelectedSession) setLiveTranscript([]);
     setPendingQuestion(null);
-    setPendingApproval(null);
+    setPendingApprovals({});
     if (!submittingSelectedSession) setRunning(false);
     if (!selected) return;
     void Promise.all([
@@ -11644,9 +11701,18 @@ function AppContent() {
         const pending = pendingItems.find(
           (item) => item.tool === "ask_user" && item.state !== "resolved",
         );
-        const approval = pendingItems.find(
-          (item) => item.tool !== "ask_user" && item.state !== "resolved",
-        );
+        const approvals = pendingItems
+          .filter(
+            (item) => item.tool !== "ask_user" && item.state !== "resolved",
+          )
+          .reduce<Record<string, PendingApproval>>((items, item) => {
+            items[item.call_id] = {
+              callId: item.call_id,
+              name: item.tool,
+              args: item.arguments,
+            };
+            return items;
+          }, {});
         const inboxPending = inboxItems.find(
           (item) =>
             item.session_id === selected.id &&
@@ -11665,13 +11731,7 @@ function AppContent() {
             ),
           );
         }
-        if (approval) {
-          setPendingApproval({
-            callId: approval.call_id,
-            name: approval.tool,
-            args: approval.arguments,
-          });
-        }
+        setPendingApprovals(approvals);
         setTranscript(mergeEvents([], items));
         if (submittingSessionIdRef.current !== selected.id)
           setLiveTranscript([]);
@@ -11861,7 +11921,10 @@ function AppContent() {
             ? (approvalPayload.arguments as Record<string, unknown>)
             : {};
         if (callId && tool !== "ask_user") {
-          setPendingApproval({ callId, name: tool, args });
+          setPendingApprovals((current) => ({
+            ...current,
+            [callId]: { callId, name: tool, args },
+          }));
         }
       }
       if (payload.kind === "approval_resolved") {
@@ -11869,9 +11932,24 @@ function AppContent() {
           typeof payload.payload?.call_id === "string"
             ? payload.payload.call_id
             : "";
-        setPendingApproval((current) =>
-          current?.callId === callId ? null : current,
-        );
+        setPendingApprovals((current) => {
+          const next = { ...current };
+          delete next[callId];
+          return next;
+        });
+      }
+      if (
+        payload.kind === "approval_resolved" ||
+        (payload.kind === "notice" &&
+          String(payload.payload?.kind) === "approval_pending")
+      ) {
+        void command<TimelineEvent[]>("read_session_events", {
+          sessionId: selected?.id,
+        })
+          .then((items) =>
+            setTranscript((current) => mergeEvents(current, items)),
+          )
+          .catch(onError);
       }
       if (payload.kind === "coordination_approval_pending") {
         void command<InboxRecord[]>("list_inbox").then(setInbox).catch(onError);
@@ -12479,8 +12557,11 @@ function AppContent() {
                       </button>
                     )}
                   </div>
-                  {pendingApproval && (
-                    <div className="transcript-interaction-card">
+                  {Object.values(pendingApprovals).map((pendingApproval) => (
+                    <div
+                      className="transcript-interaction-card"
+                      key={pendingApproval.callId}
+                    >
                       <ApprovalCard
                         item={{
                           kind: "approval",
@@ -12500,7 +12581,7 @@ function AppContent() {
                         }}
                       />
                     </div>
-                  )}
+                  ))}
                   {pendingQuestion && pendingQuestionCollapsed && (
                     <div className="transcript-question-collapsed">
                       <span className="transcript-question-collapsed-copy">
