@@ -921,10 +921,17 @@ export function PlusMenu({
     maxHeight: number;
   } | null>(null);
   const [openSubmenu, setOpenSubmenu] = useState<string | null>(null);
+  const [submenuStyle, setSubmenuStyle] = useState<{
+    top: number;
+    left: number;
+    maxHeight: number;
+  } | null>(null);
   const submenuRef = useRef<HTMLDivElement>(null);
   const submenuTriggerRefs = useRef<Record<string, HTMLButtonElement | null>>(
     {},
   );
+  const openSubmenuRef = useRef<string | null>(null);
+  openSubmenuRef.current = openSubmenu;
   const closeMenu = (restoreFocus = true) => {
     onOpenChange(false);
     if (restoreFocus) triggerRef.current?.focus();
@@ -937,9 +944,10 @@ export function PlusMenu({
     const escape = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        if (openSubmenu) {
+        if (openSubmenuRef.current) {
+          const submenu = openSubmenuRef.current;
           setOpenSubmenu(null);
-          submenuTriggerRefs.current[openSubmenu]?.focus();
+          submenuTriggerRefs.current[submenu]?.focus();
         } else {
           closeMenu();
         }
@@ -978,6 +986,25 @@ export function PlusMenu({
   }, [open, assets.length, secrets.length]);
   useEffect(() => {
     if (!openSubmenu) return;
+    const trigger = submenuTriggerRefs.current[openSubmenu];
+    if (trigger && submenuRef.current) {
+      const triggerRect = trigger.getBoundingClientRect();
+      const submenuRect = submenuRef.current.getBoundingClientRect();
+      const margin = 8;
+      const gap = 4;
+      const maxHeight = Math.max(80, window.innerHeight - margin * 2);
+      const height = Math.min(submenuRect.height, maxHeight);
+      const left =
+        triggerRect.right + gap + submenuRect.width <=
+        window.innerWidth - margin
+          ? triggerRect.right + gap
+          : Math.max(margin, triggerRect.left - submenuRect.width - gap);
+      const top = Math.min(
+        Math.max(margin, triggerRect.top),
+        Math.max(margin, window.innerHeight - height - margin),
+      );
+      setSubmenuStyle({ top, left, maxHeight });
+    }
     submenuRef.current
       ?.querySelector<HTMLButtonElement>("button:not(:disabled)")
       ?.focus();
@@ -1069,6 +1096,15 @@ export function PlusMenu({
                   role="menuitem"
                   aria-haspopup={hasSubmenu ? "menu" : undefined}
                   aria-expanded={hasSubmenu && openSubmenu === category.kind}
+                  onKeyDown={(event) => {
+                    if (
+                      hasSubmenu &&
+                      (event.key === "Enter" || event.key === "ArrowRight")
+                    ) {
+                      event.preventDefault();
+                      setOpenSubmenu(category.kind);
+                    }
+                  }}
                   onClick={() => {
                     if (hasSubmenu) {
                       setOpenSubmenu((value) =>
@@ -1096,6 +1132,15 @@ export function PlusMenu({
                     className="pm-submenu"
                     role="menu"
                     aria-label={`${category.label} items`}
+                    style={submenuStyle ?? undefined}
+                    onKeyDown={(event) => {
+                      if (event.key === "Escape" || event.key === "ArrowLeft") {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        setOpenSubmenu(null);
+                        submenuTriggerRefs.current[category.kind]?.focus();
+                      }
+                    }}
                   >
                     {matching.map((asset) => (
                       <button
@@ -1127,6 +1172,12 @@ export function PlusMenu({
                 role="menuitem"
                 aria-haspopup="menu"
                 aria-expanded={openSubmenu === "secrets"}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === "ArrowRight") {
+                    event.preventDefault();
+                    setOpenSubmenu("secrets");
+                  }
+                }}
                 onClick={() =>
                   setOpenSubmenu((value) =>
                     value === "secrets" ? null : "secrets",
@@ -1143,6 +1194,15 @@ export function PlusMenu({
                   className="pm-submenu"
                   role="menu"
                   aria-label="Secrets items"
+                  style={submenuStyle ?? undefined}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape" || event.key === "ArrowLeft") {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setOpenSubmenu(null);
+                      submenuTriggerRefs.current.secrets?.focus();
+                    }
+                  }}
                 >
                   {secrets.map((secret) => (
                     <button
