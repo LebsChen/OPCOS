@@ -17,6 +17,9 @@ import {
   reconcileSelectedIdAfterRefresh,
   selectedSessionFromList,
   sessionViewSelection,
+  shouldRefreshForSessionLifecycleEvent,
+  shouldResetSurfaceForSleep,
+  shouldShowSurfaceReconnect,
   updateSessionRunState,
   projectAgentRosterHost,
   projectAgentRosterValue,
@@ -24,6 +27,26 @@ import {
 } from "./gui";
 
 describe("GUI boundary behavior", () => {
+  it("routes session lifecycle events through the shared Tauri event channel", () => {
+    expect(
+      shouldRefreshForSessionLifecycleEvent({ kind: "session-sleep" }),
+    ).toBe(true);
+    expect(
+      shouldRefreshForSessionLifecycleEvent({ kind: "session-wake" }),
+    ).toBe(true);
+    expect(shouldRefreshForSessionLifecycleEvent({ kind: "turn_done" })).toBe(
+      false,
+    );
+  });
+
+  it("resets a surface only on the transition into sleep", () => {
+    expect(shouldResetSurfaceForSleep("awake", "asleep")).toBe(true);
+    expect(shouldResetSurfaceForSleep("asleep", "asleep")).toBe(false);
+    expect(shouldResetSurfaceForSleep("asleep", "awake")).toBe(false);
+    expect(shouldShowSurfaceReconnect("asleep")).toBe(true);
+    expect(shouldShowSurfaceReconnect("awake")).toBe(false);
+  });
+
   it("normalizes persisted permission modes at the frontend boundary", () => {
     expect(normalizePermissionMode("Interactive")).toBe("interactive");
     expect(normalizePermissionMode("Auto")).toBe("auto");
@@ -474,5 +497,13 @@ describe("GUI boundary behavior", () => {
     );
     expect(source).toContain("lastTouchedSessionRef");
     expect(source).toContain("60_000");
+    expect(source).toContain('selected?.sleep_state === "asleep"');
+    expect(source).toContain('listen<UiEvent>("opcos://event"');
+    expect(source).toContain("shouldRefreshForSessionLifecycleEvent(payload)");
+    expect(source).not.toContain('listen("session-sleep"');
+    expect(source).not.toContain('listen("session-wake"');
+    expect(source).toContain("surfaceSleepingDescription");
+    expect(source).toContain("reconnectSurface");
+    expect(source).toContain("touchSessionActivity");
   });
 });

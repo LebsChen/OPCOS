@@ -35,6 +35,9 @@ import {
   selectedSessionFromList,
   sessionViewSelection,
   submitFailureMessage,
+  shouldRefreshForSessionLifecycleEvent,
+  shouldResetSurfaceForSleep,
+  shouldShowSurfaceReconnect,
   type PendingQuestionData,
   reconcileSelectedIdAfterRefresh,
   updateSessionRunState,
@@ -2526,6 +2529,7 @@ function SurfaceView({
   const surfaceGenerationRef = useRef(0);
   const [vncPassword, setVncPassword] = useState<string | null>(null);
   const [surfaceError, setSurfaceError] = useState("");
+  const selectedSleepStateRef = useRef(selected.sleep_state);
   const [browserFrame, setBrowserFrame] = useState<{
     image: string;
     mime: string;
@@ -2537,10 +2541,28 @@ function SurfaceView({
   const [worklog, setWorklog] = useState<Record<string, unknown> | null>(null);
   const [busy, setBusy] = useState(false);
   const [ideError, setIdeError] = useState("");
+  const [sleeping, setSleeping] = useState(
+    shouldShowSurfaceReconnect(selected.sleep_state),
+  );
+  const startInFlightRef = useRef(false);
+  const lastTouchRef = useRef(0);
+  const touchSessionActivity = () => {
+    const now = Date.now();
+    if (
+      selected.sleep_state !== "asleep" &&
+      now - lastTouchRef.current < 60_000
+    )
+      return;
+    lastTouchRef.current = now;
+    void command("touch_session", { sessionId: selected.id }).catch(onError);
+  };
   const start = async (surface: string) => {
+    if (startInFlightRef.current) return;
     const generation = surfaceGenerationRef.current;
     try {
+      startInFlightRef.current = true;
       setBusy(true);
+      setSurfaceError("");
       const nextPort = await command<number>("start_surface", {
         sessionId: selected.id,
         hostId: selected.host_id,
@@ -2567,9 +2589,27 @@ function SurfaceView({
       setSurfaceError(errorMessage(error));
       onError(error);
     } finally {
+      startInFlightRef.current = false;
       setBusy(false);
     }
   };
+  useEffect(() => {
+    const previousSleepState = selectedSleepStateRef.current;
+    selectedSleepStateRef.current = selected.sleep_state;
+    if (shouldResetSurfaceForSleep(previousSleepState, selected.sleep_state)) {
+      surfaceGenerationRef.current += 1;
+      const activePort = portRef.current;
+      portRef.current = null;
+      setPort(null);
+      if (activePort !== null)
+        void command("stop_surface", { port: activePort });
+      setSleeping(true);
+      setSurfaceError(translate("surfaceSleepingDescription"));
+    } else if (!shouldShowSurfaceReconnect(selected.sleep_state) && sleeping) {
+      setSleeping(false);
+      setSurfaceError("");
+    }
+  }, [selected.sleep_state, sleeping]);
   useEffect(() => {
     return () => {
       surfaceGenerationRef.current += 1;
@@ -2591,10 +2631,12 @@ function SurfaceView({
     setDiff(null);
     setWorklog(null);
     setIdeError("");
+    setSleeping(shouldShowSurfaceReconnect(selected.sleep_state));
+    selectedSleepStateRef.current = selected.sleep_state;
   }, [selected.id]);
   useEffect(() => {
     if (tab === "terminal" || tab === "desktop" || tab === "browser") {
-      if (!port) {
+      if (!port && !sleeping) {
         void start(
           tab === "terminal" ? "pty" : tab === "desktop" ? "vnc" : "cdp",
         );
@@ -2625,6 +2667,7 @@ function SurfaceView({
     port,
     ideUrl,
     ideError,
+    sleeping,
   ]);
   useEffect(() => {
     if (tab !== "browser") return;
@@ -2686,7 +2729,10 @@ function SurfaceView({
       terminal.resize(cols, rows);
       send(JSON.stringify({ type: "resize", cols, rows }));
     };
-    const input = terminal.onData((data) => send(encoder.encode(data)));
+    const input = terminal.onData((data) => {
+      touchSessionActivity();
+      send(encoder.encode(data));
+    });
     terminal.onResize(({ cols, rows }) =>
       send(JSON.stringify({ type: "resize", cols, rows })),
     );
@@ -2699,7 +2745,7 @@ function SurfaceView({
       socket.close();
       terminal.dispose();
     };
-  }, [selected.id, port]);
+  }, [selected.id, port, sleeping]);
   useEffect(() => {
     if (tab !== "desktop" || !port || !vncHost.current) return;
     const rfb = new RFB(vncHost.current, `ws://127.0.0.1:${port}`, {
@@ -2734,11 +2780,35 @@ function SurfaceView({
             : "Remote VNC disconnected before the desktop loaded.",
         );
     });
-    return () => rfb.disconnect();
-  }, [selected.id, port, tab, vncPassword]);
+    const host = vncHost.current;
+    const onUserInput = () => touchSessionActivity();
+    host?.addEventListener("pointerdown", onUserInput);
+    host?.addEventListener("keydown", onUserInput);
+    host?.addEventListener("wheel", onUserInput, { passive: true });
+    return () => {
+      host?.removeEventListener("pointerdown", onUserInput);
+      host?.removeEventListener("keydown", onUserInput);
+      host?.removeEventListener("wheel", onUserInput);
+      rfb.disconnect();
+    };
+  }, [selected.id, port, tab, vncPassword, sleeping]);
+  const reconnect = () => {
+    setSleeping(false);
+    setSurfaceError("");
+    if (tab === "terminal" || tab === "desktop" || tab === "browser")
+      void start(
+        tab === "terminal" ? "pty" : tab === "desktop" ? "vnc" : "cdp",
+      );
+  };
   if (tab === "terminal" || tab === "desktop" || tab === "browser")
     return (
       <div className="surface-panel">
+        {shouldShowSurfaceReconnect(selected.sleep_state) && sleeping && (
+          <div className="surface-status warning">
+            <p>{translate("surfaceSleepingDescription")}</p>
+            <Button onClick={reconnect}>{translate("reconnectSurface")}</Button>
+          </div>
+        )}
         {busy && (
           <div className="surface-status muted">
             Connecting to the bound remote host…
@@ -2747,7 +2817,7 @@ function SurfaceView({
         {surfaceError && (
           <div className="surface-status error">{surfaceError}</div>
         )}
-        {!busy && !port && (
+        {!sleeping && !busy && !port && (
           <div className="surface-status warning">
             Remote surface unavailable.
           </div>
@@ -11327,22 +11397,12 @@ function AppContent() {
     if (selectedId) {
       const now = Date.now();
       const lastTouched = lastTouchedSessionRef.current[selectedId] ?? 0;
-      if (now - lastTouched >= 60_000) {
+      if (selected?.sleep_state === "asleep" || now - lastTouched >= 60_000) {
         lastTouchedSessionRef.current[selectedId] = now;
         void command("touch_session", { sessionId: selectedId });
       }
     }
   }, [selectedId]);
-  useEffect(() => {
-    const subscriptions = [
-      listen("session-sleep", () => void refresh().catch(onError)),
-      listen("session-wake", () => void refresh().catch(onError)),
-    ];
-    return () => {
-      for (const subscription of subscriptions)
-        void subscription.then((unlisten) => unlisten());
-    };
-  }, []);
   const effectiveRunning = effectiveRunningState(
     pendingQuestion !== null,
     selected?.run_state,
@@ -11839,6 +11899,10 @@ function AppContent() {
         typeof payload.payload.secret_backend === "string"
       ) {
         setSecretBackend(payload.payload.secret_backend);
+      }
+      if (shouldRefreshForSessionLifecycleEvent(payload)) {
+        void refresh().catch(onError);
+        return;
       }
       if (payload.session_id && payload.session_id !== selectedIdRef.current)
         return;

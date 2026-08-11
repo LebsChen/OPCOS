@@ -113,6 +113,25 @@ export type TranscriptItem = {
 export type SurfaceTab =
   "chat" | "terminal" | "desktop" | "browser" | "ide" | "review" | "worklog";
 
+export function shouldRefreshForSessionLifecycleEvent(payload: {
+  kind: string;
+}): boolean {
+  return payload.kind === "session-sleep" || payload.kind === "session-wake";
+}
+
+export function shouldResetSurfaceForSleep(
+  previousSleepState: string | undefined,
+  nextSleepState: string | undefined,
+): boolean {
+  return previousSleepState !== "asleep" && nextSleepState === "asleep";
+}
+
+export function shouldShowSurfaceReconnect(
+  sleepState: string | undefined,
+): boolean {
+  return sleepState === "asleep";
+}
+
 export type PendingQuestionData = {
   callId: string;
   question: string;

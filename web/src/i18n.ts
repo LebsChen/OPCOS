@@ -78,6 +78,9 @@ const messages: Record<Locale, Record<string, string>> = {
     workingNow: "Working now",
     sleeping: "Sleeping (will wake itself)",
     sessionAsleep: "Asleep (the next message will reconnect it)",
+    surfaceSleepingDescription:
+      "This panel was disconnected because the session is asleep. Reconnect to wake it.",
+    reconnectSurface: "Reconnect",
     sessionActions: "Session actions",
     deleteConfirm: "Click again to permanently delete",
     deleteQuestion: "Delete?",
@@ -187,6 +190,8 @@ const messages: Record<Locale, Record<string, string>> = {
     workingNow: "正在工作",
     sleeping: "休眠中（将自动唤醒）",
     sessionAsleep: "已休眠（下一条消息会自动重连）",
+    surfaceSleepingDescription: "会话休眠后此面板已断开。点击重连以唤醒会话。",
+    reconnectSurface: "重连",
     sessionActions: "会话操作",
     deleteConfirm: "再次点击以永久删除",
     deleteQuestion: "删除？",
