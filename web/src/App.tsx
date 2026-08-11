@@ -11390,6 +11390,7 @@ function AppContent() {
   const [navCollapsed, setNavCollapsed] = useState(
     () => localStorage.getItem(NAV_COLLAPSED_KEY) === "1",
   );
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
   const toggleNav = () => {
     const next = !navCollapsed;
     setNavCollapsed(next);
@@ -11412,6 +11413,11 @@ function AppContent() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   });
+  useEffect(() => {
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
   const [hostName, setHostName] = useState("");
   const [hostUrl, setHostUrl] = useState("");
   const [hostToken, setHostToken] = useState("");
@@ -12226,13 +12232,27 @@ function AppContent() {
       throw reason;
     }
   };
+  const readableConversationWidth = 360;
+  const baseNavWidth = navCollapsed ? 56 : navWidth;
+  const baseSplitterWidth = navCollapsed ? 0 : 6;
+  const openDrawerConversationWidth =
+    viewportWidth - baseNavWidth - baseSplitterWidth - rightPanelWidth;
+  const responsiveDrawerCollapsed =
+    !drawerCollapsed && openDrawerConversationWidth < readableConversationWidth;
+  const effectiveDrawerCollapsed = drawerCollapsed || responsiveDrawerCollapsed;
+  const effectiveDrawerWidth = effectiveDrawerCollapsed ? 44 : rightPanelWidth;
+  const drawerYieldConversationWidth =
+    viewportWidth - baseNavWidth - baseSplitterWidth - effectiveDrawerWidth;
+  const responsiveNavCollapsed =
+    !navCollapsed && drawerYieldConversationWidth < readableConversationWidth;
+  const effectiveNavCollapsed = navCollapsed || responsiveNavCollapsed;
   return (
     <div
-      className={`app ${surface === "session" && selected ? "session-layout" : "surface-layout"}${surface === "session" && selected && drawerCollapsed ? " session-drawer-collapsed" : ""}${navCollapsed ? " nav-collapsed" : ""}${windowMaximized ? " window-maximized" : ""}`}
+      className={`app ${surface === "session" && selected ? "session-layout" : "surface-layout"}${surface === "session" && selected && effectiveDrawerCollapsed ? " session-drawer-collapsed" : ""}${effectiveNavCollapsed ? " nav-collapsed" : ""}${windowMaximized ? " window-maximized" : ""}`}
       style={
         {
-          "--right-panel-width": `${drawerCollapsed ? 44 : rightPanelWidth}px`,
-          "--nav-panel-width": `${navCollapsed ? 56 : navWidth}px`,
+          "--right-panel-width": `${effectiveDrawerCollapsed ? 44 : rightPanelWidth}px`,
+          "--nav-panel-width": `${effectiveNavCollapsed ? 56 : navWidth}px`,
         } as CSSProperties
       }
     >
@@ -12314,17 +12334,17 @@ function AppContent() {
         setHostUrl={setHostUrl}
         hostToken={hostToken}
         setHostToken={setHostToken}
-        collapsed={navCollapsed}
+        collapsed={effectiveNavCollapsed}
         onCollapse={toggleNav}
       />
-      {surface === "session" && selected && !navCollapsed && (
+      {surface === "session" && selected && !effectiveNavCollapsed && (
         <LayoutSplitter
           label="Resize left session list"
           value={navWidth}
           collapseThreshold={180}
           maxValue={
-            window.innerWidth -
-            (drawerCollapsed ? 44 : rightPanelWidth) -
+            viewportWidth -
+            (effectiveDrawerCollapsed ? 44 : rightPanelWidth) -
             6 -
             320
           }
@@ -12979,7 +12999,7 @@ function AppContent() {
           transcript={transcript}
           running={effectiveRunning}
           eventRefreshKey={`${transcript.length}:${transcript.at(-1)?.event_id ?? ""}`}
-          collapsed={drawerCollapsed}
+          collapsed={effectiveDrawerCollapsed}
           providers={providers}
           onProviderChange={(provider) =>
             command("change_provider", {
@@ -13001,7 +13021,10 @@ function AppContent() {
           width={rightPanelWidth}
           onWidthChange={setRightPanelWidth}
           maxWidth={
-            window.innerWidth - (navCollapsed ? 56 : navWidth) - 6 - 320
+            viewportWidth -
+            (effectiveNavCollapsed ? 56 : navWidth) -
+            (effectiveNavCollapsed ? 0 : 6) -
+            320
           }
           onCollapse={() => setDrawerCollapsed(true)}
         />
