@@ -35,7 +35,6 @@ export type TimelineNode =
       resolved?: "allow" | "deny";
     }
   | { kind: "question"; callId: string; text: string; options?: string[] }
-  | { kind: "sleep"; text: string }
   | {
       kind: "notice";
       text: string;
@@ -268,6 +267,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
   let work: Extract<TimelineNode, { kind: "work" }> | null = null;
   let workStarted = 0;
   let workEnded = 0;
+  let completionPending = false;
   let pendingThought:
     | { row: Extract<TimelineNode, { kind: "work" }>["rows"][number] }
     | undefined;
@@ -379,6 +379,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     if (!type) continue;
     const data = payload(event);
     if (type === "user_message" || type === "initial_user_message") {
+      completionPending = false;
       flush(event.created_at_ms);
       nodes.push({
         kind: "user",
@@ -466,12 +467,7 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
         String(data.stop_reason ?? "").toLowerCase() === "finished"
       ) {
         flush(event.created_at_ms);
-        nodes.push({
-          kind: "notice",
-          text: "Turn complete — waiting for your next instruction",
-          tone: "info",
-          noticeKind: "turn_finished",
-        });
+        completionPending = true;
       }
     } else if (
       [
@@ -973,6 +969,14 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
     }
   }
   flush(workEnded || events.at(-1)?.created_at_ms || workStarted);
+  if (completionPending) {
+    nodes.push({
+      kind: "notice",
+      text: "Turn complete — waiting for your next instruction",
+      tone: "info",
+      noticeKind: "turn_finished",
+    });
+  }
   return nodes;
 }
 

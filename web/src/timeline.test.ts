@@ -102,7 +102,7 @@ describe("single event-log timeline", () => {
       resumed.some(
         (node) => node.kind === "notice" && node.noticeKind === "turn_finished",
       ),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("derives the current task state from the timeline plan", () => {
