@@ -64,12 +64,24 @@ impl OpenAiProvider {
         let mut parameter_attempts = 0;
         let mut transient_attempt = 0;
         loop {
-            let response = match apply_bearer_headers(http.post(&url).json(&body), &self.config)
-                .send()
-                .await
+            let response = match tokio::time::timeout(
+                std::time::Duration::from_secs(self.config.first_byte_timeout_seconds),
+                apply_bearer_headers(http.post(&url).json(&body), &self.config).send(),
+            )
+            .await
             {
-                Ok(response) => response,
-                Err(error)
+                Ok(Ok(response)) => response,
+                Err(_) if transient_attempt < TRANSIENT_RETRY_LIMIT => {
+                    tokio::time::sleep(retry_delay(transient_attempt, None)).await;
+                    transient_attempt += 1;
+                    continue;
+                }
+                Err(_) => {
+                    return Err(ProviderError::FirstByteTimeout {
+                        seconds: self.config.first_byte_timeout_seconds,
+                    });
+                }
+                Ok(Err(error))
                     if is_transient_request_error(&error)
                         && transient_attempt < TRANSIENT_RETRY_LIMIT =>
                 {
@@ -77,7 +89,7 @@ impl OpenAiProvider {
                     transient_attempt += 1;
                     continue;
                 }
-                Err(error) => return Err(crate::request_error(error)),
+                Ok(Err(error)) => return Err(crate::request_error(error)),
             };
             if response.status().is_success() {
                 return Ok(response);
@@ -440,12 +452,13 @@ impl Provider for OpenAiProvider {
         loop {
             match stream_once(self, &request, &output).await {
                 Err(error)
-                    if (matches!(&error, ProviderError::Request(_))
-                        || matches!(
-                            &error,
-                            ProviderError::Http { status, .. } if is_transient_status(*status)
-                        ))
-                        && attempt < TRANSIENT_RETRY_LIMIT =>
+                    if (matches!(
+                        &error,
+                        ProviderError::Request(_) | ProviderError::FirstByteTimeout { .. }
+                    ) || matches!(
+                    &error,
+                    ProviderError::Http { status, .. } if is_transient_status(*status)
+                    )) && attempt < TRANSIENT_RETRY_LIMIT =>
                 {
                     tracing::warn!(
                         attempt,
@@ -949,6 +962,50 @@ mod tests {
         assert_eq!(turn.text.as_deref(), Some("ok"));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn times_out_when_provider_never_sends_response_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for _ in 0..=TRANSIENT_RETRY_LIMIT {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 1024];
+                loop {
+                    let count = stream.read(&mut buffer).await.unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+        let mut config = ProviderConfig::new(format!("http://{address}"), "test-key");
+        config.first_byte_timeout_seconds = 1;
+        let provider = OpenAiProvider::new(config);
+        let turn = provider
+            .send(
+                provider.body(
+                    &ProviderRequest {
+                        model: "test".into(),
+                        ..Default::default()
+                    },
+                    true,
+                ),
+                true,
+            )
+            .await;
+        assert!(matches!(
+            turn,
+            Err(ProviderError::FirstByteTimeout { seconds: 1 })
+        ));
+        task.abort();
     }
 
     #[tokio::test]

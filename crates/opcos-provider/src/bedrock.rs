@@ -645,7 +645,15 @@ impl Provider for BedrockProvider {
         if let Some(tool_config) = tool_config {
             builder = builder.tool_config(tool_config);
         }
-        let response = builder.send().await.map_err(bedrock_provider_error)?;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(crate::FIRST_BYTE_TIMEOUT_SECONDS),
+            builder.send(),
+        )
+        .await
+        .map_err(|_| ProviderError::FirstByteTimeout {
+            seconds: crate::FIRST_BYTE_TIMEOUT_SECONDS,
+        })?
+        .map_err(bedrock_provider_error)?;
         let mut text = String::new();
         let mut reasoning = String::new();
         let mut tool_calls = Vec::new();
@@ -704,7 +712,15 @@ impl Provider for BedrockProvider {
         if let Some(tool_config) = tool_config {
             builder = builder.tool_config(tool_config);
         }
-        let response = builder.send().await.map_err(bedrock_provider_error)?;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(crate::FIRST_BYTE_TIMEOUT_SECONDS),
+            builder.send(),
+        )
+        .await
+        .map_err(|_| ProviderError::FirstByteTimeout {
+            seconds: crate::FIRST_BYTE_TIMEOUT_SECONDS,
+        })?
+        .map_err(bedrock_provider_error)?;
         let mut events = response.stream;
         let mut assembler = BedrockAssembler::default();
         while let Some(event) = events

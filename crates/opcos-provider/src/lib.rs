@@ -14,6 +14,8 @@ pub mod openai;
 pub mod registry;
 pub mod sse;
 
+pub const FIRST_BYTE_TIMEOUT_SECONDS: u64 = 30;
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ToolCall {
     pub id: String,
@@ -145,6 +147,8 @@ pub struct ProviderConfig {
     pub timeout_seconds: u64,
     /// Maximum idle gap between streaming response chunks, in seconds.
     pub stream_idle_timeout_seconds: u64,
+    /// Maximum time to wait for response headers on each streaming attempt.
+    pub first_byte_timeout_seconds: u64,
     pub dialect: ProviderDialect,
 }
 
@@ -163,6 +167,7 @@ impl ProviderConfig {
             headers: Vec::new(),
             timeout_seconds: 60,
             stream_idle_timeout_seconds: 120,
+            first_byte_timeout_seconds: FIRST_BYTE_TIMEOUT_SECONDS,
             dialect: ProviderDialect::OpenAi,
         }
     }
@@ -205,6 +210,8 @@ pub enum ProviderError {
     Protocol(String),
     #[error("provider stream produced no chunk for {seconds} seconds")]
     ChunkIdleTimeout { seconds: u64 },
+    #[error("provider did not return response headers within {seconds} seconds")]
+    FirstByteTimeout { seconds: u64 },
     #[error("provider context window exceeded")]
     ContextOverflow { limit: Option<u64> },
     #[error("provider capability is unavailable: {0}")]
@@ -241,7 +248,7 @@ pub(crate) fn request_error(error: reqwest::Error) -> ProviderError {
     ProviderError::Request(sanitize_error(&error.to_string()))
 }
 
-pub(crate) const TRANSIENT_RETRY_LIMIT: usize = 3;
+pub const TRANSIENT_RETRY_LIMIT: usize = 3;
 
 pub(crate) fn is_transient_status(status: StatusCode) -> bool {
     status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()

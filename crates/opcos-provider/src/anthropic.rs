@@ -84,16 +84,30 @@ impl AnthropicProvider {
             for (name, value) in &self.config.headers {
                 request = request.header(name, value);
             }
-            let response = match request.send().await {
-                Ok(response) => response,
-                Err(error)
+            let response = match tokio::time::timeout(
+                std::time::Duration::from_secs(self.config.first_byte_timeout_seconds),
+                request.send(),
+            )
+            .await
+            {
+                Ok(Ok(response)) => response,
+                Err(_) if transient_attempt < TRANSIENT_RETRY_LIMIT => {
+                    tokio::time::sleep(retry_delay(transient_attempt, None)).await;
+                    continue;
+                }
+                Err(_) => {
+                    return Err(ProviderError::FirstByteTimeout {
+                        seconds: self.config.first_byte_timeout_seconds,
+                    });
+                }
+                Ok(Err(error))
                     if is_transient_request_error(&error)
                         && transient_attempt < TRANSIENT_RETRY_LIMIT =>
                 {
                     tokio::time::sleep(retry_delay(transient_attempt, None)).await;
                     continue;
                 }
-                Err(error) => return Err(crate::request_error(error)),
+                Ok(Err(error)) => return Err(crate::request_error(error)),
             };
             if response.status().is_success() {
                 return Ok(response);
@@ -215,7 +229,28 @@ impl Provider for AnthropicProvider {
         request: ProviderRequest,
         output: Sender<StreamChunk>,
     ) -> Result<AssistantTurn, ProviderError> {
-        let response = self.send(self.body(&request, true)).await?;
+        let mut attempt = 0;
+        let response = loop {
+            match self.send(self.body(&request, true)).await {
+                Err(error)
+                    if matches!(
+                        &error,
+                        ProviderError::Request(_) | ProviderError::FirstByteTimeout { .. }
+                    ) && attempt < TRANSIENT_RETRY_LIMIT =>
+                {
+                    output
+                        .send(StreamChunk {
+                            stream_reset: true,
+                            ..Default::default()
+                        })
+                        .await
+                        .map_err(|_| ProviderError::Protocol("stream receiver closed".into()))?;
+                    attempt += 1;
+                    tokio::time::sleep(retry_delay(attempt - 1, None)).await;
+                }
+                result => break result?,
+            }
+        };
         let mut stream = crate::sse::SseDecoder::new();
         let mut text = String::new();
         let mut reasoning = String::new();
