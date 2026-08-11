@@ -920,6 +920,11 @@ export function PlusMenu({
     left: number;
     maxHeight: number;
   } | null>(null);
+  const [openSubmenu, setOpenSubmenu] = useState<string | null>(null);
+  const submenuRef = useRef<HTMLDivElement>(null);
+  const submenuTriggerRefs = useRef<Record<string, HTMLButtonElement | null>>(
+    {},
+  );
   const closeMenu = (restoreFocus = true) => {
     onOpenChange(false);
     if (restoreFocus) triggerRef.current?.focus();
@@ -932,7 +937,12 @@ export function PlusMenu({
     const escape = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        closeMenu();
+        if (openSubmenu) {
+          setOpenSubmenu(null);
+          submenuTriggerRefs.current[openSubmenu]?.focus();
+        } else {
+          closeMenu();
+        }
       }
     };
     document.addEventListener("mousedown", close);
@@ -941,7 +951,7 @@ export function PlusMenu({
       document.removeEventListener("mousedown", close);
       document.removeEventListener("keydown", escape);
     };
-  }, [open]);
+  }, [open, openSubmenu]);
   useLayoutEffect(() => {
     if (!open || !menuRef.current || !triggerRef.current) return;
     const trigger = triggerRef.current.getBoundingClientRect();
@@ -966,6 +976,12 @@ export function PlusMenu({
       .querySelector<HTMLButtonElement>("button:not(:disabled)")
       ?.focus();
   }, [open, assets.length, secrets.length]);
+  useEffect(() => {
+    if (!openSubmenu) return;
+    submenuRef.current
+      ?.querySelector<HTMLButtonElement>("button:not(:disabled)")
+      ?.focus();
+  }, [openSubmenu]);
   const upload = () => {
     closeMenu();
     fileRef.current?.click();
@@ -973,6 +989,32 @@ export function PlusMenu({
   const assetItems = assets.filter((asset) =>
     ["agents", "knowledge", "playbook", "skill"].includes(asset.kind),
   );
+  const categories = [
+    {
+      kind: "agents",
+      label: "Rules",
+      reference: "@AGENTS.md",
+      icon: "shield" as const,
+    },
+    {
+      kind: "knowledge",
+      label: "Knowledge",
+      reference: "@Knowledge",
+      icon: "inbox" as const,
+    },
+    {
+      kind: "playbook",
+      label: "Playbooks",
+      reference: "@Playbook",
+      icon: "board" as const,
+    },
+    {
+      kind: "skill",
+      label: "Skills",
+      reference: "@Skill",
+      icon: "wrench" as const,
+    },
+  ];
   return (
     <span className="plus-menu-wrap" ref={wrapRef}>
       <input
@@ -1007,70 +1049,122 @@ export function PlusMenu({
         >
           {onUpload && (
             <button type="button" role="menuitem" onClick={upload}>
-              <span className="pm-icon">＋</span>
-              上传附件
+              <Icon name="file" size={15} className="pm-icon" />
+              Upload attachment
             </button>
           )}
           <div className="pm-divider" />
-          {[
-            { kind: "agents", label: "规则", reference: "@AGENTS.md" },
-            { kind: "knowledge", label: "知识库", reference: "@Knowledge" },
-            { kind: "playbook", label: "运行手册", reference: "@Playbook" },
-            { kind: "skill", label: "技能", reference: "@Skill" },
-          ].map((category) => {
+          {categories.map((category) => {
             const matching = assetItems.filter(
               (asset) => asset.kind === category.kind,
             );
-            return matching.length > 0 ? (
-              matching.map((asset) => (
+            const hasSubmenu = matching.length > 0;
+            return (
+              <div className="pm-group" key={category.kind}>
                 <button
+                  ref={(element) => {
+                    submenuTriggerRefs.current[category.kind] = element;
+                  }}
                   type="button"
                   role="menuitem"
-                  key={`${asset.kind}:${asset.title}`}
+                  aria-haspopup={hasSubmenu ? "menu" : undefined}
+                  aria-expanded={hasSubmenu && openSubmenu === category.kind}
                   onClick={() => {
-                    closeMenu(false);
-                    onInsert(`@${asset.kind}:${asset.title}`);
+                    if (hasSubmenu) {
+                      setOpenSubmenu((value) =>
+                        value === category.kind ? null : category.kind,
+                      );
+                    } else {
+                      closeMenu(false);
+                      onInsert(category.reference);
+                    }
                   }}
                 >
-                  <span className="pm-icon">@</span>
-                  {category.label}: {asset.title}
+                  <Icon name={category.icon} size={15} className="pm-icon" />
+                  <span>{category.label}</span>
+                  {hasSubmenu && (
+                    <Icon
+                      name="chevronRight"
+                      size={13}
+                      className="pm-chevron"
+                    />
+                  )}
                 </button>
-              ))
-            ) : (
-              <button
-                type="button"
-                role="menuitem"
-                key={category.kind}
-                onClick={() => {
-                  closeMenu(false);
-                  onInsert(category.reference);
-                }}
-              >
-                <span className="pm-icon">@</span>
-                {category.label}
-              </button>
+                {hasSubmenu && openSubmenu === category.kind && (
+                  <div
+                    ref={submenuRef}
+                    className="pm-submenu"
+                    role="menu"
+                    aria-label={`${category.label} items`}
+                  >
+                    {matching.map((asset) => (
+                      <button
+                        type="button"
+                        role="menuitem"
+                        key={`${asset.kind}:${asset.title}`}
+                        onClick={() => {
+                          closeMenu(false);
+                          onInsert(`@${asset.kind}:${asset.title}`);
+                        }}
+                      >
+                        <Icon name="file" size={14} className="pm-icon" />
+                        {asset.title}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             );
           })}
           <div className="pm-divider" />
           {secrets.length > 0 ? (
-            secrets.map((secret) => (
+            <div className="pm-group">
               <button
+                ref={(element) => {
+                  submenuTriggerRefs.current.secrets = element;
+                }}
                 type="button"
                 role="menuitem"
-                key={secret.name}
-                onClick={() => {
-                  closeMenu(false);
-                  onInsert(`secret:session:${secret.name}`);
-                }}
+                aria-haspopup="menu"
+                aria-expanded={openSubmenu === "secrets"}
+                onClick={() =>
+                  setOpenSubmenu((value) =>
+                    value === "secrets" ? null : "secrets",
+                  )
+                }
               >
-                <span className="pm-icon">⌕</span>
-                密钥：{secret.name}
+                <Icon name="shield" size={15} className="pm-icon" />
+                <span>Secrets</span>
+                <Icon name="chevronRight" size={13} className="pm-chevron" />
               </button>
-            ))
+              {openSubmenu === "secrets" && (
+                <div
+                  ref={submenuRef}
+                  className="pm-submenu"
+                  role="menu"
+                  aria-label="Secrets items"
+                >
+                  {secrets.map((secret) => (
+                    <button
+                      type="button"
+                      role="menuitem"
+                      key={secret.name}
+                      onClick={() => {
+                        closeMenu(false);
+                        onInsert(`secret:session:${secret.name}`);
+                      }}
+                    >
+                      <Icon name="shield" size={14} className="pm-icon" />
+                      {secret.name}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           ) : (
             <button type="button" role="menuitem" disabled>
-              <span className="pm-icon">⌕</span>
-              密钥引用（暂无已配置密钥）
+              <Icon name="shield" size={15} className="pm-icon" />
+              Secrets
             </button>
           )}
         </div>
