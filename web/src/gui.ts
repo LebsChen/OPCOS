@@ -170,6 +170,30 @@ export function shouldShowSurfaceRetry({
   return !sleeping && !busy && port === null;
 }
 
+export function preserveSurfaceTabWhileSleeping(
+  sleepState: string | undefined,
+): boolean {
+  return sleepState === "asleep";
+}
+
+export function surfaceLifecycleEventMatches({
+  eventSessionId,
+  eventPort,
+  currentSessionId,
+  currentPort,
+}: {
+  eventSessionId?: string;
+  eventPort: unknown;
+  currentSessionId: string;
+  currentPort: number | null;
+}): boolean {
+  return (
+    eventSessionId === currentSessionId &&
+    typeof eventPort === "number" &&
+    eventPort === currentPort
+  );
+}
+
 export type PendingQuestionData = {
   callId: string;
   question: string;

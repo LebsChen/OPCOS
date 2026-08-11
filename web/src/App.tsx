@@ -40,6 +40,8 @@ import {
   shouldRetrySurfaceStart,
   shouldShowSurfaceReconnect,
   shouldShowSurfaceRetry,
+  preserveSurfaceTabWhileSleeping,
+  surfaceLifecycleEventMatches,
   surfaceNeedsConnection,
   type PendingQuestionData,
   reconcileSelectedIdAfterRefresh,
@@ -2633,6 +2635,38 @@ function SurfaceView({
       setSurfaceError("");
     }
   }, [selected.sleep_state, sleeping]);
+  useEffect(() => {
+    let cancelled = false;
+    const subscription = listen<UiEvent>("opcos://event", (event) => {
+      if (cancelled || event.payload.kind !== "surface-ended") return;
+      const surfacePayload = event.payload.payload as {
+        port?: unknown;
+        reason?: unknown;
+      };
+      const eventPort = surfacePayload.port;
+      if (
+        !surfaceLifecycleEventMatches({
+          eventSessionId: event.payload.session_id,
+          eventPort,
+          currentSessionId: selected.id,
+          currentPort: portRef.current,
+        })
+      )
+        return;
+      portRef.current = null;
+      setPort(null);
+      setBusy(false);
+      setSurfaceError(
+        typeof surfacePayload.reason === "string"
+          ? surfacePayload.reason
+          : translate("surfaceUnavailable"),
+      );
+    });
+    return () => {
+      cancelled = true;
+      void subscription.then((unlisten) => unlisten());
+    };
+  }, [selected.id]);
   useEffect(() => {
     return () => {
       surfaceGenerationRef.current += 1;
@@ -10743,7 +10777,8 @@ function SessionRightPanel({
   }> = [
     ...(capabilities.vnc?.state === "Unavailable" &&
     capabilities.computer_use?.state === "Unavailable" &&
-    panelTab !== "desktop"
+    panelTab !== "desktop" &&
+    !preserveSurfaceTabWhileSleeping(selected.sleep_state)
       ? []
       : [
           {
@@ -10752,11 +10787,15 @@ function SessionRightPanel({
             icon: "monitor" as const,
           },
         ]),
-    ...(capabilities.ide?.state === "Unavailable" && panelTab !== "ide"
+    ...(capabilities.ide?.state === "Unavailable" &&
+    panelTab !== "ide" &&
+    !preserveSurfaceTabWhileSleeping(selected.sleep_state)
       ? []
       : [{ id: "ide" as const, label: "Editor", icon: "code" as const }]),
     ...(selected.host_id === "local" ||
-    (capabilities.pty?.state === "Unavailable" && panelTab !== "terminal")
+    (capabilities.pty?.state === "Unavailable" &&
+      panelTab !== "terminal" &&
+      !preserveSurfaceTabWhileSleeping(selected.sleep_state))
       ? []
       : [
           {
@@ -10766,13 +10805,18 @@ function SessionRightPanel({
           },
         ]),
     ...(selected.host_id === "local" ||
-    (capabilities.browser?.state === "Unavailable" && panelTab !== "browser")
+    (capabilities.browser?.state === "Unavailable" &&
+      panelTab !== "browser" &&
+      !preserveSurfaceTabWhileSleeping(selected.sleep_state))
       ? []
       : [{ id: "browser" as const, label: "Browser", icon: "grid" as const }]),
   ];
   const tabs = [...informationTabs, ...workspaceTabs, ...remoteTabs];
-  const unavailableCapability =
-    panelTab === "browser" && capabilities.browser?.state === "Unavailable"
+  const unavailableCapability = preserveSurfaceTabWhileSleeping(
+    selected.sleep_state,
+  )
+    ? null
+    : panelTab === "browser" && capabilities.browser?.state === "Unavailable"
       ? capabilities.browser
       : panelTab === "desktop" &&
           capabilities.vnc?.state === "Unavailable" &&
@@ -11008,7 +11052,8 @@ function SessionRightPanel({
                   style={{ display: panelTab === item.id ? "flex" : "none" }}
                 >
                   {item.id === "browser" &&
-                  capabilities.browser?.state === "Unavailable" ? (
+                  capabilities.browser?.state === "Unavailable" &&
+                  !preserveSurfaceTabWhileSleeping(selected.sleep_state) ? (
                     <div className="rail-error">
                       {capabilities.browser.reason || "Capability unavailable."}
                     </div>

@@ -1546,3 +1546,30 @@ force a re-probe by switching session away and back.
 - Fixture caveat: `/api/exec-sync` in the local fixture times out around 60 s, so a `sleep 60` probe
   fails host-side. Use `sleep 45` or shorter when you need a long-running turn to hold a session
   awake.
+
+## Surface start failures: what the UI can and cannot show
+
+`start_surface` (`src-tauri/src/main.rs`, `async fn start_surface`) binds a local `TcpListener` and
+spawns `relay_surface` **before ever contacting the host**, then returns `Ok(port)`. Consequences for
+testing:
+
+- A genuinely unreachable/erroring host (connection refused, HTTP 503, session bound to a dead host)
+  does **not** make `start_surface` fail. The frontend gets a port, so `port !== null` and the
+  `shouldShowSurfaceRetry({busy, port, sleeping})` banner (i18n `surfaceUnavailable` / `retrySurface`)
+  can never render for that case — you only get a transient toast (`rvm request failed: …`) and a
+  blank black panel. If you are asked to verify a "reason + Retry" affordance, prove it with a case
+  where `start_surface` itself returns `Err` (e.g. `host_id == "local"`, or computer-use disabled for
+  vnc/cdp), and report the unreachable-host case separately.
+- Ways to fake an unavailable host, cheapest first: point the session at a host whose URL is a dead
+  port (a `DeadHost` entry with `http://127.0.0.1:9` is already in the local DB), stop the fixture
+  (`kill` the `python3 agent.py` PID — `pkill -f fixture-agent/agent.py` does **not** match, the
+  cmdline is just `python3 agent.py`), or run a logging stub on :8899 that 503s everything and appends
+  each request to a log file so you can count attempts.
+- Retry-storm check: count host-side requests. One panel mount = exactly one `GET /pty-ws?...`
+  attempt; an untouched failed panel produced zero further requests over 90 s.
+- Sessions with `run_state='error'` are never slept, no matter how long they idle. Pick a session with
+  `run_state='idle'` for sleep tests, or you will wait forever and mis-report a sleep regression.
+- Right-rail surface icon positions shift depending on which panel is open and which capabilities the
+  host reports (local-host sessions have no Terminal/Desktop icon at all). Always `zoom` the rail
+  (region ~`[995, 25, 1024, 400]`) to locate the monitor (Desktop) and `>_` (Terminal) icons before
+  clicking; clicking the already-active icon toggles the panel closed.

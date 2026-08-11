@@ -670,6 +670,7 @@ struct SurfaceRuntime {
     session_id: String,
     host_id: String,
     kind: WsKind,
+    identity: Arc<()>,
     task: tauri::async_runtime::JoinHandle<()>,
 }
 
@@ -11242,20 +11243,69 @@ fn session_workspace(state: &DesktopState, session_id: &str) -> Result<Option<St
     Ok((!workspace.is_empty()).then_some(workspace))
 }
 
+fn surface_runtime_identity_is_current(current: &Arc<()>, candidate: &Arc<()>) -> bool {
+    Arc::ptr_eq(current, candidate)
+}
+
+async fn finish_surface(app: &tauri::AppHandle, port: u16, identity: &Arc<()>, reason: String) {
+    let Some(state) = app.try_state::<DesktopState>() else {
+        return;
+    };
+    let removed = {
+        let mut surfaces = state.surfaces.lock().await;
+        if surfaces
+            .get(&port)
+            .is_some_and(|surface| surface_runtime_identity_is_current(&surface.identity, identity))
+        {
+            surfaces.remove(&port)
+        } else {
+            None
+        }
+    };
+    let Some(surface) = removed else {
+        return;
+    };
+    emit(
+        app,
+        "surface-ended",
+        Some(&surface.session_id),
+        json!({
+            "port": port,
+            "surface": format!("{:?}", surface.kind),
+            "reason": reason,
+        }),
+    );
+}
+
 async fn relay_surface(
+    app: tauri::AppHandle,
+    port: u16,
+    identity: Arc<()>,
     listener: TcpListener,
     client: HttpRvmClient,
     kind: WsKind,
     params: WsParams,
 ) {
-    let Ok((stream, _)) = listener.accept().await else {
-        return;
+    let (stream, _) = match listener.accept().await {
+        Ok(value) => value,
+        Err(error) => {
+            finish_surface(&app, port, &identity, error.to_string()).await;
+            return;
+        }
     };
-    let Ok(browser) = accept_async(stream).await else {
-        return;
+    let browser = match accept_async(stream).await {
+        Ok(value) => value,
+        Err(error) => {
+            finish_surface(&app, port, &identity, error.to_string()).await;
+            return;
+        }
     };
-    let Ok(upstream) = client.open_ws(kind, params).await else {
-        return;
+    let upstream = match client.open_ws(kind, params).await {
+        Ok(value) => value,
+        Err(error) => {
+            finish_surface(&app, port, &identity, error.to_string()).await;
+            return;
+        }
     };
     let (mut browser_write, mut browser_read) = browser.split();
     let (mut upstream_write, mut upstream_read) = upstream.split();
@@ -11277,6 +11327,13 @@ async fn relay_surface(
         _ = browser_to_upstream => {},
         _ = upstream_to_browser => {},
     }
+    finish_surface(
+        &app,
+        port,
+        &identity,
+        "Remote surface disconnected.".to_owned(),
+    )
+    .await;
 }
 
 fn effective_config_objects(
@@ -13929,13 +13986,23 @@ async fn start_surface(
         .map_err(|error| error.to_string())?
         .port();
     let params = WsParams { cols, rows, cwd };
-    let task = tauri::async_runtime::spawn(relay_surface(listener, client, kind, params));
+    let identity = Arc::new(());
+    let task = tauri::async_runtime::spawn(relay_surface(
+        state.mcp_notification_app.clone(),
+        port,
+        Arc::clone(&identity),
+        listener,
+        client,
+        kind,
+        params,
+    ));
     state.surfaces.lock().await.insert(
         port,
         SurfaceRuntime {
             session_id,
             host_id,
             kind,
+            identity,
             task,
         },
     );
@@ -13945,7 +14012,6 @@ async fn start_surface(
 #[tauri::command]
 async fn stop_surface(state: State<'_, DesktopState>, port: u16) -> Result<(), String> {
     if let Some(surface) = state.surfaces.lock().await.remove(&port) {
-        let _ = (&surface.host_id, surface.kind);
         surface.task.abort();
     }
     Ok(())
@@ -30165,6 +30231,14 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn surface_runtime_identity_prevents_stale_cleanup() {
+        let current = Arc::new(());
+        let replacement = Arc::new(());
+        assert!(surface_runtime_identity_is_current(&current, &current));
+        assert!(!surface_runtime_identity_is_current(&current, &replacement));
+    }
 
     #[test]
     fn computer_use_arguments_accept_flat_nested_and_report_missing_action() {

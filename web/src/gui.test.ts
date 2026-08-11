@@ -22,6 +22,8 @@ import {
   shouldResetSurfaceForSleep,
   shouldShowSurfaceReconnect,
   shouldShowSurfaceRetry,
+  preserveSurfaceTabWhileSleeping,
+  surfaceLifecycleEventMatches,
   surfaceNeedsConnection,
   updateSessionRunState,
   projectAgentRosterHost,
@@ -72,6 +74,32 @@ describe("GUI boundary behavior", () => {
     ).toBe(true);
     expect(
       shouldShowSurfaceRetry({ busy: false, port: null, sleeping: true }),
+    ).toBe(false);
+    expect(preserveSurfaceTabWhileSleeping("asleep")).toBe(true);
+    expect(preserveSurfaceTabWhileSleeping("awake")).toBe(false);
+    expect(
+      surfaceLifecycleEventMatches({
+        eventSessionId: "s",
+        eventPort: 1234,
+        currentSessionId: "s",
+        currentPort: 1234,
+      }),
+    ).toBe(true);
+    expect(
+      surfaceLifecycleEventMatches({
+        eventSessionId: "other",
+        eventPort: 1234,
+        currentSessionId: "s",
+        currentPort: 1234,
+      }),
+    ).toBe(false);
+    expect(
+      surfaceLifecycleEventMatches({
+        eventSessionId: "s",
+        eventPort: 1235,
+        currentSessionId: "s",
+        currentPort: 1234,
+      }),
     ).toBe(false);
   });
 
@@ -535,6 +563,8 @@ describe("GUI boundary behavior", () => {
     expect(source).toContain("surfaceUnavailable");
     expect(source).toContain("retrySurface");
     expect(source).toContain("surfaceRetryToken");
+    expect(source).toContain("surface-ended");
+    expect(source).toContain("preserveSurfaceTabWhileSleeping");
     expect(source).toContain("touchSessionActivity");
   });
 });
