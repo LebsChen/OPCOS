@@ -648,6 +648,66 @@ impl HttpRvmClient {
         url
     }
 
+    pub async fn ide_auth_cookies(&self, folder: &str) -> Result<Vec<String>, RvmError> {
+        let mut url = self.ide_url(folder);
+        let mut cookies: Vec<String> = Vec::new();
+        for _ in 0..8 {
+            let mut request = self
+                .http
+                .get(url.clone())
+                .header(header::AUTHORIZATION, self.config.auth_header())
+                .header(header::ACCEPT, "text/html")
+                .header(header::USER_AGENT, IDE_BROWSER_USER_AGENT)
+                .header("Sec-Fetch-Mode", "navigate");
+            if !cookies.is_empty() {
+                request = request.header(header::COOKIE, cookies.join("; "));
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|error| RvmError::request(error, &self.config.token))?;
+            for value in response.headers().get_all(header::SET_COOKIE) {
+                if let Ok(value) = value.to_str()
+                    && let Some(pair) = value.split(';').next()
+                    && let Some(name) = pair.split('=').next()
+                {
+                    cookies.retain(|old| old.split('=').next() != Some(name));
+                    cookies.push(pair.to_owned());
+                }
+            }
+            if response.status().is_redirection() {
+                let location = response
+                    .headers()
+                    .get(header::LOCATION)
+                    .ok_or_else(|| RvmError::WebSocket("IDE redirect missing location".into()))?
+                    .to_str()
+                    .map_err(|_| RvmError::WebSocket("IDE redirect has invalid URL".into()))?;
+                url = url
+                    .join(location)
+                    .map_err(|_| RvmError::WebSocket("IDE redirect has invalid URL".into()))?;
+                continue;
+            }
+            if !response.status().is_success() {
+                let status = response.status();
+                let bytes = response
+                    .bytes()
+                    .await
+                    .map_err(|error| RvmError::request(error, &self.config.token))?;
+                return Err(RvmError::http(
+                    status,
+                    &String::from_utf8_lossy(&bytes),
+                    &self.config.token,
+                ));
+            }
+            let _ = response
+                .bytes()
+                .await
+                .map_err(|error| RvmError::request(error, &self.config.token))?;
+            return Ok(cookies);
+        }
+        Err(RvmError::WebSocket("too many IDE redirects".into()))
+    }
+
     fn remote_path(&self, path: &str) -> Result<String, RvmError> {
         self.path_guard
             .as_ref()
@@ -1441,6 +1501,53 @@ mod tests {
                 ("folder".into(), "vscode-remote://linux/workspace".into())
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn ide_auth_cookies_follows_redirects_and_replays_set_cookie() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            for index in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let size = socket.read(&mut request).await.unwrap();
+                let received = String::from_utf8_lossy(&request[..size]).to_ascii_lowercase();
+                assert!(received.contains("authorization: bearer test-token"));
+                if index == 0 {
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 302 Found\r\nLocation: /ide/\r\nSet-Cookie: rvm_ide_tkn=cookie-value; HttpOnly; Path=/\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                } else {
+                    assert!(received.contains("cookie: rvm_ide_tkn=cookie-value"));
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let client = HttpRvmClient::new(RvmClientConfig {
+            base_url: Url::parse(&format!("http://{address}")).unwrap(),
+            token: "test-token".into(),
+            request_timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+        let cookies = client
+            .ide_auth_cookies("vscode-remote://linux/workspace")
+            .await
+            .unwrap();
+        assert_eq!(cookies, vec!["rvm_ide_tkn=cookie-value"]);
+        task.await.unwrap();
     }
 
     #[test]

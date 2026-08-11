@@ -116,7 +116,7 @@ use agent_client_protocol::schema::v1::{
     PromptRequest as AcpPromptRequest, RequestPermissionOutcome, SessionNotification,
     SessionUpdate, StopReason as AcpStopReason, TextContent as AcpTextContent,
 };
-use tauri::{Emitter, Manager, RunEvent, State};
+use tauri::{Emitter, Manager, RunEvent, State, webview::Cookie};
 use tauri_plugin_opener::OpenerExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -13648,7 +13648,8 @@ async fn capture_remote_browser_frame(
 }
 
 #[tauri::command]
-fn ide_url(
+async fn ide_url(
+    window: tauri::WebviewWindow,
     state: State<'_, DesktopState>,
     session_id: String,
     folder_uri: String,
@@ -13660,9 +13661,32 @@ fn ide_url(
     if host_id == "local" {
         return Err("本机 host 不支持远程 Web IDE，请绑定远程主机".into());
     }
-    Ok(client_for(&state, &host_id)?
-        .ide_url(&folder_uri)
-        .to_string())
+    let client = client_for(&state, &host_id)?;
+    let url = client.ide_url(&folder_uri);
+    let cookies = client
+        .ide_auth_cookies(&folder_uri)
+        .await
+        .map_err(|error| error.to_string())?;
+    eprintln!("remote IDE bootstrap returned {} cookies", cookies.len());
+    let host = url
+        .host_str()
+        .ok_or_else(|| "Remote Web IDE URL has no host".to_owned())?;
+    for pair in cookies {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let cookie = Cookie::build((name.to_owned(), value.to_owned()))
+            .domain(host.to_owned())
+            .path("/")
+            .secure(url.scheme() == "https")
+            .http_only(true)
+            .build();
+        window
+            .set_cookie(cookie)
+            .map_err(|error| format!("Could not set remote IDE cookie: {error}"))?;
+    }
+    eprintln!("remote IDE cookies planted for host origin");
+    Ok(url.to_string())
 }
 
 #[tauri::command(rename = "create_session")]
