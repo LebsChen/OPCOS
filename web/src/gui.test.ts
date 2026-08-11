@@ -345,14 +345,18 @@ describe("GUI boundary behavior", () => {
     expect(source).not.toContain('<PlannedPane title="Editor">');
   });
 
-  it("keeps surface credentials out of browser-visible relay URLs", () => {
+  it("uses the server-provided direct IDE URL", () => {
     const source = readFileSync(
       fileURLToPath(new URL("./App.tsx", import.meta.url)),
       "utf8",
     );
     expect(source).toContain("ws://127.0.0.1:${port}");
-    expect(source).toContain("http://127.0.0.1:${ideProxy.port}/ide/");
-    expect(source).not.toMatch(/(?:ws|http)s?:\/\/[^"`]*linux\.windevos\.com/i);
+    expect(source).toContain('command<string>("ide_url"');
+    expect(source).toContain("Remote IDE workspace is not configured");
+    expect(source).not.toContain(
+      'folderUri: selected.workspace || "/workspace"',
+    );
+    expect(source).toContain("src={ideUrl}");
     expect(source).not.toMatch(/Authorization:\s*Bearer/i);
   });
 
@@ -379,29 +383,5 @@ describe("GUI boundary behavior", () => {
     );
     expect(source).toContain('setHostVncPassword(password || "")');
     expect(source).toContain("vncPassword: hostVncPassword");
-  });
-
-  it("reports a bounded Web IDE stall after the relay upgrade", () => {
-    const source = readFileSync(
-      fileURLToPath(new URL("./App.tsx", import.meta.url)),
-      "utf8",
-    );
-    expect(source).toContain("/__opcos_status");
-    expect(source).toContain(
-      "Remote Web IDE workbench stalled after the WebSocket upgrade",
-    );
-    expect(source).toContain("Date.now() - started >= 60_000");
-  });
-
-  it("offers a system-browser Web IDE when WebKit cannot start the workbench", () => {
-    const source = readFileSync(
-      fileURLToPath(new URL("./App.tsx", import.meta.url)),
-      "utf8",
-    );
-    expect(source).toContain("open_ide_external");
-    expect(source).toContain("This embedded WebKit webview cannot run");
-    expect(source).toContain("Open remote IDE in system browser");
-    expect(source).toContain("navigator.userAgent");
-    expect(source).toContain("latest?.total_sockets ?? 0) === 0");
   });
 });
