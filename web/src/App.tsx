@@ -2604,7 +2604,7 @@ function SurfaceView({
       if (activePort !== null)
         void command("stop_surface", { port: activePort });
       setSleeping(true);
-      setSurfaceError(translate("surfaceSleepingDescription"));
+      setSurfaceError("");
     } else if (!shouldShowSurfaceReconnect(selected.sleep_state) && sleeping) {
       setSleeping(false);
       setSurfaceError("");
