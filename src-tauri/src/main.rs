@@ -1,17 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use async_trait::async_trait;
-use axum::{
-    Router,
-    body::Body,
-    extract::{
-        FromRequestParts, Path, Request, State as AxumState,
-        ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade},
-    },
-    http::{StatusCode, Uri},
-    response::{Html, IntoResponse, Response},
-    routing::any,
-};
 use base64::Engine;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::{SinkExt, StreamExt};
@@ -59,8 +48,8 @@ use opcos_provider::openai::OpenAiProvider;
 use opcos_provider::registry;
 use opcos_provider::{Provider, ProviderConfig};
 use opcos_rvm::{
-    ExecRequest, HttpRvmClient, IdeBootstrap, MAX_EXEC_TIMEOUT_SECONDS, PersistentShell,
-    RemotePathGuard, RvmClient, RvmClientConfig, WsKind, WsParams, join_remote_path,
+    ExecRequest, HttpRvmClient, MAX_EXEC_TIMEOUT_SECONDS, PersistentShell, RemotePathGuard,
+    RvmClient, RvmClientConfig, WsKind, WsParams, join_remote_path,
 };
 use opcos_store::{
     ActionBeginResult, ArtifactRecord, CiMonitor, KeyringSecretStore, LoginProfileRecord,
@@ -79,10 +68,7 @@ use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::process::Command as ProcessCommand;
 use std::sync::mpsc as std_mpsc;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -661,7 +647,6 @@ struct DesktopState {
     trigger_watcher_reload: Mutex<Option<std_mpsc::Sender<()>>>,
     trigger_watcher_stop: Mutex<Option<std_mpsc::Sender<()>>>,
     surfaces: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
-    ide_proxies: AsyncMutex<HashMap<u16, tauri::async_runtime::JoinHandle<()>>>,
     coordination: Arc<AsyncMutex<HashMap<String, CoordinationRuntime>>>,
     index_root: PathBuf,
     artifact_root: PathBuf,
@@ -5163,27 +5148,6 @@ async fn run_event_bus_pump(app: &tauri::AppHandle, state: &DesktopState) {
             let _ = state.store.ack_event(consumer_id, event.sequence);
         }
     }
-}
-
-#[derive(Clone)]
-struct IdeProxyState {
-    client: HttpRvmClient,
-    bootstrap: IdeBootstrap,
-    activity: Arc<IdeProxyActivity>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct IdeProxyInfo {
-    port: u16,
-}
-
-#[derive(Default)]
-struct IdeProxyActivity {
-    active_sockets: AtomicUsize,
-    total_sockets: AtomicUsize,
-    browser_frames: AtomicUsize,
-    upstream_frames: AtomicUsize,
-    upstream_failures: AtomicUsize,
 }
 
 #[async_trait]
@@ -11103,252 +11067,6 @@ async fn relay_surface(
     }
 }
 
-async fn ide_root(AxumState(state): AxumState<IdeProxyState>, request: Request) -> Response {
-    let is_websocket = request
-        .headers()
-        .get("upgrade")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
-    if is_websocket {
-        let (mut parts, _) = request.into_parts();
-        let uri = parts.uri.clone();
-        if let Ok(ws) = WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
-            let protocols = ws
-                .requested_protocols()
-                .filter_map(|value| value.to_str().ok().map(str::to_owned))
-                .collect::<Vec<_>>();
-            let upstream_protocol = protocols.first().cloned();
-            return ws
-                .protocols(protocols)
-                .on_upgrade(move |socket| {
-                    let upstream_path = if uri.path() == "/" {
-                        "/ide/".to_owned()
-                    } else {
-                        uri.path().to_owned()
-                    };
-                    ide_relay_socket(
-                        socket,
-                        state,
-                        format!("{upstream_path}?{}", uri.query().unwrap_or_default()),
-                        upstream_protocol,
-                    )
-                })
-                .into_response();
-        }
-    }
-    Html(state.bootstrap.html).into_response()
-}
-
-async fn ide_status(AxumState(state): AxumState<IdeProxyState>) -> Response {
-    let body = serde_json::json!({
-        "active_sockets": state.activity.active_sockets.load(Ordering::Relaxed),
-        "total_sockets": state.activity.total_sockets.load(Ordering::Relaxed),
-        "browser_frames": state.activity.browser_frames.load(Ordering::Relaxed),
-        "upstream_frames": state.activity.upstream_frames.load(Ordering::Relaxed),
-        "upstream_failures": state.activity.upstream_failures.load(Ordering::Relaxed),
-    });
-    (
-        StatusCode::OK,
-        [("access-control-allow-origin", "*")],
-        axum::Json(body),
-    )
-        .into_response()
-}
-
-fn rewrite_workbench_authority(html: &str, authority: &str) -> String {
-    let marker = r#""remoteAuthority":""#;
-    let Some(value_start) = html.find(marker).map(|index| index + marker.len()) else {
-        return html.to_owned();
-    };
-    let Some(value_end) = html[value_start..]
-        .find('"')
-        .map(|index| value_start + index)
-    else {
-        return html.to_owned();
-    };
-    let mut rewritten = html.to_owned();
-    rewritten.replace_range(value_start..value_end, authority);
-    rewritten
-}
-
-async fn ide_asset(
-    AxumState(state): AxumState<IdeProxyState>,
-    Path(path): Path<String>,
-    uri: Uri,
-) -> Response {
-    ide_asset_route(state, path, uri, "/ide/static/").await
-}
-
-async fn ide_callback(AxumState(state): AxumState<IdeProxyState>, uri: Uri) -> Response {
-    let query = uri
-        .query()
-        .map(|value| format!("?{value}"))
-        .unwrap_or_default();
-    match state
-        .client
-        .ide_request_bytes(&format!("/ide/callback{query}"), &state.bootstrap.cookies)
-        .await
-    {
-        Ok(bytes) => Response::new(Body::from(bytes)),
-        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
-    }
-}
-
-async fn ide_out_asset(
-    AxumState(state): AxumState<IdeProxyState>,
-    Path(path): Path<String>,
-    uri: Uri,
-) -> Response {
-    ide_asset_route(state, path, uri, "/ide/static/out/").await
-}
-
-async fn ide_resources_asset(
-    AxumState(state): AxumState<IdeProxyState>,
-    Path(path): Path<String>,
-    uri: Uri,
-) -> Response {
-    ide_asset_route(state, path, uri, "/ide/static/resources/").await
-}
-
-async fn ide_asset_route(state: IdeProxyState, path: String, uri: Uri, prefix: &str) -> Response {
-    let route = if path == "vscode-remote-resource" {
-        "/vscode-remote-resource".to_owned()
-    } else {
-        format!("{prefix}{path}")
-    };
-    let query = uri
-        .query()
-        .map(|value| format!("?{value}"))
-        .unwrap_or_default();
-    let route = format!("{route}{query}");
-    match state
-        .client
-        .ide_request_bytes(&route, &state.bootstrap.cookies)
-        .await
-    {
-        Ok(bytes) => {
-            let content_type = if route.ends_with(".js") {
-                "application/javascript"
-            } else if route.ends_with(".css") {
-                "text/css"
-            } else if route.ends_with(".json") {
-                "application/json"
-            } else {
-                "application/octet-stream"
-            };
-            Response::builder()
-                .header("content-type", content_type)
-                .body(Body::from(bytes))
-                .unwrap_or_else(|_| Response::new(Body::empty()))
-        }
-        Err(_) => StatusCode::BAD_GATEWAY.into_response(),
-    }
-}
-
-fn ide_asset_upstream_route(route: &str) -> String {
-    if let Some(path) = route.strip_prefix("/out/") {
-        return format!("/ide/static/out/{path}");
-    }
-    if let Some(path) = route.strip_prefix("/resources/") {
-        return format!("/ide/static/resources/{path}");
-    }
-    if let Some(path) = route.strip_prefix("/static/") {
-        return format!("/ide/static/{path}");
-    }
-    route.to_owned()
-}
-
-async fn ide_relay_socket(
-    mut browser: WebSocket,
-    state: IdeProxyState,
-    route: String,
-    protocol: Option<String>,
-) {
-    state.activity.total_sockets.fetch_add(1, Ordering::Relaxed);
-    state
-        .activity
-        .active_sockets
-        .fetch_add(1, Ordering::Relaxed);
-    let Ok(upstream) = state
-        .client
-        .open_ide_ws(&route, &state.bootstrap.cookies, protocol.as_deref())
-        .await
-    else {
-        state
-            .activity
-            .upstream_failures
-            .fetch_add(1, Ordering::Relaxed);
-        state
-            .activity
-            .active_sockets
-            .fetch_sub(1, Ordering::Relaxed);
-        let _ = browser.close().await;
-        return;
-    };
-    let (mut upstream_write, mut upstream_read) = upstream.split();
-    loop {
-        tokio::select! {
-            browser_message = browser.recv() => {
-                let Some(Ok(message)) = browser_message else { break };
-                state
-                    .activity
-                    .browser_frames
-                    .fetch_add(1, Ordering::Relaxed);
-                let converted = match message {
-                    AxumMessage::Text(value) => tokio_tungstenite::tungstenite::Message::Text(
-                        value.to_string().into(),
-                    ),
-                    AxumMessage::Binary(value) => tokio_tungstenite::tungstenite::Message::Binary(value),
-                    AxumMessage::Ping(value) => tokio_tungstenite::tungstenite::Message::Ping(value),
-                    AxumMessage::Pong(value) => tokio_tungstenite::tungstenite::Message::Pong(value),
-                    AxumMessage::Close(_) => break,
-                };
-                if upstream_write.send(converted).await.is_err() { break; }
-            }
-            upstream_message = upstream_read.next() => {
-                let Some(Ok(message)) = upstream_message else { break };
-                state
-                    .activity
-                    .upstream_frames
-                    .fetch_add(1, Ordering::Relaxed);
-                let converted = match message {
-                    tokio_tungstenite::tungstenite::Message::Text(value) => {
-                        AxumMessage::Text(value.to_string().into())
-                    }
-                    tokio_tungstenite::tungstenite::Message::Binary(value) => AxumMessage::Binary(value),
-                    tokio_tungstenite::tungstenite::Message::Ping(value) => AxumMessage::Ping(value),
-                    tokio_tungstenite::tungstenite::Message::Pong(value) => AxumMessage::Pong(value),
-                    tokio_tungstenite::tungstenite::Message::Close(_) => break,
-                    tokio_tungstenite::tungstenite::Message::Frame(_) => continue,
-                };
-                if browser.send(converted).await.is_err() { break; }
-            }
-        }
-    }
-    state
-        .activity
-        .active_sockets
-        .fetch_sub(1, Ordering::Relaxed);
-}
-
-async fn serve_ide_proxy(listener: TcpListener, state: IdeProxyState) {
-    let router = Router::new()
-        .route("/", any(ide_root))
-        .route("/__opcos_status", any(ide_status))
-        .route("/ide", any(ide_root))
-        .route("/ide/", any(ide_root))
-        .route("/ide/callback", any(ide_callback))
-        .route("/ide/{*path}", any(ide_root))
-        .route("/static/{*path}", any(ide_asset))
-        .route("/out/{*path}", any(ide_out_asset))
-        .route("/resources/{*path}", any(ide_resources_asset))
-        .route("/extensions/{*path}", any(ide_asset))
-        .route("/node_modules/{*path}", any(ide_asset))
-        .route("/vscode-remote-resource", any(ide_asset))
-        .with_state(state);
-    let _ = axum::serve(listener, router).await;
-}
-
 fn effective_config_objects(
     connection: &Connection,
     workspace: &str,
@@ -13930,30 +13648,11 @@ async fn capture_remote_browser_frame(
 }
 
 #[tauri::command]
-async fn ide_bootstrap(
+fn ide_url(
     state: State<'_, DesktopState>,
     session_id: String,
     folder_uri: String,
-) -> Result<IdeBootstrap, String> {
-    if !folder_uri.starts_with("vscode-remote://") {
-        return Err("IDE folder must be a vscode-remote URI".into());
-    }
-    let host_id = session_host_id(&state, &session_id)?;
-    if host_id == "local" {
-        return Err("本机 host 不支持远程 Web IDE，请绑定远程主机".into());
-    }
-    client_for(&state, &host_id)?
-        .ide_bootstrap(&folder_uri)
-        .await
-        .map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-async fn start_ide_proxy(
-    state: State<'_, DesktopState>,
-    session_id: String,
-    folder_uri: String,
-) -> Result<IdeProxyInfo, String> {
+) -> Result<String, String> {
     let host_id = session_host_id(&state, &session_id)?;
     if !folder_uri.starts_with("vscode-remote://") {
         return Err("IDE folder must be a vscode-remote URI".into());
@@ -13961,54 +13660,9 @@ async fn start_ide_proxy(
     if host_id == "local" {
         return Err("本机 host 不支持远程 Web IDE，请绑定远程主机".into());
     }
-    let client = client_for(&state, &host_id)?;
-    let mut bootstrap = client
-        .ide_bootstrap(&folder_uri)
-        .await
-        .map_err(|error| error.to_string())?;
-    let asset_route = bootstrap
-        .html
-        .split(['"', '\''])
-        .find(|part| {
-            (part.starts_with("/out/") || part.starts_with("/resources/"))
-                && part
-                    .rsplit('/')
-                    .next()
-                    .is_some_and(|name| name.split(['?', '#']).next().unwrap_or("").contains('.'))
-        })
-        .map(str::to_owned)
-        .ok_or_else(|| "Remote Web IDE returned no loadable workbench asset paths.".to_owned())?;
-    let asset_upstream_route = ide_asset_upstream_route(&asset_route);
-    client
-        .ide_request_bytes(&asset_upstream_route, &bootstrap.cookies)
-        .await
-        .map_err(|error| format!("Remote Web IDE workbench asset request failed: {error}"))?;
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .map_err(|error| error.to_string())?;
-    let port = listener
-        .local_addr()
-        .map_err(|error| error.to_string())?
-        .port();
-    bootstrap.html =
-        rewrite_workbench_authority(&bootstrap.html, &format!("127.0.0.1.sslip.io:{port}"));
-    let task = tauri::async_runtime::spawn(serve_ide_proxy(
-        listener,
-        IdeProxyState {
-            client,
-            bootstrap,
-            activity: Arc::new(IdeProxyActivity::default()),
-        },
-    ));
-    state.ide_proxies.lock().await.insert(port, task);
-    Ok(IdeProxyInfo { port })
-}
-
-#[tauri::command]
-fn open_ide_external(app: tauri::AppHandle, port: u16) -> Result<(), String> {
-    app.opener()
-        .open_url(format!("http://127.0.0.1:{port}/ide/"), None::<&str>)
-        .map_err(|_| "could not open the system browser".to_owned())
+    Ok(client_for(&state, &host_id)?
+        .ide_url(&folder_uri)
+        .to_string())
 }
 
 #[tauri::command(rename = "create_session")]
@@ -29634,7 +29288,6 @@ fn main() {
                 acp_streams: Mutex::new(HashMap::new()),
                 trigger_runs: AsyncMutex::new(HashSet::new()),
                 surfaces: AsyncMutex::new(HashMap::new()),
-                ide_proxies: AsyncMutex::new(HashMap::new()),
                 coordination: Arc::clone(&coordination),
                 index_root: {
                     let mut root = path.clone();
@@ -29993,9 +29646,7 @@ fn main() {
             validate_provider_key,
             start_surface,
             capture_remote_browser_frame,
-            ide_bootstrap,
-            start_ide_proxy,
-            open_ide_external
+            ide_url
         ])
         .build(tauri::generate_context!())
         .expect("error while building OPCOS")
@@ -32810,26 +32461,6 @@ agents:
     }
 
     #[test]
-    fn ide_proxy_activity_tracks_multiple_socket_frames() {
-        let activity = IdeProxyActivity::default();
-        activity.total_sockets.fetch_add(2, Ordering::Relaxed);
-        activity.active_sockets.fetch_add(2, Ordering::Relaxed);
-        activity.upstream_frames.fetch_add(1, Ordering::Relaxed);
-        activity.active_sockets.fetch_sub(1, Ordering::Relaxed);
-        assert_eq!(activity.total_sockets.load(Ordering::Relaxed), 2);
-        assert_eq!(activity.active_sockets.load(Ordering::Relaxed), 1);
-        assert_eq!(activity.upstream_frames.load(Ordering::Relaxed), 1);
-    }
-
-    #[test]
-    fn ide_workbench_authority_is_rewritten_to_the_loopback_proxy() {
-        let html = r#"<meta data-settings='{"remoteAuthority":"linux.windevos.com","connectionToken":"local"}'>"#;
-        let rewritten = rewrite_workbench_authority(html, "127.0.0.1.sslip.io:43123");
-        assert!(rewritten.contains(r#""remoteAuthority":"127.0.0.1.sslip.io:43123""#));
-        assert!(!rewritten.contains("linux.windevos.com"));
-    }
-
-    #[test]
     fn mcp_session_views_use_session_id_without_frontend_field_churn() {
         let view = mcp_session_view(SessionView {
             id: "session-test".into(),
@@ -32897,22 +32528,6 @@ agents:
         assert!(!ASKPASS_SCRIPT.contains(token));
         assert!(ASKPASS_SCRIPT.contains("OPCOS_GIT_PASSWORD"));
         assert!(ASKPASS_SCRIPT.contains("OPCOS_GIT_USERNAME"));
-    }
-
-    #[test]
-    fn ide_preflight_uses_the_same_upstream_prefix_as_asset_proxy() {
-        assert_eq!(
-            ide_asset_upstream_route("/out/nls.messages.js"),
-            "/ide/static/out/nls.messages.js"
-        );
-        assert_eq!(
-            ide_asset_upstream_route("/resources/workbench.css?x=1"),
-            "/ide/static/resources/workbench.css?x=1"
-        );
-        assert_eq!(
-            ide_asset_upstream_route("/static/out/workbench.js"),
-            "/ide/static/out/workbench.js"
-        );
     }
 
     #[test]

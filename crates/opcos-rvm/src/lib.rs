@@ -451,87 +451,6 @@ pub struct HttpRvmClient {
     path_guard: Option<RemotePathGuard>,
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct IdeBootstrap {
-    pub html: String,
-    #[serde(skip)]
-    pub cookies: Vec<String>,
-}
-
-fn cookie_pair(set_cookie: &str) -> Option<String> {
-    set_cookie.split(';').next().map(str::to_owned)
-}
-
-pub fn has_encoded_traversal(path: &str) -> bool {
-    let mut current = path.to_owned();
-    for _ in 0..6 {
-        let decoded = percent_decode_once(&current);
-        if decoded == current {
-            break;
-        }
-        current = decoded;
-    }
-    current
-        .split('/')
-        .any(|segment| segment == ".." || segment == ".")
-}
-
-fn percent_decode_once(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut output = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let hex = |byte: u8| match byte {
-                b'0'..=b'9' => Some(byte - b'0'),
-                b'a'..=b'f' => Some(byte - b'a' + 10),
-                b'A'..=b'F' => Some(byte - b'A' + 10),
-                _ => None,
-            };
-            if let (Some(high), Some(low)) = (hex(bytes[index + 1]), hex(bytes[index + 2])) {
-                output.push(high * 16 + low);
-                index += 3;
-                continue;
-            }
-        }
-        output.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8_lossy(&output).into_owned()
-}
-
-pub fn sanitize_proxy_url(raw: &str, upstream_token: &str) -> Result<Url, RvmError> {
-    let mut url = Url::parse(raw).map_err(|_| RvmError::InvalidUrl)?;
-    if has_encoded_traversal(url.path()) {
-        return Err(RvmError::Path("encoded traversal rejected".into()));
-    }
-    let pairs = url
-        .query_pairs()
-        .map(|(key, value)| {
-            let key_is_token = key.eq_ignore_ascii_case("token")
-                || key.eq_ignore_ascii_case("tkn")
-                || key.eq_ignore_ascii_case("connectionToken")
-                || key.eq_ignore_ascii_case("reconnectionToken");
-            (
-                key.into_owned(),
-                if key_is_token {
-                    upstream_token.to_owned()
-                } else {
-                    value.into_owned()
-                },
-            )
-        })
-        .collect::<Vec<_>>();
-    url.set_query(None);
-    if !pairs.is_empty() {
-        let mut query = url.query_pairs_mut();
-        for (key, value) in pairs {
-            query.append_pair(&key, &value);
-        }
-    }
-    Ok(url)
-}
-
 pub struct PersistentShell<C> {
     client: C,
     session: String,
@@ -720,219 +639,13 @@ impl HttpRvmClient {
         })
     }
 
-    pub async fn ide_bootstrap(&self, folder: &str) -> Result<IdeBootstrap, RvmError> {
-        let mut cookies: Vec<String> = Vec::new();
+    pub fn ide_url(&self, folder: &str) -> Url {
         let mut url = self.config.base_url.clone();
         url.set_path("/ide/");
         url.query_pairs_mut()
             .append_pair("tkn", &self.config.token)
             .append_pair("folder", folder);
-        for _ in 0..8 {
-            let mut request = self
-                .http
-                .get(url.clone())
-                .header(header::AUTHORIZATION, self.config.auth_header())
-                .header(header::ACCEPT, "text/html")
-                .header(header::USER_AGENT, IDE_BROWSER_USER_AGENT)
-                .header("Sec-Fetch-Mode", "navigate");
-            if !cookies.is_empty() {
-                request = request.header(header::COOKIE, cookies.join("; "));
-            }
-            let response = request
-                .send()
-                .await
-                .map_err(|error| RvmError::request(error, &self.config.token))?;
-            for value in response.headers().get_all(header::SET_COOKIE) {
-                if let Ok(value) = value.to_str()
-                    && let Some(pair) = cookie_pair(value)
-                {
-                    if let Some(name) = pair.split('=').next() {
-                        cookies.retain(|old| old.split('=').next() != Some(name));
-                    }
-                    cookies.push(pair);
-                }
-            }
-            if response.status().is_redirection() {
-                let location = response
-                    .headers()
-                    .get(header::LOCATION)
-                    .ok_or_else(|| RvmError::WebSocket("IDE redirect missing location".into()))?
-                    .to_str()
-                    .map_err(|_| RvmError::WebSocket("IDE redirect has invalid location".into()))?;
-                let redirected = url
-                    .join(location)
-                    .map_err(|_| RvmError::WebSocket("IDE redirect has invalid URL".into()))?;
-                url = sanitize_proxy_url(redirected.as_str(), &self.config.token)?;
-                continue;
-            }
-            if !response.status().is_success() {
-                let status = response.status();
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|error| RvmError::request(error, &self.config.token))?;
-                return Err(RvmError::http(
-                    status,
-                    &String::from_utf8_lossy(&bytes),
-                    &self.config.token,
-                ));
-            }
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|error| RvmError::request(error, &self.config.token))?;
-            let html = String::from_utf8_lossy(&bytes).into_owned();
-            return Ok(IdeBootstrap { html, cookies });
-        }
-        Err(RvmError::WebSocket("too many IDE redirects".into()))
-    }
-
-    pub async fn ide_request_bytes(
-        &self,
-        route: &str,
-        cookies: &[String],
-    ) -> Result<Bytes, RvmError> {
-        let mut url = self
-            .config
-            .base_url
-            .join(route)
-            .map_err(|_| RvmError::InvalidUrl)?;
-        let pairs = url
-            .query_pairs()
-            .map(|(key, value)| {
-                let key_is_token = key.eq_ignore_ascii_case("token")
-                    || key.eq_ignore_ascii_case("tkn")
-                    || key.eq_ignore_ascii_case("connectionToken");
-                (
-                    key.into_owned(),
-                    if key_is_token {
-                        self.config.token.clone()
-                    } else {
-                        value.into_owned()
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        url.set_query(None);
-        if !pairs.is_empty() {
-            let mut query = url.query_pairs_mut();
-            for (key, value) in pairs {
-                query.append_pair(&key, &value);
-            }
-        }
-        let mut request = self
-            .http
-            .get(url)
-            .timeout(Duration::from_secs(120))
-            .header(header::ACCEPT, "*/*")
-            .header(header::USER_AGENT, IDE_BROWSER_USER_AGENT)
-            .header("Sec-Fetch-Mode", "no-cors")
-            .header("Sec-Fetch-Dest", "empty")
-            .header(
-                header::REFERER,
-                format!(
-                    "{}/ide/",
-                    self.config.base_url.as_str().trim_end_matches('/')
-                ),
-            );
-        request = request.header(header::AUTHORIZATION, self.config.auth_header());
-        if !cookies.is_empty() {
-            request = request.header(header::COOKIE, cookies.join("; "));
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| RvmError::request(error, &self.config.token))?;
-        let status = response.status();
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| RvmError::request(error, &self.config.token))?;
-        if !status.is_success() {
-            return Err(RvmError::http(
-                status,
-                &String::from_utf8_lossy(&bytes),
-                &self.config.token,
-            ));
-        }
-        Ok(bytes)
-    }
-
-    pub async fn open_ide_ws(
-        &self,
-        route: &str,
-        cookies: &[String],
-        protocol: Option<&str>,
-    ) -> Result<RvmWebSocket, RvmError> {
-        let mut url = self
-            .config
-            .base_url
-            .join(route)
-            .map_err(|_| RvmError::InvalidUrl)?;
-        url.set_scheme(match url.scheme() {
-            "https" => "wss",
-            _ => "ws",
-        })
-        .map_err(|_| RvmError::InvalidUrl)?;
-        let pairs = ide_ws_query_pairs(&url, &self.config.token);
-        url.set_query(None);
-        if !pairs.is_empty() {
-            let mut query = url.query_pairs_mut();
-            for (key, value) in pairs {
-                query.append_pair(&key, &value);
-            }
-        }
-        let mut request = url.as_str().into_client_request().map_err(|error| {
-            RvmError::WebSocket(RvmError::redact(&error.to_string(), &self.config.token))
-        })?;
-        let mut origin = self.config.base_url.clone();
-        origin.set_path("");
-        origin.set_query(None);
-        request.headers_mut().insert(
-            header::ORIGIN,
-            origin
-                .as_str()
-                .parse()
-                .map_err(|_| RvmError::WebSocket("invalid IDE origin".into()))?,
-        );
-        request.headers_mut().insert(
-            header::USER_AGENT,
-            IDE_BROWSER_USER_AGENT
-                .parse()
-                .map_err(|_| RvmError::WebSocket("invalid IDE user-agent".into()))?,
-        );
-        if let Some(protocol) = protocol {
-            request.headers_mut().insert(
-                header::SEC_WEBSOCKET_PROTOCOL,
-                protocol
-                    .parse()
-                    .map_err(|_| RvmError::WebSocket("invalid IDE websocket protocol".into()))?,
-            );
-        }
-        request.headers_mut().insert(
-            header::AUTHORIZATION,
-            self.config
-                .auth_header()
-                .parse()
-                .map_err(|_| RvmError::WebSocket("invalid authorization header".into()))?,
-        );
-        if !cookies.is_empty() {
-            request.headers_mut().insert(
-                header::COOKIE,
-                cookies
-                    .join("; ")
-                    .parse()
-                    .map_err(|_| RvmError::WebSocket("invalid IDE cookie".into()))?,
-            );
-        }
-        let result = connect_async(request).await;
-        match result {
-            Ok((stream, _)) => Ok(stream),
-            Err(error) => Err(RvmError::WebSocket(RvmError::redact(
-                &error.to_string(),
-                &self.config.token,
-            ))),
-        }
+        url
     }
 
     fn remote_path(&self, path: &str) -> Result<String, RvmError> {
@@ -1061,17 +774,6 @@ impl HttpRvmClient {
         }
         Ok(bytes)
     }
-}
-
-fn ide_ws_query_pairs(url: &Url, _token: &str) -> Vec<(String, String)> {
-    url.query_pairs()
-        .filter(|(key, _)| {
-            !key.eq_ignore_ascii_case("token")
-                && !key.eq_ignore_ascii_case("tkn")
-                && !key.eq_ignore_ascii_case("connectionToken")
-        })
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect()
 }
 
 #[async_trait]
@@ -1721,6 +1423,25 @@ mod tests {
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn ide_url_contains_only_the_direct_host_route_and_folder() {
+        let client = HttpRvmClient::new(RvmClientConfig {
+            base_url: Url::parse("https://linux.example.test").unwrap(),
+            token: "test-token".into(),
+            request_timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+        let url = client.ide_url("vscode-remote://linux/workspace");
+        assert_eq!(url.path(), "/ide/");
+        assert_eq!(
+            url.query_pairs().collect::<Vec<_>>(),
+            vec![
+                ("tkn".into(), "test-token".into()),
+                ("folder".into(), "vscode-remote://linux/workspace".into())
+            ]
+        );
+    }
 
     #[test]
     fn token_is_redacted_from_debug() {

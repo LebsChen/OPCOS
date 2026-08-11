@@ -2526,13 +2526,12 @@ function SurfaceView({
     mime: string;
     target_url: string;
   } | null>(null);
-  const [ideProxy, setIdeProxy] = useState<{ port: number } | null>(null);
+  const [ideUrl, setIdeUrl] = useState("");
   const [review, setReview] = useState<Record<string, unknown> | null>(null);
   const [diff, setDiff] = useState<Record<string, unknown> | null>(null);
   const [worklog, setWorklog] = useState<Record<string, unknown> | null>(null);
   const [busy, setBusy] = useState(false);
   const [ideError, setIdeError] = useState("");
-  const [ideWebviewUnsupported, setIdeWebviewUnsupported] = useState(false);
   const start = async (surface: string) => {
     try {
       setBusy(true);
@@ -2564,12 +2563,11 @@ function SurfaceView({
     setVncPassword(null);
     setSurfaceError("");
     setBrowserFrame(null);
-    setIdeProxy(null);
+    setIdeUrl("");
     setReview(null);
     setDiff(null);
     setWorklog(null);
     setIdeError("");
-    setIdeWebviewUnsupported(false);
   }, [selected.id]);
   useEffect(() => {
     if (tab === "terminal" || tab === "desktop" || tab === "browser") {
@@ -2578,13 +2576,13 @@ function SurfaceView({
           tab === "terminal" ? "pty" : tab === "desktop" ? "vnc" : "cdp",
         );
       }
-    } else if (tab === "ide" && !ideProxy && !ideError) {
+    } else if (tab === "ide" && !ideUrl && !ideError) {
       setBusy(true);
-      void command<{ port: number }>("start_ide_proxy", {
+      void command<string>("ide_url", {
         sessionId: selected.id,
         folderUri: `vscode-remote://${selected.host_name}/${selected.workspace || "workspace"}`,
       })
-        .then(setIdeProxy)
+        .then(setIdeUrl)
         .catch((error) => {
           setIdeError(errorMessage(error));
           onError(error);
@@ -2598,73 +2596,9 @@ function SurfaceView({
     selected.host_name,
     selected.workspace,
     port,
-    ideProxy,
+    ideUrl,
     ideError,
   ]);
-  useEffect(() => {
-    if (tab !== "ide" || !ideProxy || ideError) return;
-    let cancelled = false;
-    let timer: number | undefined;
-    let latest: {
-      total_sockets: number;
-      upstream_frames: number;
-    } | null = null;
-    const started = Date.now();
-    const poll = async () => {
-      try {
-        const response = await fetch(
-          `http://127.0.0.1:${ideProxy.port}/__opcos_status`,
-        );
-        if (!response.ok) throw new Error(`status ${response.status}`);
-        const next = (await response.json()) as {
-          active_sockets: number;
-          total_sockets: number;
-          upstream_frames: number;
-          upstream_failures: number;
-        };
-        if (cancelled) return;
-        latest = next;
-        if (next.upstream_failures > 0) {
-          setIdeError(
-            "Remote Web IDE relay failed while opening the workbench session.",
-          );
-          return;
-        }
-        if (next.upstream_frames > 0) return;
-      } catch {
-        // Keep polling until the bounded stall timeout expires.
-      }
-      if (cancelled) return;
-      if (Date.now() - started >= 60_000) {
-        const isWebKitWebView =
-          /AppleWebKit/i.test(navigator.userAgent) &&
-          !/Chrome|Chromium|CriOS|Edg/i.test(navigator.userAgent);
-        if (
-          isWebKitWebView &&
-          (latest?.total_sockets ?? 0) === 0 &&
-          (latest?.upstream_frames ?? 0) === 0
-        ) {
-          setIdeWebviewUnsupported(true);
-          setIdeError(
-            "This embedded WebKit webview cannot run the remote Web IDE workbench. Open it in your system browser instead.",
-          );
-        } else {
-          setIdeError(
-            `Remote Web IDE workbench stalled after the WebSocket upgrade (sockets: ${
-              latest?.total_sockets ?? 0
-            }, upstream frames: ${latest?.upstream_frames ?? 0}).`,
-          );
-        }
-        return;
-      }
-      timer = window.setTimeout(() => void poll(), 250);
-    };
-    void poll();
-    return () => {
-      cancelled = true;
-      if (timer !== undefined) window.clearTimeout(timer);
-    };
-  }, [tab, ideProxy, ideError]);
   useEffect(() => {
     if (tab !== "browser") return;
     let cancelled = false;
@@ -2828,40 +2762,17 @@ function SurfaceView({
             Connecting to the bound remote host…
           </div>
         )}
-        {ideProxy && !ideError ? (
+        {ideUrl && !ideError ? (
           <iframe
             title={translate("Remote Web IDE")}
-            src={`http://127.0.0.1:${ideProxy.port}/ide/`}
+            src={ideUrl}
             className="ide-frame"
-            onLoad={(event) => {
-              const frame = event.currentTarget;
-              try {
-                const body = frame.contentDocument?.body?.textContent || "";
-                if (
-                  /bad gateway|upstream|forbidden|not available/i.test(body)
-                ) {
-                  setIdeError("Remote Web IDE workbench asset request failed.");
-                }
-              } catch {
-                // Cross-origin frames cannot be inspected; browser errors remain visible.
-              }
-            }}
           />
         ) : ideError ? (
           <div className="empty-surface ide-error">
             <Icon name="code" size={32} />
             <p>{ideError}</p>
             <p className="muted">No local fallback is used.</p>
-            {ideWebviewUnsupported && ideProxy && (
-              <button
-                type="button"
-                onClick={() =>
-                  void command("open_ide_external", { port: ideProxy.port })
-                }
-              >
-                Open remote IDE in system browser
-              </button>
-            )}
           </div>
         ) : (
           <div className="empty-surface">
