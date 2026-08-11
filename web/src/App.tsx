@@ -12301,18 +12301,7 @@ function AppContent() {
               {/* OpenWorker session topbar: surfaces/gui/src/App.tsx:1365-1442.
                 Only the facts and Tauri panel action are adapted to OPCOS. */}
               <header className="main-topbar">
-                <div className="main-topbar-side">
-                  {navCollapsed && (
-                    <button
-                      className="topbar-icon-btn"
-                      onClick={toggleNav}
-                      aria-label="Show sidebar"
-                      title="Show sidebar"
-                    >
-                      <Icon name="sidebar" size={16} />
-                    </button>
-                  )}
-                </div>
+                <div className="main-topbar-side" aria-hidden="true" />
                 <div className="main-title">
                   <span className="main-title-text" title={selected.title}>
                     {selected.title}
