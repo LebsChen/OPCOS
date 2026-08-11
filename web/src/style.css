@@ -2169,12 +2169,6 @@ input.workspace-chip {
 }
 
 @media (max-width: 1100px) {
-  .app.session-layout {
-    grid-template-columns: 220px 6px minmax(0, 1fr);
-  }
-  .app.session-layout.session-drawer-collapsed {
-    grid-template-columns: 220px 6px minmax(0, 1fr);
-  }
   .surface-panel {
     padding-inline: 12px;
   }
@@ -2184,23 +2178,6 @@ input.workspace-chip {
   .surface-toolbar button {
     max-width: 100%;
     white-space: nowrap;
-  }
-}
-@media (max-width: 760px) {
-  .app.session-layout .main-topbar,
-  .app.session-layout .main-chat {
-    margin-right: 44px;
-  }
-  .app.session-layout .session-right-panel:not(.drawer-collapsed) {
-    width: 44px;
-  }
-  .app.session-layout
-    .session-right-panel:not(.drawer-collapsed)
-    .session-panel-drawer,
-  .app.session-layout
-    .session-right-panel:not(.drawer-collapsed)
-    .session-panel-resizer {
-    display: none;
   }
 }
 .terminal-host,
