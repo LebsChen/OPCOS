@@ -35,6 +35,7 @@ export type TimelineNode =
       resolved?: "allow" | "deny";
     }
   | { kind: "question"; callId: string; text: string; options?: string[] }
+  | { kind: "tail_status"; text: string }
   | {
       kind: "notice";
       text: string;
@@ -262,7 +263,10 @@ export function mergeEvents(
     .map(({ event }) => event);
 }
 
-export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
+export function buildTimeline(
+  events: TimelineEvent[],
+  running = false,
+): TimelineNode[] {
   const nodes: TimelineNode[] = [];
   let work: Extract<TimelineNode, { kind: "work" }> | null = null;
   let workStarted = 0;
@@ -968,13 +972,20 @@ export function buildTimeline(events: TimelineEvent[]): TimelineNode[] {
       }
     }
   }
+  const currentWork = work as Extract<TimelineNode, { kind: "work" }> | null;
+  const tailActivity = currentWork
+    ? lastActivityLabel(currentWork.rows)
+    : undefined;
   flush(workEnded || events.at(-1)?.created_at_ms || workStarted);
-  if (completionPending) {
+  if (running) {
     nodes.push({
-      kind: "notice",
+      kind: "tail_status",
+      text: `OPCOS: ${tailActivity || "Running"}`,
+    });
+  } else if (completionPending) {
+    nodes.push({
+      kind: "tail_status",
       text: "Turn complete — waiting for your next instruction",
-      tone: "info",
-      noticeKind: "turn_finished",
     });
   }
   return nodes;

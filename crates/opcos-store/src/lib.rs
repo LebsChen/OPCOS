@@ -65,6 +65,8 @@ pub struct SessionRecord {
     pub external_session_id: Option<String>,
     pub run_state: String,
     pub stop_reason: String,
+    pub terminal_cause: Option<String>,
+    pub provider_finish_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub project_id: Option<String>,
@@ -1097,10 +1099,12 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> Result<SessionRecord, rusqlite::
         external_session_id: row.get(15)?,
         run_state: row.get(16)?,
         stop_reason: row.get(17)?,
-        created_at: parse_timestamp(row.get(18)?)?,
-        updated_at: parse_timestamp(row.get(19)?)?,
-        project_id: row.get(20)?,
-        agent_id: row.get(21)?,
+        terminal_cause: row.get(18)?,
+        provider_finish_reason: row.get(19)?,
+        created_at: parse_timestamp(row.get(20)?)?,
+        updated_at: parse_timestamp(row.get(21)?)?,
+        project_id: row.get(22)?,
+        agent_id: row.get(23)?,
     })
 }
 
@@ -1407,6 +1411,14 @@ pub trait SessionStore {
         session_id: &str,
         run_state: &str,
         stop_reason: &str,
+    ) -> Result<(), StoreError>;
+    fn update_session_status_with_details(
+        &self,
+        session_id: &str,
+        run_state: &str,
+        stop_reason: &str,
+        terminal_cause: Option<&str>,
+        provider_finish_reason: Option<&str>,
     ) -> Result<(), StoreError>;
     fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), StoreError>;
     fn update_session_title(&self, session_id: &str, title: &str) -> Result<(), StoreError>;
@@ -4641,6 +4653,8 @@ impl SqliteStore {
                external_session_id TEXT,
                run_state TEXT NOT NULL DEFAULT 'idle',
                stop_reason TEXT NOT NULL DEFAULT 'none',
+               terminal_cause TEXT,
+               provider_finish_reason TEXT,
                created_at TEXT NOT NULL,
                updated_at TEXT NOT NULL,
                project_id TEXT,
@@ -4749,6 +4763,21 @@ impl SqliteStore {
             if !session_columns.iter().any(|column| column == "stop_reason") {
                 connection.execute(
                     "ALTER TABLE sessions ADD COLUMN stop_reason TEXT NOT NULL DEFAULT 'none'",
+                    [],
+                )?;
+            }
+            if !table_columns(&connection, "sessions")?
+                .iter()
+                .any(|column| column == "terminal_cause")
+            {
+                connection.execute("ALTER TABLE sessions ADD COLUMN terminal_cause TEXT", [])?;
+            }
+            if !table_columns(&connection, "sessions")?
+                .iter()
+                .any(|column| column == "provider_finish_reason")
+            {
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN provider_finish_reason TEXT",
                     [],
                 )?;
             }
@@ -5447,7 +5476,7 @@ impl SqliteStore {
 
     pub fn save_session(&self, session: &SessionRecord) -> Result<(), StoreError> {
         self.connection.lock().expect("sqlite mutex poisoned").execute(
-            "INSERT OR REPLACE INTO sessions(session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at,project_id,agent_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)",
+            "INSERT OR REPLACE INTO sessions(session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,terminal_cause,provider_finish_reason,created_at,updated_at,project_id,agent_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
             params![
                 session.session_id,
                 session.workspace,
@@ -5467,6 +5496,8 @@ impl SqliteStore {
                 session.external_session_id,
                 session.run_state,
                 session.stop_reason,
+                session.terminal_cause,
+                session.provider_finish_reason,
                 session.created_at.to_rfc3339(),
                 session.updated_at.to_rfc3339(),
                 session.project_id,
@@ -5479,7 +5510,7 @@ impl SqliteStore {
     pub fn load_session(&self, session_id: &str) -> Result<Option<SessionRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let result = connection.query_row(
-            "SELECT session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at,project_id,agent_id FROM sessions WHERE session_id=?1",
+            "SELECT session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,terminal_cause,provider_finish_reason,created_at,updated_at,project_id,agent_id FROM sessions WHERE session_id=?1",
             [session_id],
             session_from_row,
         );
@@ -5493,7 +5524,7 @@ impl SqliteStore {
     pub fn load_sessions(&self) -> Result<Vec<SessionRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,created_at,updated_at,project_id,agent_id FROM sessions ORDER BY created_at DESC",
+            "SELECT session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,terminal_cause,provider_finish_reason,created_at,updated_at,project_id,agent_id FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = statement.query_map([], session_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -5891,9 +5922,40 @@ impl SqliteStore {
         run_state: &str,
         stop_reason: &str,
     ) -> Result<(), StoreError> {
+        self.update_session_status_with_details(session_id, run_state, stop_reason, None, None)
+    }
+
+    pub fn update_session_status_with_details(
+        &self,
+        session_id: &str,
+        run_state: &str,
+        stop_reason: &str,
+        terminal_cause: Option<&str>,
+        provider_finish_reason: Option<&str>,
+    ) -> Result<(), StoreError> {
         let changed = self.connection.lock().expect("sqlite mutex poisoned").execute(
-            "UPDATE sessions SET run_state=?1, stop_reason=?2, updated_at=?3 WHERE session_id=?4",
-            params![run_state, stop_reason, Utc::now().to_rfc3339(), session_id],
+            "UPDATE sessions SET
+             run_state=CASE WHEN terminal_cause IN ('user_interrupted','crash_orphaned')
+                              AND ?1='idle' AND ?2='finished'
+                            THEN run_state ELSE ?1 END,
+             stop_reason=CASE WHEN terminal_cause IN ('user_interrupted','crash_orphaned')
+                                AND ?1='idle' AND ?2='finished'
+                              THEN stop_reason ELSE ?2 END,
+             terminal_cause=CASE WHEN terminal_cause IN ('user_interrupted','crash_orphaned')
+                                   AND ?1='idle' AND ?2='finished'
+                                 THEN terminal_cause ELSE ?3 END,
+             provider_finish_reason=CASE WHEN terminal_cause IN ('user_interrupted','crash_orphaned')
+                                           AND ?1='idle' AND ?2='finished'
+                                         THEN provider_finish_reason ELSE ?4 END,
+             updated_at=?5 WHERE session_id=?6",
+            params![
+                run_state,
+                stop_reason,
+                terminal_cause,
+                provider_finish_reason,
+                Utc::now().to_rfc3339(),
+                session_id
+            ],
         )?;
         if changed == 0 {
             return Err(StoreError::SessionNotFound(session_id.into()));
@@ -5902,10 +5964,16 @@ impl SqliteStore {
     }
 
     pub fn reconcile_running_sessions(&self) -> Result<usize, StoreError> {
-        let changed = self.connection.lock().expect("sqlite mutex poisoned").execute(
-            "UPDATE sessions SET run_state='interrupted', stop_reason='interrupted_by_crash', updated_at=?1 WHERE run_state='running'",
-            [Utc::now().to_rfc3339()],
-        )?;
+        let changed = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE sessions SET run_state='interrupted', stop_reason='interrupted_by_crash',
+             terminal_cause='crash_orphaned', provider_finish_reason=NULL, updated_at=?1
+             WHERE run_state='running'",
+                [Utc::now().to_rfc3339()],
+            )?;
         Ok(changed)
     }
 }
@@ -5930,6 +5998,24 @@ impl SessionStore for SqliteStore {
         stop_reason: &str,
     ) -> Result<(), StoreError> {
         SqliteStore::update_session_status(self, session_id, run_state, stop_reason)
+    }
+
+    fn update_session_status_with_details(
+        &self,
+        session_id: &str,
+        run_state: &str,
+        stop_reason: &str,
+        terminal_cause: Option<&str>,
+        provider_finish_reason: Option<&str>,
+    ) -> Result<(), StoreError> {
+        SqliteStore::update_session_status_with_details(
+            self,
+            session_id,
+            run_state,
+            stop_reason,
+            terminal_cause,
+            provider_finish_reason,
+        )
     }
 
     fn update_session_mode(&self, session_id: &str, mode: &str) -> Result<(), StoreError> {
@@ -6776,6 +6862,35 @@ impl SessionStore for SqliteStore {
 mod tests {
     use super::*;
 
+    fn test_session(session_id: &str) -> SessionRecord {
+        SessionRecord {
+            session_id: session_id.into(),
+            workspace: "/workspace".into(),
+            model: "test".into(),
+            mode: "Interactive".into(),
+            harness: "builtin".into(),
+            title: "Test".into(),
+            extra_roots: vec![],
+            grants: serde_json::json!({}),
+            pinned: false,
+            archived: false,
+            origin: None,
+            origin_label: None,
+            compaction: serde_json::json!({}),
+            host_id: "local".into(),
+            provider: None,
+            external_session_id: None,
+            run_state: "idle".into(),
+            stop_reason: "none".into(),
+            terminal_cause: None,
+            provider_finish_reason: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            project_id: None,
+            agent_id: None,
+        }
+    }
+
     #[test]
     fn migration_and_session_insert_work() {
         let store = SqliteStore::open_in_memory().unwrap();
@@ -6798,6 +6913,8 @@ mod tests {
             external_session_id: None,
             run_state: "idle".into(),
             stop_reason: "none".into(),
+            terminal_cause: None,
+            provider_finish_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             project_id: None,
@@ -6816,6 +6933,44 @@ mod tests {
                 .as_deref(),
             Some("opencode-session-1")
         );
+    }
+
+    #[test]
+    fn terminal_details_persist_and_interruptions_win_over_late_completion() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut session = test_session("terminal-details");
+        session.run_state = "error".into();
+        session.stop_reason = "provider_error".into();
+        session.terminal_cause = Some("provider_failed".into());
+        session.provider_finish_reason = Some("rate_limit".into());
+        store.save_session(&session).unwrap();
+        let loaded = store.load_session(&session.session_id).unwrap().unwrap();
+        assert_eq!(loaded.terminal_cause.as_deref(), Some("provider_failed"));
+        assert_eq!(loaded.provider_finish_reason.as_deref(), Some("rate_limit"));
+
+        store
+            .update_session_status_with_details(
+                &session.session_id,
+                "interrupted",
+                "interrupted_by_user",
+                Some("user_interrupted"),
+                None,
+            )
+            .unwrap();
+        store
+            .update_session_status_with_details(
+                &session.session_id,
+                "idle",
+                "finished",
+                Some("completed"),
+                Some("stop"),
+            )
+            .unwrap();
+        let loaded = store.load_session(&session.session_id).unwrap().unwrap();
+        assert_eq!(loaded.run_state, "interrupted");
+        assert_eq!(loaded.stop_reason, "interrupted_by_user");
+        assert_eq!(loaded.terminal_cause.as_deref(), Some("user_interrupted"));
+        assert_eq!(loaded.provider_finish_reason, None);
     }
 
     #[test]
@@ -6842,6 +6997,8 @@ mod tests {
                 external_session_id: None,
                 run_state: "future_run_state".into(),
                 stop_reason: "future_stop_reason".into(),
+                terminal_cause: None,
+                provider_finish_reason: None,
                 created_at: now,
                 updated_at: now,
                 project_id: None,
@@ -6925,6 +7082,8 @@ mod tests {
                     external_session_id: None,
                     run_state: if id == "running" { "running" } else { "idle" }.into(),
                     stop_reason: "none".into(),
+                    terminal_cause: None,
+                    provider_finish_reason: None,
                     created_at: now,
                     updated_at: now,
                     project_id: None,
@@ -6937,6 +7096,7 @@ mod tests {
         let running = store.load_session("running").unwrap().unwrap();
         assert_eq!(running.run_state, "interrupted");
         assert_eq!(running.stop_reason, "interrupted_by_crash");
+        assert_eq!(running.terminal_cause.as_deref(), Some("crash_orphaned"));
         assert_eq!(
             store.load_session("idle").unwrap().unwrap().run_state,
             "idle"
@@ -7044,6 +7204,8 @@ mod tests {
                 external_session_id: None,
                 run_state: "idle".into(),
                 stop_reason: "none".into(),
+                terminal_cause: None,
+                provider_finish_reason: None,
                 created_at: now,
                 updated_at: now,
                 project_id: Some("project-1".into()),

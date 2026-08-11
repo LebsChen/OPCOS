@@ -6623,6 +6623,8 @@ struct SessionView {
     workspace: String,
     run_state: String,
     stop_reason: String,
+    terminal_cause: Option<String>,
+    provider_finish_reason: Option<String>,
     archived: bool,
     project_id: Option<String>,
     agent_id: Option<String>,
@@ -11013,6 +11015,8 @@ fn session_status_payload_from_store(store: &SqliteStore, session_id: &str) -> V
             json!({
                 "run_state": session.run_state,
                 "stop_reason": session.stop_reason,
+                "terminal_cause": session.terminal_cause,
+                "provider_finish_reason": session.provider_finish_reason,
             })
         })
         .unwrap_or_else(|| json!({"run_state":"error","stop_reason":"internal_error"}))
@@ -11819,6 +11823,80 @@ async fn acp_for(
     Ok(harness)
 }
 
+async fn restart_session_runtime_inner(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<(), String> {
+    let session = session_for(state, session_id)?;
+    if session.run_state == "running" {
+        return Err("cannot restart a session while its turn is running".into());
+    }
+    if let Some(engine) = state.engines.lock().await.get(session_id).cloned()
+        && engine.has_active_turn()
+    {
+        return Err("cannot restart a session while its turn is running".into());
+    }
+    state.engines.lock().await.remove(session_id);
+    state.engine_capabilities.lock().await.remove(session_id);
+    state.engine_hosts.lock().await.remove(session_id);
+    state.acp_event_sessions.lock().await.remove(session_id);
+    state.acp_engines.lock().await.remove(session_id);
+
+    if session.host_id != "local" {
+        client_for(state, &session.host_id)?
+            .health()
+            .await
+            .map_err(|error| format!("remote host unavailable: {error}"))?;
+    }
+    match session.harness.as_str() {
+        "builtin" => {
+            let _ = engine_for_with_context(app, state, session_id, ToolOrigin::User, None, None)
+                .await?;
+        }
+        "acp" => {
+            let _ = acp_for(state, session_id).await?;
+        }
+        _ => return Err("this session uses an unavailable harness".into()),
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn restart_session_runtime(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<(), String> {
+    restart_session_runtime_inner(&app, &state, &session_id).await
+}
+
+#[tauri::command]
+async fn retry_session(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<(), String> {
+    let session = session_for(&state, &session_id)?;
+    if session.harness != "builtin" {
+        return Err("retry is not available for this harness; restart the runtime first".into());
+    }
+    restart_session_runtime_inner(&app, &state, &session_id).await?;
+    let engine = engine_for(&app, &state, &session_id, ToolOrigin::User).await?;
+    engine
+        .retry()
+        .await
+        .map(|_| {
+            emit(
+                &app,
+                "turn_done",
+                Some(&session_id),
+                session_status_payload(&state, &session_id),
+            );
+        })
+        .map_err(engine_error_message)
+}
+
 struct SessionExternalTools {
     tools: Vec<Value>,
     allowed_names: Vec<String>,
@@ -12443,9 +12521,13 @@ async fn engine_for_with_context(
     } else {
         let client = client_for(state, &host_id)?;
         let health = client.health().await.map_err(|error| {
-            let _ = state
-                .store
-                .update_session_status(session_id, "error", "host_unavailable");
+            let _ = state.store.update_session_status_with_details(
+                session_id,
+                "error",
+                "host_unavailable",
+                Some("host_unavailable"),
+                None,
+            );
             format!("remote host unavailable: {error}")
         })?;
         remote_platform = health.platform.clone();
@@ -14220,6 +14302,8 @@ fn create_session_for_state(
             external_session_id: None,
             run_state: "idle".into(),
             stop_reason: "none".into(),
+            terminal_cause: None,
+            provider_finish_reason: None,
             created_at: now,
             updated_at: now,
             project_id: project_id.clone(),
@@ -14288,6 +14372,8 @@ fn create_session_for_state(
         workspace: workspace.unwrap_or_default(),
         run_state: "idle".into(),
         stop_reason: "none".into(),
+        terminal_cause: None,
+        provider_finish_reason: None,
         archived: false,
         project_id: project_id.clone(),
         agent_id: agent_id.clone(),
@@ -14674,6 +14760,8 @@ fn session_view_for_host(
         workspace: session.workspace,
         run_state: session.run_state,
         stop_reason: session.stop_reason,
+        terminal_cause: session.terminal_cause,
+        provider_finish_reason: session.provider_finish_reason,
         archived: session.archived,
         project_id: session.project_id,
         agent_id: session.agent_id,
@@ -15940,10 +16028,13 @@ pub(crate) async fn submit_turn_inner_with_context(
         let client = client_for(state, &host_id)
             .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?;
         if let Err(error) = client.health().await {
-            let _ =
-                state
-                    .store
-                    .update_session_status(&request.session_id, "error", "host_unavailable");
+            let _ = state.store.update_session_status_with_details(
+                &request.session_id,
+                "error",
+                "host_unavailable",
+                Some("host_unavailable"),
+                None,
+            );
             emit(
                 &app,
                 "notice",
@@ -16383,7 +16474,12 @@ impl AcpDesktopLifecycle {
 
     async fn handle_error(&self, message: &str) {
         let _ = self.recorder.append_notice("error", message);
-        let _ = self.recorder.update_status("error", "harness_error");
+        let _ = self.recorder.update_session_status_with_details(
+            "error",
+            "harness_error",
+            Some("harness_error"),
+            None,
+        );
         let _ = self.recorder.append_session_event(&acp_session_event(
             "error",
             acp_working_event(
@@ -16520,7 +16616,7 @@ impl AcpDesktopLifecycle {
                 }
                 opcos_engine::HarnessEvent::TurnFinished { turn } => {
                     let _ = persist_acp_assistant_turn(&self.recorder, &turn);
-                    let (run_state, stop_reason) = self
+                    let interrupted = self
                         .store
                         .load_session(&self.session_id)
                         .ok()
@@ -16529,9 +16625,33 @@ impl AcpDesktopLifecycle {
                             session.run_state == "interrupted"
                                 && session.stop_reason == "interrupted_by_user"
                         })
-                        .map(|session| (session.run_state, session.stop_reason))
-                        .unwrap_or_else(|| ("idle".into(), "finished".into()));
-                    let _ = self.recorder.update_status(&run_state, &stop_reason);
+                        .is_some();
+                    let (run_state, stop_reason, terminal_cause) = if interrupted {
+                        (
+                            "interrupted".to_owned(),
+                            "interrupted_by_user".to_owned(),
+                            Some("user_interrupted"),
+                        )
+                    } else if turn
+                        .extras
+                        .get("stop_reason")
+                        .and_then(Value::as_str)
+                        == Some("end_turn")
+                    {
+                        ("idle".to_owned(), "finished".to_owned(), Some("model_stopped"))
+                    } else {
+                        ("idle".to_owned(), "finished".to_owned(), Some("completed"))
+                    };
+                    let provider_finish_reason = turn
+                        .extras
+                        .get("stop_reason")
+                        .and_then(Value::as_str);
+                    let _ = self.recorder.update_session_status_with_details(
+                        &run_state,
+                        &stop_reason,
+                        terminal_cause,
+                        provider_finish_reason,
+                    );
                     let _ = persist_acp_turn_finished(&self.recorder, &run_state, &stop_reason);
                     let mut payload =
                         session_status_payload_from_store(&self.store, &self.session_id);
@@ -16695,7 +16815,13 @@ async fn interrupt_for_state(
         harness.interrupt();
         state
             .store
-            .update_session_status(&session_id, "interrupted", "interrupted_by_user")
+            .update_session_status_with_details(
+                &session_id,
+                "interrupted",
+                "interrupted_by_user",
+                Some("user_interrupted"),
+                None,
+            )
             .map_err(|error| error.to_string())?;
         emit(
             &app,
@@ -16709,7 +16835,13 @@ async fn interrupt_for_state(
     engine.interrupt();
     state
         .store
-        .update_session_status(&session_id, "interrupted", "interrupted_by_user")
+        .update_session_status_with_details(
+            &session_id,
+            "interrupted",
+            "interrupted_by_user",
+            Some("user_interrupted"),
+            None,
+        )
         .map_err(|error| error.to_string())?;
     audit(
         state,
@@ -22900,6 +23032,8 @@ async fn linear_create_session_from_issue(
             external_session_id: None,
             run_state: "idle".into(),
             stop_reason: "none".into(),
+            terminal_cause: None,
+            provider_finish_reason: None,
             created_at: now,
             updated_at: now,
             project_id: None,
@@ -24582,6 +24716,8 @@ async fn ensure_project_worker_session(
                 external_session_id: None,
                 run_state: "idle".into(),
                 stop_reason: "none".into(),
+                terminal_cause: None,
+                provider_finish_reason: None,
                 created_at: now,
                 updated_at: now,
                 project_id: Some(project.id.clone()),
@@ -29843,6 +29979,8 @@ fn main() {
             get_progressive_tool_disclosure,
             set_progressive_tool_disclosure,
             change_mode,
+            restart_session_runtime,
+            retry_session,
             resolve_inbox,
             change_model,
             change_provider,
@@ -30078,6 +30216,8 @@ mod m7_tests {
                 external_session_id: None,
                 run_state: "idle".into(),
                 stop_reason: "finished".into(),
+                terminal_cause: None,
+                provider_finish_reason: None,
                 created_at: now,
                 updated_at: now,
                 project_id: None,
@@ -30135,6 +30275,8 @@ mod m7_tests {
             external_session_id: None,
             run_state: "idle".into(),
             stop_reason: "none".into(),
+            terminal_cause: None,
+            provider_finish_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             project_id: None,
@@ -32843,6 +32985,8 @@ agents:
             workspace: "/tmp".into(),
             run_state: "idle".into(),
             stop_reason: "none".into(),
+            terminal_cause: None,
+            provider_finish_reason: None,
             archived: false,
             project_id: None,
             agent_id: None,
@@ -32944,6 +33088,8 @@ agents:
             external_session_id: None,
             run_state: "idle".into(),
             stop_reason: "none".into(),
+            terminal_cause: None,
+            provider_finish_reason: None,
             created_at: now,
             updated_at: now,
             project_id: None,
@@ -33590,6 +33736,8 @@ agents:
             external_session_id: None,
             run_state: "idle".into(),
             stop_reason: "waiting_for_approval".into(),
+            terminal_cause: None,
+            provider_finish_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
             project_id: None,
@@ -33657,6 +33805,8 @@ agents:
                 external_session_id: None,
                 run_state: "idle".into(),
                 stop_reason: "none".into(),
+                terminal_cause: None,
+                provider_finish_reason: None,
                 created_at: now,
                 updated_at: now,
                 project_id: None,

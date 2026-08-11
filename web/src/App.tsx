@@ -61,7 +61,7 @@ import {
   type SurfaceRequestTab,
 } from "./surfaceRequests";
 import { Sidebar } from "./components/Sidebar";
-import { sessionStatusLabel } from "./sessionStatus";
+import { sessionRecoveryAction, sessionStatusLabel } from "./sessionStatus";
 import { Transcript } from "./components/Transcript";
 import { ApprovalCard, PreviewBlock } from "./components/ApprovalCard";
 import { Composer, PlusMenu, SendButton } from "./components/Composer";
@@ -12424,6 +12424,7 @@ function AppContent() {
                       sessionStatusLabel(
                         selected.run_state,
                         selected.stop_reason,
+                        selected.terminal_cause,
                       ),
                     ].join(" · ")}
                   </span>
@@ -12457,11 +12458,33 @@ function AppContent() {
                           sessionId={selected.id}
                           hostName={selected.host_name}
                           running={effectiveRunning}
-                          onRetry={() => {
-                            void command("submit_turn", {
-                              request: { session_id: selected.id, text: "" },
-                            }).catch(onError);
-                          }}
+                          onRetry={
+                            sessionRecoveryAction(
+                              selected.run_state,
+                              selected.stop_reason,
+                            ) === "restart"
+                              ? () =>
+                                  void command("restart_session_runtime", {
+                                    sessionId: selected.id,
+                                  }).catch(onError)
+                              : sessionRecoveryAction(
+                                    selected.run_state,
+                                    selected.stop_reason,
+                                  ) === "retry"
+                                ? () =>
+                                    void command("retry_session", {
+                                      sessionId: selected.id,
+                                    }).catch(onError)
+                                : undefined
+                          }
+                          retryLabel={
+                            sessionRecoveryAction(
+                              selected.run_state,
+                              selected.stop_reason,
+                            ) === "restart"
+                              ? "Restart"
+                              : "Retry"
+                          }
                           onQuestionAnswer={(callId, answer) => {
                             void command("resolve_inbox", {
                               sessionId: selected.id,

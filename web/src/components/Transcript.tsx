@@ -513,6 +513,7 @@ export function Transcript({
   hostName,
   running,
   onRetry,
+  retryLabel = "Retry",
   onQuestionAnswer,
 }: {
   events: TimelineEvent[];
@@ -520,9 +521,10 @@ export function Transcript({
   hostName?: string;
   running?: boolean;
   onRetry?: () => void;
+  retryLabel?: string;
   onQuestionAnswer?: (callId: string, answer: string) => void;
 }) {
-  const nodes = buildTimeline(events);
+  const nodes = buildTimeline(events, Boolean(running));
   const worklogOverrides = useRef(new Set<number>());
   const [worklogOpen, setWorklogOpen] = useState<Record<number, boolean>>({});
   const [clock, setClock] = useState(() => Date.now());
@@ -579,6 +581,12 @@ export function Transcript({
               onAnswer={(answer) => onQuestionAnswer?.(node.callId, answer)}
             />
           );
+        if (node.kind === "tail_status")
+          return (
+            <div className="notice info transcript-tail-status" key={index}>
+              {node.text}
+            </div>
+          );
         if (node.kind === "notice")
           return (
             <div
@@ -599,7 +607,7 @@ export function Transcript({
               )}
               {node.retriable && onRetry && !running && (
                 <button className="btn ml-2" onClick={onRetry}>
-                  Retry
+                  {retryLabel}
                 </button>
               )}
             </div>

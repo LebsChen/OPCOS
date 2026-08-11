@@ -957,6 +957,24 @@ where
             .map_err(|error| EngineError::Store(error.to_string()))
     }
 
+    pub fn update_session_status_with_details(
+        &self,
+        run_state: &str,
+        stop_reason: &str,
+        terminal_cause: Option<&str>,
+        provider_finish_reason: Option<&str>,
+    ) -> Result<(), EngineError> {
+        self.store
+            .update_session_status_with_details(
+                &self.session_id,
+                run_state,
+                stop_reason,
+                terminal_cause,
+                provider_finish_reason,
+            )
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
     pub fn save_pending(
         &self,
         pending: &PendingRecord,
@@ -2309,7 +2327,13 @@ has failed {} times and the last error code was {}",
             self.run_loop(self.provider_messages()?).await
         }
         .await;
-        self.finish_turn(&result);
+        self.finish_turn(
+            &result,
+            result
+                .as_ref()
+                .ok()
+                .and_then(|turn| turn.finish_reason.as_deref()),
+        );
         result
     }
 
@@ -2328,7 +2352,13 @@ has failed {} times and the last error code was {}",
             self.run_loop(self.provider_messages()?).await
         }
         .await;
-        self.finish_turn(&result);
+        self.finish_turn(
+            &result,
+            result
+                .as_ref()
+                .ok()
+                .and_then(|turn| turn.finish_reason.as_deref()),
+        );
         result
     }
 
@@ -2398,7 +2428,13 @@ has failed {} times and the last error code was {}",
         self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
         let result = async { self.run_loop(self.provider_messages()?).await }.await;
-        self.finish_turn(&result);
+        self.finish_turn(
+            &result,
+            result
+                .as_ref()
+                .ok()
+                .and_then(|turn| turn.finish_reason.as_deref()),
+        );
         result
     }
 
@@ -2415,7 +2451,14 @@ has failed {} times and the last error code was {}",
             )
             .await;
         let result = self.resume_pending_turn_inner().await;
-        self.finish_turn(&result);
+        self.finish_turn(
+            &result,
+            result
+                .as_ref()
+                .ok()
+                .and_then(|turn| turn.as_ref())
+                .and_then(|turn| turn.finish_reason.as_deref()),
+        );
         result
     }
 
@@ -2485,9 +2528,32 @@ has failed {} times and the last error code was {}",
     }
 
     fn set_session_status(&self, run_state: &str, stop_reason: &str) {
-        if let Err(error) = self.recorder.update_status(run_state, stop_reason) {
+        if let Err(error) =
+            self.recorder
+                .update_session_status_with_details(run_state, stop_reason, None, None)
+        {
             eprintln!(
                 "opcos-engine: failed to persist session status for {}: {}",
+                self.session_id, error
+            );
+        }
+    }
+
+    fn set_terminal_status(
+        &self,
+        run_state: &str,
+        stop_reason: &str,
+        terminal_cause: Option<&str>,
+        provider_finish_reason: Option<&str>,
+    ) {
+        if let Err(error) = self.recorder.update_session_status_with_details(
+            run_state,
+            stop_reason,
+            terminal_cause,
+            provider_finish_reason,
+        ) {
+            eprintln!(
+                "opcos-engine: failed to persist terminal status for {}: {}",
                 self.session_id, error
             );
         }
@@ -2521,7 +2587,7 @@ has failed {} times and the last error code was {}",
             Err(EngineError::MaxIterations) => ("error", "max_iterations"),
             Err(EngineError::MessageUsageLimitReached) => ("error", "usage_limit"),
             Err(EngineError::ApprovalAlreadyProcessed(_)) => ("idle", "waiting_for_approval"),
-            Err(EngineError::TurnAlreadyRunning) => ("error", "turn_already_running"),
+            Err(EngineError::TurnAlreadyRunning) => ("running", "none"),
         };
         if result.is_ok() && self.policy_denied.load(Ordering::SeqCst) {
             return ("idle", "policy_denied");
@@ -2529,11 +2595,25 @@ has failed {} times and the last error code was {}",
         (run_state, stop_reason)
     }
 
-    fn finish_turn<T>(&self, result: &Result<T, EngineError>) {
+    fn finish_turn<T>(
+        &self,
+        result: &Result<T, EngineError>,
+        provider_finish_reason: Option<&str>,
+    ) {
         self.turn_active.store(false, Ordering::SeqCst);
         self.clear_steering_queue();
         let (run_state, stop_reason) = self.turn_status(result);
-        self.set_session_status(run_state, stop_reason);
+        self.set_terminal_status(
+            run_state,
+            stop_reason,
+            match (run_state, stop_reason) {
+                ("idle", "finished") => Some("completed"),
+                ("interrupted", "interrupted_by_user") => Some("user_interrupted"),
+                (_, "turn_already_running") => None,
+                (_, reason) => Some(reason),
+            },
+            provider_finish_reason,
+        );
         let _ = self.record_working_event(
             "turn_finished",
             "status",
@@ -2653,7 +2733,13 @@ has failed {} times and the last error code was {}",
         self.set_session_status("running", "none");
         self.policy_denied.store(false, Ordering::SeqCst);
         let result = self.resolve_approval_inner(call_id, outcome).await;
-        self.finish_turn(&result);
+        self.finish_turn(
+            &result,
+            result
+                .as_ref()
+                .ok()
+                .and_then(|turn| turn.finish_reason.as_deref()),
+        );
         result
     }
 
@@ -2664,7 +2750,13 @@ has failed {} times and the last error code was {}",
     ) -> Result<AssistantTurn, EngineError> {
         self.set_session_status("running", "none");
         let result = self.resolve_pending_input_inner(call_id, response).await;
-        self.finish_turn(&result);
+        self.finish_turn(
+            &result,
+            result
+                .as_ref()
+                .ok()
+                .and_then(|turn| turn.finish_reason.as_deref()),
+        );
         result
     }
 
@@ -8757,6 +8849,8 @@ mod tests {
                 external_session_id: None,
                 run_state: "idle".into(),
                 stop_reason: "none".into(),
+                terminal_cause: None,
+                provider_finish_reason: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 project_id: None,
@@ -9032,6 +9126,8 @@ mod tests {
                 external_session_id: None,
                 run_state: "idle".into(),
                 stop_reason: "none".into(),
+                terminal_cause: None,
+                provider_finish_reason: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 project_id: None,
@@ -10464,6 +10560,8 @@ mod tests {
                 external_session_id: None,
                 run_state: "idle".into(),
                 stop_reason: "none".into(),
+                terminal_cause: None,
+                provider_finish_reason: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 project_id: None,

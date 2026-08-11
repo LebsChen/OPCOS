@@ -21,6 +21,25 @@ const saved = persisted as TimelineEvent[];
 const opcos = opcosEvents as TimelineEvent[];
 
 describe("single event-log timeline", () => {
+  it("shows one live tail action while a turn is running", () => {
+    const nodes = buildTimeline(
+      [
+        {
+          type: "one_line_thoughts",
+          event_id: "thought",
+          created_at_ms: 1,
+          short: "Designing recovery",
+        },
+      ] as TimelineEvent[],
+      true,
+    );
+    expect(nodes.at(-1)).toEqual({
+      kind: "tail_status",
+      text: "OPCOS: Designing recovery",
+    });
+    expect(nodes.filter((node) => node.kind === "tail_status")).toHaveLength(1);
+  });
+
   it("updates and clears a persisted provider wait row when streaming resumes", () => {
     const nodes = buildTimeline([
       {
@@ -83,10 +102,8 @@ describe("single event-log timeline", () => {
       resultSummary: undefined,
     });
     expect(nodes).toContainEqual({
-      kind: "notice",
+      kind: "tail_status",
       text: "Turn complete — waiting for your next instruction",
-      tone: "info",
-      noticeKind: "turn_finished",
     });
     expect(buildTimeline(saved)).toEqual(nodes);
     const resumed = buildTimeline([
@@ -98,11 +115,7 @@ describe("single event-log timeline", () => {
         message: "Continue",
       },
     ] as TimelineEvent[]);
-    expect(
-      resumed.some(
-        (node) => node.kind === "notice" && node.noticeKind === "turn_finished",
-      ),
-    ).toBe(false);
+    expect(resumed.some((node) => node.kind === "tail_status")).toBe(false);
   });
 
   it("derives the current task state from the timeline plan", () => {

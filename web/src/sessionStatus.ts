@@ -1,7 +1,9 @@
 export function sessionStatusLabel(
   runState: string | undefined,
   stopReason: string | undefined,
+  terminalCause?: string,
 ): string {
+  if (terminalCause === "model_stopped") return "模型主动结束";
   switch (stopReason) {
     case "waiting_for_user":
       return "等你回话";
@@ -23,6 +25,14 @@ export function sessionStatusLabel(
       return "上下文已耗尽";
     case "internal_error":
       return "内部错误";
+    case "tool_preflight_error":
+      return "工具执行前检查失败";
+    case "usage_limit":
+      return "已达到用量限制";
+    case "harness_error":
+      return "Agent 运行时连接失败";
+    case "turn_already_running":
+      return runState === "running" ? "运行中" : "正在运行";
     case "max_iterations":
       return "达到最大轮次";
     case "none":
@@ -32,4 +42,15 @@ export function sessionStatusLabel(
     default:
       return "状态未知";
   }
+}
+
+export function sessionRecoveryAction(
+  runState: string | undefined,
+  stopReason: string | undefined,
+): "retry" | "restart" | null {
+  if (runState !== "error") return null;
+  if (stopReason === "provider_error" || stopReason === "host_unavailable")
+    return "retry";
+  if (stopReason === "harness_error") return "restart";
+  return null;
 }
