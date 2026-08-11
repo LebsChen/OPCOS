@@ -594,6 +594,12 @@ where
 {
     fn drop(&mut self) {
         self.state.shutdown.notify_waiters();
+        let process = Arc::clone(&self.state.process);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = process.shutdown().await;
+            });
+        }
     }
 }
 

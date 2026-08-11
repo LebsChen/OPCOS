@@ -467,10 +467,12 @@ describe("GUI boundary behavior", () => {
       "utf8",
     );
     expect(source).toContain('session.sleep_state === "asleep"');
-    expect(source).toContain("the next message will reconnect");
+    expect(source).toContain('translate("sessionAsleep")');
     expect(source).toContain('command("stop_surface", { port: activePort })');
     expect(source).toContain(
       'command("touch_session", { sessionId: selectedId })',
     );
+    expect(source).toContain("lastTouchedSessionRef");
+    expect(source).toContain("60_000");
   });
 });

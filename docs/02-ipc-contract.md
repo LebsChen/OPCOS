@@ -13,6 +13,7 @@
 | `start_surface`   | `session_id`, `host_id`, `surface`, `cols?`, `rows?`, `cwd?`     | 本地 relay port `u16`                                                                  | `surface` 只接受 `pty` / `vnc` / `cdp`；绑定本地 relay 失败时报错。                                                                                                        |
 | `stop_surface`    | `port`                                                           | `{}`                                                                                   | 终止并移除该端口的 relay；未知或重复端口是 no-op。                                                                                                                          |
 | `touch_session`   | `session_id`                                                     | `{}`                                                                                   | 唤醒会话并刷新闲置活动时间。                                                                                                                                                 |
+| `wake_session`    | `session_id`                                                     | `{}`                                                                                   | 清除休眠状态并刷新闲置活动时间；运行时按下一次实际入口惰性重建。                                                                                                             |
 | `ide_bootstrap`   | `session_id`, `folder_uri`                                       | `IdeBootstrap`                                                                         | `folder_uri` 必须以 `vscode-remote://` 开头；session/远程读取失败显式报错。                                                                                                |
 | `ide_url`         | `session_id`, `folder_uri`                                       | 远端 IDE URL                                                                            | 返回远端 IDE URL，`folder_uri` 前缀或远端请求失败显式报错；前端直接加载该 URL，不再启动本地 IDE proxy。                                                                     |
 | `create_session`  | `title`, `host_id`, `model?`, `provider?`, `mode?`, `workspace?` | `SessionView`                                                                          | host 不存在时报 `remote host not found; session was not created`。                                                                                                         |
@@ -132,7 +133,7 @@ Cloud-Dev 的 PTY 做法是动态事件名 `term-data-{id}`（byte array）与 `
 - `steering` 立即返回，但完成由后台 task 发 `turn_done`；前端不能把 invoke resolve 当作 turn 完成。
 - `interrupt` 立即请求 engine 停止，停止完成仍由 engine/event 状态确认。
 - `start_surface` 只返回 relay port；relay 由会话拥有，`stop_surface` 或前端卸载会显式终止本地 relay task 及其远端 socket。`ide_url` 返回远端 IDE URL，前端直接加载。
-- 会话闲置达到阈值后会真实休眠并释放运行时；`wake_session`、`touch_session` 或下一次会话入口会自动唤醒。桌面端发出 `session-sleep` / `session-wake` 事件，payload 含 `session_id`。
+- 会话闲置达到阈值后会真实休眠并释放运行时；`wake_session`、`touch_session` 或下一次会话入口会自动唤醒。桌面端发出 `session-sleep` / `session-wake` 事件，payload 含 `session_id`；`session-sleep` 另含被终止 relay 的 `surfaces`（`host_id`、`kind`）。
 - `mcp_tools` 是远程 `tools/list` 请求；若 server 长时间无响应，必须受 client timeout 约束，具体 timeout 当前未确认。
 
 同一 session 的 `submit_turn`、`resolve_approval`、`interrupt` 必须串行化或由 engine 保证顺序；否则会出现审批已解决但旧 turn 又发 `turn_done` 的竞态［推断］。

@@ -11317,13 +11317,21 @@ function AppContent() {
   const titleEditingRef = useRef(false);
   const previousRunningRef = useRef(false);
   const submittingSessionIdRef = useRef<string | undefined>(undefined);
+  const lastTouchedSessionRef = useRef<Record<string, number>>({});
   useEffect(() => {
     titleEditingRef.current = false;
     setEditingSessionTitle(false);
   }, [selected?.id]);
   useEffect(() => {
     selectedIdRef.current = selectedId ?? undefined;
-    if (selectedId) void command("touch_session", { sessionId: selectedId });
+    if (selectedId) {
+      const now = Date.now();
+      const lastTouched = lastTouchedSessionRef.current[selectedId] ?? 0;
+      if (now - lastTouched >= 60_000) {
+        lastTouchedSessionRef.current[selectedId] = now;
+        void command("touch_session", { sessionId: selectedId });
+      }
+    }
   }, [selectedId]);
   useEffect(() => {
     const subscriptions = [
@@ -12536,11 +12544,6 @@ function AppContent() {
                       onClick={beginSessionTitleEdit}
                     >
                       {selected.title}
-                      {selected.sleep_state === "asleep" && (
-                        <span className="text-xs text-faint">
-                          Asleep — the next message will reconnect it.
-                        </span>
-                      )}
                     </button>
                   )}
                   <span className="title-sub" data-testid="session-subtitle">
@@ -12554,6 +12557,12 @@ function AppContent() {
                         selected.terminal_cause,
                       ),
                     ].join(" · ")}
+                    {selected.sleep_state === "asleep" && (
+                      <span className="text-xs text-faint">
+                        {" · "}
+                        {translate("sessionAsleep")}
+                      </span>
+                    )}
                   </span>
                 </div>
                 <div className="main-topbar-side main-topbar-actions">

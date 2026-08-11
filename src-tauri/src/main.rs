@@ -713,6 +713,17 @@ async fn detach_session_runtime(state: &DesktopState, session_id: &str) {
     state.acp_engines.lock().await.remove(session_id);
 }
 
+fn leases_to_disconnect(
+    leases: &mut HashMap<String, HashSet<(String, String)>>,
+    session_id: &str,
+) -> Vec<(String, String)> {
+    let owned = leases.remove(session_id).unwrap_or_default();
+    owned
+        .into_iter()
+        .filter(|lease| !leases.values().any(|items| items.contains(lease)))
+        .collect()
+}
+
 async fn register_mcp_lease(
     state: &DesktopState,
     session_id: &str,
@@ -729,22 +740,11 @@ async fn register_mcp_lease(
 }
 
 async fn release_mcp_leases(state: &DesktopState, session_id: &str) {
-    let leases = state
-        .mcp_leases
-        .lock()
-        .await
-        .remove(session_id)
-        .unwrap_or_default();
+    let leases = {
+        let mut all_leases = state.mcp_leases.lock().await;
+        leases_to_disconnect(&mut all_leases, session_id)
+    };
     for (runtime_key, object_id) in leases {
-        let still_used = state
-            .mcp_leases
-            .lock()
-            .await
-            .values()
-            .any(|items| items.contains(&(runtime_key.clone(), object_id.clone())));
-        if still_used {
-            continue;
-        }
         let manager = if runtime_key == "global" {
             Arc::clone(&state.mcp)
         } else {
@@ -758,6 +758,41 @@ async fn release_mcp_leases(state: &DesktopState, session_id: &str) {
         };
         manager.disconnect(&object_id).await;
     }
+}
+
+async fn release_session_runtime(state: &DesktopState, session_id: &str) {
+    let surfaces = {
+        let mut surfaces = state.surfaces.lock().await;
+        surfaces
+            .extract_if(|_, surface| surface.session_id == session_id)
+            .map(|(_, surface)| {
+                surface.task.abort();
+                json!({"host_id": surface.host_id, "kind": format!("{:?}", surface.kind)})
+            })
+            .collect::<Vec<_>>()
+    };
+    detach_session_runtime(state, session_id).await;
+    release_mcp_leases(state, session_id).await;
+    if !surfaces.is_empty() {
+        audit(
+            state,
+            session_id,
+            "session_surfaces_stopped",
+            json!({"surfaces": surfaces}),
+        );
+    }
+}
+
+fn session_can_idle_sleep(
+    session: &SessionRecord,
+    pending: &[opcos_store::PendingRecord],
+    has_active_turn: bool,
+) -> bool {
+    session.sleep_state == "awake"
+        && !session.archived
+        && session.run_state == "idle"
+        && !has_active_turn
+        && !pending.iter().any(|item| item.state == "pending")
 }
 
 async fn wake_session_inner(state: &DesktopState, session_id: &str) -> Result<(), String> {
@@ -795,43 +830,30 @@ async fn sleep_session_inner(
     session_id: &str,
 ) -> Result<(), String> {
     let session = session_for(state, session_id)?;
-    if session.sleep_state != "awake" || session.archived || session.run_state != "idle" {
-        return Ok(());
-    }
-    if state
+    let pending = state
         .store
         .load_pending(session_id)
-        .map_err(|error| error.to_string())?
-        .iter()
-        .any(|pending| pending.state == "pending")
-    {
-        return Ok(());
-    }
-    if state
+        .map_err(|error| error.to_string())?;
+    let has_active_turn = state
         .engines
         .lock()
         .await
         .get(session_id)
-        .is_some_and(|engine| engine.has_active_turn())
-    {
+        .is_some_and(|engine| engine.has_active_turn());
+    if !session_can_idle_sleep(&session, &pending, has_active_turn) {
         return Ok(());
     }
-    detach_session_runtime(state, session_id).await;
-    let ports = {
+    let surfaces = {
         let mut surfaces = state.surfaces.lock().await;
-        let ports = surfaces
-            .iter()
-            .filter(|(_, surface)| surface.session_id == session_id)
-            .map(|(port, _)| *port)
-            .collect::<Vec<_>>();
-        for port in &ports {
-            if let Some(surface) = surfaces.remove(port) {
+        surfaces
+            .extract_if(|_, surface| surface.session_id == session_id)
+            .map(|(_, surface)| {
                 surface.task.abort();
-            }
-        }
-        ports
+                json!({"host_id": surface.host_id, "kind": format!("{:?}", surface.kind)})
+            })
+            .collect::<Vec<_>>()
     };
-    let _ = ports;
+    detach_session_runtime(state, session_id).await;
     release_mcp_leases(state, session_id).await;
     let now = Utc::now();
     state
@@ -843,7 +865,7 @@ async fn sleep_session_inner(
         app,
         "session-sleep",
         Some(session_id),
-        json!({"session_id": session_id}),
+        json!({"session_id": session_id, "surfaces": surfaces}),
     );
     Ok(())
 }
@@ -11751,11 +11773,7 @@ async fn restart_session_runtime_inner(
     {
         return Err("cannot restart a session while its turn is running".into());
     }
-    state.engines.lock().await.remove(session_id);
-    state.engine_capabilities.lock().await.remove(session_id);
-    state.engine_hosts.lock().await.remove(session_id);
-    state.acp_event_sessions.lock().await.remove(session_id);
-    state.acp_engines.lock().await.remove(session_id);
+    release_session_runtime(state, session_id).await;
 
     if session.host_id != "local" {
         client_for(state, &session.host_id)?
@@ -14525,13 +14543,16 @@ async fn session_capabilities(
 }
 
 #[tauri::command]
-fn set_session_archived(
+async fn set_session_archived(
     app: tauri::AppHandle,
     state: State<'_, DesktopState>,
     session_id: String,
     archived: bool,
 ) -> Result<Value, String> {
     let result = set_session_archived_for_state(&state, &session_id, archived)?;
+    if archived {
+        release_session_runtime(&state, &session_id).await;
+    }
     emit(&app, "session_list_changed", None, json!({}));
     Ok(result)
 }
@@ -17398,6 +17419,7 @@ impl opcos_mcp_server::OpcosControlPlane for DesktopControlPlane {
             }
             "archive" => {
                 let result = set_session_archived_for_state(&state, &session_id, true)?;
+                release_session_runtime(&state, &session_id).await;
                 emit(&self.app, "session_list_changed", None, json!({}));
                 Ok(result)
             }
@@ -30926,6 +30948,92 @@ mod m7_tests {
         );
         assert_eq!(attended_pending_event_kind("plan"), "approval");
         assert_eq!(attended_pending_event_kind("approval"), "approval");
+    }
+
+    #[test]
+    fn idle_sleep_threshold_honors_override_and_default() {
+        let key = "OPCOS_IDLE_SLEEP_SECONDS";
+        let previous = std::env::var(key).ok();
+        unsafe {
+            std::env::remove_var(key);
+        }
+        assert_eq!(idle_sleep_after(), Duration::from_secs(30 * 60));
+        unsafe {
+            std::env::set_var(key, "7");
+        }
+        assert_eq!(idle_sleep_after(), Duration::from_secs(7));
+        match previous {
+            Some(value) => unsafe { std::env::set_var(key, value) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    #[test]
+    fn mcp_lease_release_only_disconnects_final_holder() {
+        let mut leases = HashMap::from([
+            (
+                "session-a".into(),
+                HashSet::from([("project-1".into(), "mcp-1".into())]),
+            ),
+            (
+                "session-b".into(),
+                HashSet::from([("project-1".into(), "mcp-1".into())]),
+            ),
+        ]);
+        assert!(leases_to_disconnect(&mut leases, "session-a").is_empty());
+        assert_eq!(
+            leases_to_disconnect(&mut leases, "session-b"),
+            vec![("project-1".into(), "mcp-1".into())]
+        );
+    }
+
+    #[test]
+    fn idle_sleep_gate_excludes_active_and_pending_sessions() {
+        let mut session = SessionRecord {
+            session_id: "idle-sleep-test".into(),
+            workspace: String::new(),
+            model: "auto".into(),
+            mode: "Auto".into(),
+            harness: "builtin".into(),
+            title: "Idle sleep test".into(),
+            extra_roots: vec![],
+            grants: json!({}),
+            pinned: false,
+            archived: false,
+            origin: None,
+            origin_label: None,
+            compaction: json!({}),
+            host_id: "local".into(),
+            provider: None,
+            external_session_id: None,
+            run_state: "idle".into(),
+            stop_reason: "none".into(),
+            terminal_cause: None,
+            provider_finish_reason: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_active_at: Utc::now(),
+            sleep_state: "awake".into(),
+            slept_at: None,
+            project_id: None,
+            agent_id: None,
+        };
+        let pending = vec![opcos_store::PendingRecord {
+            session_id: session.session_id.clone(),
+            call_id: "call-1".into(),
+            tool: "write_file".into(),
+            arguments: json!({}),
+            state: "pending".into(),
+        }];
+        assert!(!session_can_idle_sleep(&session, &pending, false));
+        assert!(!session_can_idle_sleep(&session, &[], true));
+        session.run_state = "running".into();
+        assert!(!session_can_idle_sleep(&session, &[], false));
+        session.run_state = "idle".into();
+        session.archived = true;
+        assert!(!session_can_idle_sleep(&session, &[], false));
+        session.archived = false;
+        assert!(session_can_idle_sleep(&session, &[], false));
     }
 
     #[tokio::test]
