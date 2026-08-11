@@ -132,6 +132,44 @@ export function shouldShowSurfaceReconnect(
   return sleepState === "asleep";
 }
 
+export function surfaceNeedsConnection(
+  tab: SurfaceTab | "pr",
+  port: number | null,
+  sleeping: boolean,
+): boolean {
+  return (
+    (tab === "terminal" || tab === "desktop" || tab === "browser") &&
+    port === null &&
+    !sleeping
+  );
+}
+
+export function shouldRetrySurfaceStart({
+  invalidated,
+  port,
+  sleeping,
+  tab,
+}: {
+  invalidated: boolean;
+  port: number | null;
+  sleeping: boolean;
+  tab: SurfaceTab | "pr";
+}): boolean {
+  return invalidated && surfaceNeedsConnection(tab, port, sleeping);
+}
+
+export function shouldShowSurfaceRetry({
+  busy,
+  port,
+  sleeping,
+}: {
+  busy: boolean;
+  port: number | null;
+  sleeping: boolean;
+}): boolean {
+  return !sleeping && !busy && port === null;
+}
+
 export type PendingQuestionData = {
   callId: string;
   question: string;

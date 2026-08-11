@@ -18,8 +18,11 @@ import {
   selectedSessionFromList,
   sessionViewSelection,
   shouldRefreshForSessionLifecycleEvent,
+  shouldRetrySurfaceStart,
   shouldResetSurfaceForSleep,
   shouldShowSurfaceReconnect,
+  shouldShowSurfaceRetry,
+  surfaceNeedsConnection,
   updateSessionRunState,
   projectAgentRosterHost,
   projectAgentRosterValue,
@@ -45,6 +48,31 @@ describe("GUI boundary behavior", () => {
     expect(shouldResetSurfaceForSleep("asleep", "awake")).toBe(false);
     expect(shouldShowSurfaceReconnect("asleep")).toBe(true);
     expect(shouldShowSurfaceReconnect("awake")).toBe(false);
+    expect(surfaceNeedsConnection("terminal", null, false)).toBe(true);
+    expect(surfaceNeedsConnection("terminal", 1234, false)).toBe(false);
+    expect(surfaceNeedsConnection("terminal", null, true)).toBe(false);
+    expect(
+      shouldRetrySurfaceStart({
+        invalidated: true,
+        port: null,
+        sleeping: false,
+        tab: "terminal",
+      }),
+    ).toBe(true);
+    expect(
+      shouldRetrySurfaceStart({
+        invalidated: false,
+        port: null,
+        sleeping: false,
+        tab: "terminal",
+      }),
+    ).toBe(false);
+    expect(
+      shouldShowSurfaceRetry({ busy: false, port: null, sleeping: false }),
+    ).toBe(true);
+    expect(
+      shouldShowSurfaceRetry({ busy: false, port: null, sleeping: true }),
+    ).toBe(false);
   });
 
   it("normalizes persisted permission modes at the frontend boundary", () => {
@@ -504,6 +532,9 @@ describe("GUI boundary behavior", () => {
     expect(source).not.toContain('listen("session-wake"');
     expect(source).toContain("surfaceSleepingDescription");
     expect(source).toContain("reconnectSurface");
+    expect(source).toContain("surfaceUnavailable");
+    expect(source).toContain("retrySurface");
+    expect(source).toContain("surfaceRetryToken");
     expect(source).toContain("touchSessionActivity");
   });
 });

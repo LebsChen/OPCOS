@@ -37,7 +37,10 @@ import {
   submitFailureMessage,
   shouldRefreshForSessionLifecycleEvent,
   shouldResetSurfaceForSleep,
+  shouldRetrySurfaceStart,
   shouldShowSurfaceReconnect,
+  shouldShowSurfaceRetry,
+  surfaceNeedsConnection,
   type PendingQuestionData,
   reconcileSelectedIdAfterRefresh,
   updateSessionRunState,
@@ -2545,7 +2548,13 @@ function SurfaceView({
     shouldShowSurfaceReconnect(selected.sleep_state),
   );
   const startInFlightRef = useRef(false);
+  const retryAfterStartRef = useRef(false);
+  const sleepingRef = useRef(sleeping);
+  const surfaceTabRef = useRef(tab);
+  const [surfaceRetryToken, setSurfaceRetryToken] = useState(0);
   const lastTouchRef = useRef(0);
+  sleepingRef.current = sleeping;
+  surfaceTabRef.current = tab;
   const touchSessionActivity = () => {
     const now = Date.now();
     if (
@@ -2557,8 +2566,12 @@ function SurfaceView({
     void command("touch_session", { sessionId: selected.id }).catch(onError);
   };
   const start = async (surface: string) => {
-    if (startInFlightRef.current) return;
+    if (startInFlightRef.current) {
+      retryAfterStartRef.current = true;
+      return;
+    }
     const generation = surfaceGenerationRef.current;
+    let invalidated = false;
     try {
       startInFlightRef.current = true;
       setBusy(true);
@@ -2573,6 +2586,7 @@ function SurfaceView({
         projectId: selected.project_id || null,
       });
       if (generation !== surfaceGenerationRef.current) {
+        invalidated = true;
         await command("stop_surface", { port: nextPort });
         return;
       }
@@ -2591,6 +2605,15 @@ function SurfaceView({
     } finally {
       startInFlightRef.current = false;
       setBusy(false);
+      const retryRequested = invalidated || retryAfterStartRef.current;
+      const shouldRetry = shouldRetrySurfaceStart({
+        invalidated: retryRequested,
+        port: portRef.current,
+        sleeping: sleepingRef.current,
+        tab: surfaceTabRef.current,
+      });
+      retryAfterStartRef.current = false;
+      if (shouldRetry) setSurfaceRetryToken((token) => token + 1);
     }
   };
   useEffect(() => {
@@ -2668,6 +2691,7 @@ function SurfaceView({
     ideUrl,
     ideError,
     sleeping,
+    surfaceRetryToken,
   ]);
   useEffect(() => {
     if (tab !== "browser") return;
@@ -2800,6 +2824,10 @@ function SurfaceView({
         tab === "terminal" ? "pty" : tab === "desktop" ? "vnc" : "cdp",
       );
   };
+  const retrySurface = () => {
+    setSurfaceError("");
+    setSurfaceRetryToken((token) => token + 1);
+  };
   if (tab === "terminal" || tab === "desktop" || tab === "browser")
     return (
       <div className="surface-panel">
@@ -2817,9 +2845,10 @@ function SurfaceView({
         {surfaceError && (
           <div className="surface-status error">{surfaceError}</div>
         )}
-        {!sleeping && !busy && !port && (
+        {shouldShowSurfaceRetry({ busy, port, sleeping }) && (
           <div className="surface-status warning">
-            Remote surface unavailable.
+            <p>{translate("surfaceUnavailable")}</p>
+            <Button onClick={retrySurface}>{translate("retrySurface")}</Button>
           </div>
         )}
         {tab === "terminal" && (

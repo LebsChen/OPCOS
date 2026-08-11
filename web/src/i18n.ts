@@ -81,6 +81,8 @@ const messages: Record<Locale, Record<string, string>> = {
     surfaceSleepingDescription:
       "This panel was disconnected because the session is asleep. Reconnect to wake it.",
     reconnectSurface: "Reconnect",
+    surfaceUnavailable: "The remote surface is unavailable.",
+    retrySurface: "Retry",
     sessionActions: "Session actions",
     deleteConfirm: "Click again to permanently delete",
     deleteQuestion: "Delete?",
@@ -192,6 +194,8 @@ const messages: Record<Locale, Record<string, string>> = {
     sessionAsleep: "已休眠（下一条消息会自动重连）",
     surfaceSleepingDescription: "会话休眠后此面板已断开。点击重连以唤醒会话。",
     reconnectSurface: "重连",
+    surfaceUnavailable: "远程面板当前不可用。",
+    retrySurface: "重试",
     sessionActions: "会话操作",
     deleteConfirm: "再次点击以永久删除",
     deleteQuestion: "删除？",
