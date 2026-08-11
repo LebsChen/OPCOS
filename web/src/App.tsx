@@ -2580,7 +2580,7 @@ function SurfaceView({
       setBusy(true);
       void command<string>("ide_url", {
         sessionId: selected.id,
-        folderUri: `vscode-remote://${selected.host_name}/${selected.workspace || "workspace"}`,
+        folderUri: selected.workspace || "/workspace",
       })
         .then(setIdeUrl)
         .catch((error) => {

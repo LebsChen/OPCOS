@@ -13655,8 +13655,8 @@ async fn ide_url(
     folder_uri: String,
 ) -> Result<String, String> {
     let host_id = session_host_id(&state, &session_id)?;
-    if !folder_uri.starts_with("vscode-remote://") {
-        return Err("IDE folder must be a vscode-remote URI".into());
+    if !folder_uri.starts_with('/') && !folder_uri.starts_with("vscode-remote://") {
+        return Err("IDE folder must be a remote path or vscode-remote URI".into());
     }
     if host_id == "local" {
         return Err("本机 host 不支持远程 Web IDE，请绑定远程主机".into());

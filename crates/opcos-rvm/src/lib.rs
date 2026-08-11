@@ -644,8 +644,21 @@ impl HttpRvmClient {
         url.set_path("/ide/");
         url.query_pairs_mut()
             .append_pair("tkn", &self.config.token)
-            .append_pair("folder", folder);
+            .append_pair("folder", &self.normalize_ide_folder(folder));
         url
+    }
+
+    fn normalize_ide_folder(&self, folder: &str) -> String {
+        let Ok(mut folder_url) = Url::parse(folder) else {
+            return folder.to_owned();
+        };
+        if folder_url.scheme() != "vscode-remote" {
+            return folder.to_owned();
+        }
+        if let Some(host) = self.config.base_url.host_str() {
+            let _ = folder_url.set_host(Some(host));
+        }
+        folder_url.to_string()
     }
 
     pub async fn ide_auth_cookies(&self, folder: &str) -> Result<Vec<String>, RvmError> {
@@ -1498,7 +1511,10 @@ mod tests {
             url.query_pairs().collect::<Vec<_>>(),
             vec![
                 ("tkn".into(), "test-token".into()),
-                ("folder".into(), "vscode-remote://linux/workspace".into())
+                (
+                    "folder".into(),
+                    "vscode-remote://linux.example.test/workspace".into()
+                )
             ]
         );
     }
