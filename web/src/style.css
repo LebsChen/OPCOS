@@ -1389,6 +1389,13 @@ h3 {
   flex: 1;
   overflow: auto;
 }
+.session-panel-drawer,
+.session-panel-drawer .drawer-head,
+.session-panel-drawer .session-panel-content,
+.session-panel-drawer .session-pane,
+.session-panel-drawer .session-pane > .surface-panel {
+  background-color: var(--column-surface);
+}
 .tasks-pane {
   display: flex;
   flex-direction: column;
