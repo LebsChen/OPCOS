@@ -2170,12 +2170,6 @@ input.workspace-chip {
 }
 
 @media (max-width: 1100px) {
-  .app.session-layout {
-    grid-template-columns: 220px minmax(280px, 1fr);
-  }
-  .app.session-layout.session-drawer-collapsed {
-    grid-template-columns: 220px minmax(280px, 1fr);
-  }
   .surface-panel {
     padding-inline: 12px;
   }
