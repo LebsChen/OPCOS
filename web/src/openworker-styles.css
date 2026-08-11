@@ -803,11 +803,10 @@ body {
 
 /* approval */
 .approval {
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--line);
   background: var(--panel);
-  border-radius: 14px;
-  padding: 14px 16px;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04);
+  border-radius: 12px;
+  padding: 12px 14px;
 }
 .approval-dock {
   max-width: 760px;
@@ -942,6 +941,10 @@ body {
   margin-top: 0;
   flex-wrap: nowrap;
 }
+.approval-row-line .approval-option-row {
+  width: auto;
+  flex: 0 0 auto;
+}
 .approval-peek {
   font: inherit;
   font-size: 11.5px;
@@ -953,21 +956,125 @@ body {
   flex: none;
 }
 /* owner call (UX-018): no solid fills — the primary action is a blue border */
-.approval .btn.approval-primary {
-  border-color: var(--accent);
-  color: var(--accent);
-  font-weight: 600;
-}
-.approval .btn.approval-primary:hover {
-  background: var(--accent-soft);
-}
-.approval .btn.quiet-deny {
+.approval-option-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  padding: 2px 0;
   border: 0;
   background: none;
-  color: var(--faint);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  line-height: 20px;
+  text-align: left;
+  cursor: pointer;
 }
-.approval .btn.quiet-deny:hover {
-  color: var(--danger);
+.approval-option-row.approval-answer-submit {
+  width: auto;
+  flex: 0 0 auto;
+}
+.approval-option-row:hover,
+.approval-option-row:focus-visible {
+  color: var(--accent);
+}
+.approval-option-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.approval-option-row:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+.approval-option-key {
+  flex: 0 0 16px;
+  color: var(--muted);
+  font-weight: 600;
+}
+.approval-option-row.selected .approval-option-key,
+.approval-option-row[aria-pressed="true"] .approval-option-key {
+  color: var(--accent);
+}
+.transcript-question-card {
+  margin: 0 22px 14px;
+}
+.transcript-question-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+.transcript-question-head strong {
+  min-width: 0;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 20px;
+}
+.transcript-question-head .approval-with {
+  flex: 1;
+  min-width: 0;
+  margin-top: 0;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.transcript-question-close {
+  flex: none;
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--muted);
+  font-size: 20px;
+  line-height: 18px;
+  cursor: pointer;
+}
+.transcript-question-close:hover,
+.transcript-question-close:focus-visible {
+  color: var(--ink);
+}
+.transcript-question-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.transcript-question-collapsed {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  margin: 0 22px 14px;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 12.5px;
+  line-height: 18px;
+}
+.transcript-question-collapsed-copy {
+  display: flex;
+  min-width: 0;
+  gap: 8px;
+}
+.transcript-question-collapsed-copy > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.transcript-question-reopen {
+  flex: none;
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
 }
 .approval-rest {
   margin-top: 7px;

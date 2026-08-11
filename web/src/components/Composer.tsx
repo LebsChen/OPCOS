@@ -127,6 +127,8 @@ interface Props {
   onConnectModel?: () => void;
   onConfigureVoiceInput?: () => void;
   onSend: (text: string, attachments?: Attachment[]) => void | Promise<void>;
+  onPendingQuestionAnswer?: (text: string) => void | Promise<void>;
+  pendingQuestion?: boolean;
   onSteer?: (text: string, attachments?: Attachment[]) => void;
   onInterrupt: () => void;
   assets?: Array<{ kind: string; title: string }>;
@@ -167,6 +169,7 @@ interface Props {
   progressiveToolDisclosure?: boolean;
   onProgressiveToolDisclosureChange?: (on: boolean) => void;
   approvalSlot?: ReactNode;
+  interactionHeader?: ReactNode;
   // Push text + attachments into the composer (e.g. a start-panel task card). The `nonce` makes
   // repeated identical prefills re-apply; the user can still edit before sending.
   prefill?: { text: string; attachments?: Attachment[]; nonce: number };
@@ -418,6 +421,19 @@ export function Composer(props: Props) {
       dictationBusy
     )
       return;
+    if (props.onPendingQuestionAnswer) {
+      try {
+        await props.onPendingQuestionAnswer(expandSlashCommand(t));
+        setSlashQuery(null);
+        setText("");
+        setAttachments([]);
+      } catch (error) {
+        showAttachNotice(
+          error instanceof Error ? error.message : "Answer submission failed.",
+        );
+      }
+      return;
+    }
     const route = submissionRoute(props.running, Boolean(props.onSteer));
     if (route === "blocked") {
       showAttachNotice(
@@ -557,7 +573,10 @@ export function Composer(props: Props) {
         </div>
       )}
 
-      <div className="composer-card">
+      <div
+        className={`composer-card${props.interactionHeader ? " composer-card-interaction" : ""}`}
+      >
+        {props.interactionHeader}
         {legacyOpenCode && (
           <div className="px-3.5 pt-3.5 text-[12px] text-muted">
             This historical OpenCode session is read-only. Create an ACP session
@@ -567,7 +586,10 @@ export function Composer(props: Props) {
         <textarea
           ref={textareaRef}
           className="w-full block px-3.5 pt-3.5 pb-1.5 text-[14.5px]"
-          placeholder={props.placeholder || "Ask OPCOS…"}
+          placeholder={
+            props.placeholder ||
+            (props.pendingQuestion ? "Type an answer…" : "Ask OPCOS…")
+          }
           value={text}
           onChange={(e) => {
             const value = e.target.value;

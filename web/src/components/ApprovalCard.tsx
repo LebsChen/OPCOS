@@ -184,26 +184,40 @@ function Buttons({
   return (
     <div className="approval-btns">
       {switchModeOptions.length > 0 ? (
-        switchModeOptions.map((option) => (
+        switchModeOptions.map((option, index) => (
           <button
-            className="btn approval-primary"
+            className="approval-option-row"
             key={option.optionId}
+            type="button"
             onClick={() => onApprove("allow", option.optionId)}
           >
-            {option.name || option.optionId}
+            <span className="approval-option-key">
+              {String.fromCharCode(65 + index)}
+            </span>
+            <span>{option.name || option.optionId}</span>
           </button>
         ))
       ) : (
         <button
-          className="btn approval-primary"
+          className="approval-option-row"
+          type="button"
           onClick={() => onApprove("allow")}
         >
-          {primaryLabel}
+          <span className="approval-option-key">A</span>
+          <span>{primaryLabel}</span>
         </button>
       )}
-      <span className="spacer" />
-      <button className="btn quiet-deny" onClick={() => onApprove("deny")}>
-        Deny
+      <button
+        className="approval-option-row"
+        type="button"
+        onClick={() => onApprove("deny")}
+      >
+        <span className="approval-option-key">
+          {String.fromCharCode(
+            65 + (switchModeOptions.length > 0 ? switchModeOptions.length : 1),
+          )}
+        </span>
+        <span>Deny</span>
       </button>
     </div>
   );

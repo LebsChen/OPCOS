@@ -1787,6 +1787,14 @@ h3 {
   border-radius: 10px;
   padding: 12px 16px;
 }
+.composer-card-interaction {
+  padding-top: 0;
+}
+.composer-card-interaction > .transcript-question-card {
+  margin: 0 -16px;
+  padding: 12px 16px 10px;
+  border-bottom: 1px solid var(--color-line);
+}
 .composer-card:focus-within {
   border-color: var(--color-accent);
 }
