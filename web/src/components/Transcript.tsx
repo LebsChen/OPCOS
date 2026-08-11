@@ -583,7 +583,8 @@ export function Transcript({
           );
         if (node.kind === "tail_status")
           return (
-            <div className="notice info transcript-tail-status" key={index}>
+            <div className="transcript-sleep" key={index}>
+              <span className="transcript-sleep-dot" />
               {node.text}
             </div>
           );
