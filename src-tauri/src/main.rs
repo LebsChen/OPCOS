@@ -760,7 +760,7 @@ async fn release_mcp_leases(state: &DesktopState, session_id: &str) {
     }
 }
 
-async fn release_session_runtime(state: &DesktopState, session_id: &str) {
+async fn release_session_runtime(state: &DesktopState, session_id: &str) -> Vec<Value> {
     let surfaces = {
         let mut surfaces = state.surfaces.lock().await;
         surfaces
@@ -781,6 +781,7 @@ async fn release_session_runtime(state: &DesktopState, session_id: &str) {
             json!({"surfaces": surfaces}),
         );
     }
+    surfaces
 }
 
 fn session_can_idle_sleep(
@@ -843,18 +844,7 @@ async fn sleep_session_inner(
     if !session_can_idle_sleep(&session, &pending, has_active_turn) {
         return Ok(());
     }
-    let surfaces = {
-        let mut surfaces = state.surfaces.lock().await;
-        surfaces
-            .extract_if(|_, surface| surface.session_id == session_id)
-            .map(|(_, surface)| {
-                surface.task.abort();
-                json!({"host_id": surface.host_id, "kind": format!("{:?}", surface.kind)})
-            })
-            .collect::<Vec<_>>()
-    };
-    detach_session_runtime(state, session_id).await;
-    release_mcp_leases(state, session_id).await;
+    let surfaces = release_session_runtime(state, session_id).await;
     let now = Utc::now();
     state
         .store
