@@ -72,6 +72,9 @@ pub struct SessionRecord {
     pub provider_finish_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub last_active_at: DateTime<Utc>,
+    pub sleep_state: String,
+    pub slept_at: Option<DateTime<Utc>>,
     pub project_id: Option<String>,
     pub agent_id: Option<String>,
 }
@@ -1106,8 +1109,14 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> Result<SessionRecord, rusqlite::
         provider_finish_reason: row.get(19)?,
         created_at: parse_timestamp(row.get(20)?)?,
         updated_at: parse_timestamp(row.get(21)?)?,
-        project_id: row.get(22)?,
-        agent_id: row.get(23)?,
+        last_active_at: parse_timestamp(row.get(22)?)?,
+        sleep_state: row.get(23)?,
+        slept_at: row
+            .get::<_, Option<String>>(24)?
+            .map(parse_timestamp)
+            .transpose()?,
+        project_id: row.get(25)?,
+        agent_id: row.get(26)?,
     })
 }
 
@@ -1182,7 +1191,7 @@ fn migrate_legacy_sessions(connection: &Connection) -> Result<(), StoreError> {
             created_at
         };
         connection.execute(
-            "INSERT OR IGNORE INTO sessions(session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,'[]','{}',0,0,NULL,NULL,'{}',?6,?7,?8,?8)",
+            "INSERT OR IGNORE INTO sessions(session_id,workspace,model,mode,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,created_at,updated_at,last_active_at,sleep_state,slept_at) VALUES (?1,?2,?3,?4,?5,'[]','{}',0,0,NULL,NULL,'{}',?6,?7,?8,?8,?8,'awake',NULL)",
             params![id, workspace, model, mode, title, host_id, provider, timestamp],
         )?;
     }
@@ -4671,6 +4680,9 @@ impl SqliteStore {
                provider_finish_reason TEXT,
                created_at TEXT NOT NULL,
                updated_at TEXT NOT NULL,
+               last_active_at TEXT NOT NULL DEFAULT '',
+               sleep_state TEXT NOT NULL DEFAULT 'awake',
+               slept_at TEXT,
                project_id TEXT,
                agent_id TEXT
              );
@@ -4752,6 +4764,15 @@ impl SqliteStore {
                     [],
                 )?;
             }
+            connection.execute(
+                "UPDATE sessions SET updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE updated_at=''",
+                [],
+            )?;
+            connection.execute(
+                "UPDATE sessions SET created_at=updated_at WHERE created_at=''",
+                [],
+            )?;
             if !table_columns(&connection, "sessions")?
                 .iter()
                 .any(|column| column == "provider")
@@ -4800,6 +4821,47 @@ impl SqliteStore {
             }
             if !session_columns.iter().any(|column| column == "agent_id") {
                 connection.execute("ALTER TABLE sessions ADD COLUMN agent_id TEXT", [])?;
+            }
+            if !table_columns(&connection, "sessions")?
+                .iter()
+                .any(|column| column == "last_active_at")
+            {
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN last_active_at TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+                connection.execute(
+                    "UPDATE sessions SET last_active_at=COALESCE(
+                        NULLIF(updated_at,''),
+                        NULLIF(created_at,''),
+                        strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                    )",
+                    [],
+                )?;
+            }
+            connection.execute(
+                "UPDATE sessions SET last_active_at=COALESCE(
+                    NULLIF(last_active_at,''),
+                    NULLIF(updated_at,''),
+                    NULLIF(created_at,''),
+                    strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                ) WHERE last_active_at=''",
+                [],
+            )?;
+            if !table_columns(&connection, "sessions")?
+                .iter()
+                .any(|column| column == "sleep_state")
+            {
+                connection.execute(
+                    "ALTER TABLE sessions ADD COLUMN sleep_state TEXT NOT NULL DEFAULT 'awake'",
+                    [],
+                )?;
+            }
+            if !table_columns(&connection, "sessions")?
+                .iter()
+                .any(|column| column == "slept_at")
+            {
+                connection.execute("ALTER TABLE sessions ADD COLUMN slept_at TEXT", [])?;
             }
             let pending_columns = table_columns(&connection, "pending")?;
             for (name, definition) in [
@@ -5490,7 +5552,7 @@ impl SqliteStore {
 
     pub fn save_session(&self, session: &SessionRecord) -> Result<(), StoreError> {
         self.connection.lock().expect("sqlite mutex poisoned").execute(
-            "INSERT OR REPLACE INTO sessions(session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,terminal_cause,provider_finish_reason,created_at,updated_at,project_id,agent_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
+            "INSERT OR REPLACE INTO sessions(session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,terminal_cause,provider_finish_reason,created_at,updated_at,last_active_at,sleep_state,slept_at,project_id,agent_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)",
             params![
                 session.session_id,
                 session.workspace,
@@ -5514,6 +5576,9 @@ impl SqliteStore {
                 session.provider_finish_reason,
                 session.created_at.to_rfc3339(),
                 session.updated_at.to_rfc3339(),
+                session.last_active_at.to_rfc3339(),
+                session.sleep_state,
+                session.slept_at.map(|value| value.to_rfc3339()),
                 session.project_id,
                 session.agent_id,
             ],
@@ -5524,7 +5589,7 @@ impl SqliteStore {
     pub fn load_session(&self, session_id: &str) -> Result<Option<SessionRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let result = connection.query_row(
-            "SELECT session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,terminal_cause,provider_finish_reason,created_at,updated_at,project_id,agent_id FROM sessions WHERE session_id=?1",
+            "SELECT session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,terminal_cause,provider_finish_reason,created_at,updated_at,last_active_at,sleep_state,slept_at,project_id,agent_id FROM sessions WHERE session_id=?1",
             [session_id],
             session_from_row,
         );
@@ -5538,9 +5603,60 @@ impl SqliteStore {
     pub fn load_sessions(&self) -> Result<Vec<SessionRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,terminal_cause,provider_finish_reason,created_at,updated_at,project_id,agent_id FROM sessions ORDER BY created_at DESC",
+            "SELECT session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,terminal_cause,provider_finish_reason,created_at,updated_at,last_active_at,sleep_state,slept_at,project_id,agent_id FROM sessions ORDER BY created_at DESC",
         )?;
         let rows = statement.query_map([], session_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(StoreError::from)
+    }
+
+    pub fn touch_session_activity(
+        &self,
+        session_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let changed = self
+            .connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE sessions SET last_active_at=?1,updated_at=?1 WHERE session_id=?2",
+                params![now.to_rfc3339(), session_id],
+            )?;
+        if changed == 0 {
+            return Err(StoreError::SessionNotFound(session_id.into()));
+        }
+        Ok(())
+    }
+
+    pub fn set_session_sleep_state(
+        &self,
+        session_id: &str,
+        state: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let slept_at = (state == "asleep").then(|| now.to_rfc3339());
+        let changed = self.connection.lock().expect("sqlite mutex poisoned").execute(
+            "UPDATE sessions SET sleep_state=?1,slept_at=?2,last_active_at=?3,updated_at=?3 WHERE session_id=?4",
+            params![state, slept_at, now.to_rfc3339(), session_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::SessionNotFound(session_id.into()));
+        }
+        Ok(())
+    }
+
+    pub fn list_idle_sleep_candidates(
+        &self,
+        before: DateTime<Utc>,
+    ) -> Result<Vec<SessionRecord>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let mut statement = connection.prepare(
+            "SELECT session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,terminal_cause,provider_finish_reason,created_at,updated_at,last_active_at,sleep_state,slept_at,project_id,agent_id
+             FROM sessions WHERE archived=0 AND run_state='idle' AND sleep_state='awake' AND last_active_at < ?1
+             ORDER BY last_active_at ASC",
+        )?;
+        let rows = statement.query_map([before.to_rfc3339()], session_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(StoreError::from)
     }
@@ -6900,6 +7016,9 @@ mod tests {
             provider_finish_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            last_active_at: Utc::now(),
+            sleep_state: "awake".into(),
+            slept_at: None,
             project_id: None,
             agent_id: None,
         }
@@ -6931,6 +7050,9 @@ mod tests {
             provider_finish_reason: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            last_active_at: Utc::now(),
+            sleep_state: "awake".into(),
+            slept_at: None,
             project_id: None,
             agent_id: None,
         };
@@ -6946,6 +7068,56 @@ mod tests {
                 .external_session_id
                 .as_deref(),
             Some("opencode-session-1")
+        );
+    }
+
+    #[test]
+    fn session_activity_and_sleep_state_round_trip() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = test_session("sleep-state");
+        store.save_session(&session).unwrap();
+        let active_at = Utc::now() - chrono::Duration::hours(2);
+        store
+            .touch_session_activity("sleep-state", active_at)
+            .unwrap();
+        let loaded = store.load_session("sleep-state").unwrap().unwrap();
+        assert_eq!(loaded.last_active_at, active_at);
+        store
+            .set_session_sleep_state("sleep-state", "asleep", Utc::now())
+            .unwrap();
+        let loaded = store.load_session("sleep-state").unwrap().unwrap();
+        assert_eq!(loaded.sleep_state, "asleep");
+        assert!(loaded.slept_at.is_some());
+        store
+            .set_session_sleep_state("sleep-state", "awake", Utc::now())
+            .unwrap();
+        let loaded = store.load_session("sleep-state").unwrap().unwrap();
+        assert_eq!(loaded.sleep_state, "awake");
+        assert!(loaded.slept_at.is_none());
+    }
+
+    #[test]
+    fn idle_sleep_candidates_filter_state_and_cutoff() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let mut idle = test_session("idle-old");
+        idle.last_active_at = Utc::now() - chrono::Duration::hours(2);
+        store.save_session(&idle).unwrap();
+        let mut awake = test_session("idle-new");
+        awake.last_active_at = Utc::now();
+        store.save_session(&awake).unwrap();
+        let mut asleep = idle.clone();
+        asleep.session_id = "already-asleep".into();
+        asleep.sleep_state = "asleep".into();
+        store.save_session(&asleep).unwrap();
+        let candidates = store
+            .list_idle_sleep_candidates(Utc::now() - chrono::Duration::hours(1))
+            .unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|session| session.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["idle-old"]
         );
     }
 
@@ -7015,6 +7187,9 @@ mod tests {
                 provider_finish_reason: None,
                 created_at: now,
                 updated_at: now,
+                last_active_at: now,
+                sleep_state: "awake".into(),
+                slept_at: None,
                 project_id: None,
                 agent_id: None,
             })
@@ -7055,6 +7230,9 @@ mod tests {
                 provider_finish_reason: None,
                 created_at: now,
                 updated_at: now,
+                last_active_at: now,
+                sleep_state: "awake".into(),
+                slept_at: None,
                 project_id: None,
                 agent_id: None,
             })
@@ -7102,6 +7280,9 @@ mod tests {
                     provider_finish_reason: None,
                     created_at: now,
                     updated_at: now,
+                    last_active_at: now,
+                    sleep_state: "awake".into(),
+                    slept_at: None,
                     project_id: None,
                     agent_id: None,
                 })
@@ -7224,6 +7405,9 @@ mod tests {
                 provider_finish_reason: None,
                 created_at: now,
                 updated_at: now,
+                last_active_at: now,
+                sleep_state: "awake".into(),
+                slept_at: None,
                 project_id: Some("project-1".into()),
                 agent_id: Some("agent-2".into()),
             })

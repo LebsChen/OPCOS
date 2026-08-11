@@ -23,6 +23,8 @@ export type Session = {
   archived?: boolean;
   project_id?: string | null;
   agent_id?: string | null;
+  sleep_state?: "awake" | "asleep" | string;
+  slept_at?: string | null;
 };
 
 export function normalizePermissionMode(mode: string): string {

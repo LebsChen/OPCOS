@@ -2522,6 +2522,8 @@ function SurfaceView({
   const terminalHost = useRef<HTMLDivElement>(null);
   const vncHost = useRef<HTMLDivElement>(null);
   const [port, setPort] = useState<number | null>(null);
+  const portRef = useRef<number | null>(null);
+  const surfaceGenerationRef = useRef(0);
   const [vncPassword, setVncPassword] = useState<string | null>(null);
   const [surfaceError, setSurfaceError] = useState("");
   const [browserFrame, setBrowserFrame] = useState<{
@@ -2536,9 +2538,11 @@ function SurfaceView({
   const [busy, setBusy] = useState(false);
   const [ideError, setIdeError] = useState("");
   const start = async (surface: string) => {
+    const generation = surfaceGenerationRef.current;
     try {
       setBusy(true);
       const nextPort = await command<number>("start_surface", {
+        sessionId: selected.id,
         hostId: selected.host_id,
         surface,
         cols: 100,
@@ -2546,6 +2550,11 @@ function SurfaceView({
         cwd: selected.workspace || null,
         projectId: selected.project_id || null,
       });
+      if (generation !== surfaceGenerationRef.current) {
+        await command("stop_surface", { port: nextPort });
+        return;
+      }
+      portRef.current = nextPort;
       setPort(nextPort);
       if (surface === "vnc") {
         setVncPassword(
@@ -2562,6 +2571,17 @@ function SurfaceView({
     }
   };
   useEffect(() => {
+    return () => {
+      surfaceGenerationRef.current += 1;
+      const activePort = portRef.current;
+      portRef.current = null;
+      if (activePort !== null) {
+        void command("stop_surface", { port: activePort });
+      }
+    };
+  }, [selected.id, tab]);
+  useEffect(() => {
+    portRef.current = null;
     setPort(null);
     setVncPassword(null);
     setSurfaceError("");
@@ -11303,7 +11323,18 @@ function AppContent() {
   }, [selected?.id]);
   useEffect(() => {
     selectedIdRef.current = selectedId ?? undefined;
+    if (selectedId) void command("touch_session", { sessionId: selectedId });
   }, [selectedId]);
+  useEffect(() => {
+    const subscriptions = [
+      listen("session-sleep", () => void refresh().catch(onError)),
+      listen("session-wake", () => void refresh().catch(onError)),
+    ];
+    return () => {
+      for (const subscription of subscriptions)
+        void subscription.then((unlisten) => unlisten());
+    };
+  }, []);
   const effectiveRunning = effectiveRunningState(
     pendingQuestion !== null,
     selected?.run_state,
@@ -12361,7 +12392,12 @@ function AppContent() {
           pinned: false,
           archived: session.archived ?? false,
           attention: 0,
-          liveness: selected?.id === session.id && running ? "working" : "idle",
+          liveness:
+            selected?.id === session.id && running
+              ? "working"
+              : session.sleep_state === "asleep"
+                ? "sleeping"
+                : "idle",
           stop_reason: session.stop_reason,
           project_id: session.project_id,
         }))}
@@ -12500,6 +12536,11 @@ function AppContent() {
                       onClick={beginSessionTitleEdit}
                     >
                       {selected.title}
+                      {selected.sleep_state === "asleep" && (
+                        <span className="text-xs text-faint">
+                          Asleep — the next message will reconnect it.
+                        </span>
+                      )}
                     </button>
                   )}
                   <span className="title-sub" data-testid="session-subtitle">

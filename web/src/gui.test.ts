@@ -460,4 +460,17 @@ describe("GUI boundary behavior", () => {
     expect(source).toContain('setHostVncPassword(password || "")');
     expect(source).toContain("vncPassword: hostVncPassword");
   });
+
+  it("surfaces real sleep state and stops owned surfaces", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain('session.sleep_state === "asleep"');
+    expect(source).toContain("the next message will reconnect");
+    expect(source).toContain('command("stop_surface", { port: activePort })');
+    expect(source).toContain(
+      'command("touch_session", { sessionId: selectedId })',
+    );
+  });
 });
