@@ -11126,24 +11126,55 @@ function QuestionCard({
   const [answer, setAnswer] = useState("");
   const [selectedOptions, setSelectedOptions] = useState<string[]>([]);
   const [submitting, setSubmitting] = useState(false);
+  const [collapsed, setCollapsed] = useState(false);
   const options = question.options ?? [];
+  const optionLabel = (index: number) =>
+    String.fromCharCode("A".charCodeAt(0) + index);
   const submit = (value: string) => {
     if (!value.trim() || submitting) return;
     setSubmitting(true);
     void onAnswer(value.trim()).catch(() => setSubmitting(false));
   };
+  if (collapsed) {
+    return (
+      <div className="transcript-question-collapsed">
+        <span className="transcript-question-collapsed-copy">
+          <strong>Question</strong>
+          <span>{question.question}</span>
+        </span>
+        <button
+          className="transcript-question-reopen"
+          type="button"
+          onClick={() => setCollapsed(false)}
+        >
+          Answer
+        </button>
+      </div>
+    );
+  }
   return (
-    <div className="approval rounded-xl border border-line p-3 mb-4">
-      <strong>Question</strong>
-      <div className="approval-with mt-3">{question.question}</div>
+    <div className="approval transcript-question-card">
+      <div className="transcript-question-head">
+        <strong>{question.question}</strong>
+        <button
+          className="transcript-question-close"
+          type="button"
+          aria-label="Collapse question"
+          title="Collapse question"
+          onClick={() => setCollapsed(true)}
+        >
+          ×
+        </button>
+      </div>
       {options.length > 0 && (
-        <div className="approval-btns mt-3 flex-wrap">
-          {options.map((option) => {
+        <div className="approval-btns flex-wrap">
+          {options.map((option, index) => {
             const selected = selectedOptions.includes(option);
             return (
               <button
                 key={option}
-                className={`btn ${selected ? "approval-primary" : ""}`}
+                className={`approval-option-row${selected ? " selected" : ""}`}
+                type="button"
                 disabled={submitting}
                 aria-pressed={selected}
                 onClick={() => {
@@ -11158,22 +11189,27 @@ function QuestionCard({
                   }
                 }}
               >
-                {option}
+                <span className="approval-option-key">
+                  {optionLabel(index)}
+                </span>
+                <span>{option}</span>
               </button>
             );
           })}
           {question.allowMultiple && (
             <button
-              className="btn approval-primary"
+              className="approval-option-row"
+              type="button"
               disabled={submitting || selectedOptions.length === 0}
               onClick={() => submit(JSON.stringify(selectedOptions))}
             >
-              {submitting ? "Sending…" : "Submit selection"}
+              <span className="approval-option-key">↵</span>
+              <span>{submitting ? "Sending…" : "Submit selection"}</span>
             </button>
           )}
         </div>
       )}
-      <div className="approval-btns mt-3">
+      <div className="approval-btns">
         <input
           className="ob-input flex-1"
           value={answer}
@@ -11181,13 +11217,21 @@ function QuestionCard({
           onChange={(event) => setAnswer(event.target.value)}
           placeholder="Type your answer"
           aria-label="Answer"
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.shiftKey) {
+              event.preventDefault();
+              submit(answer);
+            }
+          }}
         />
         <button
-          className="btn approval-primary"
+          className="approval-option-row approval-answer-submit"
+          type="button"
           disabled={submitting || !answer.trim()}
           onClick={() => submit(answer)}
         >
-          {submitting ? "Sending…" : "Answer"}
+          <span className="approval-option-key">↵</span>
+          <span>{submitting ? "Sending…" : "Answer"}</span>
         </button>
       </div>
     </div>

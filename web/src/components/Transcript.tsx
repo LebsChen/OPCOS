@@ -166,20 +166,25 @@ function QuestionCard({
   onAnswer?: (answer: string) => void;
 }) {
   const [answer, setAnswer] = useState("");
+  const optionLabel = (index: number) =>
+    String.fromCharCode("A".charCodeAt(0) + index);
   return (
     <div className="approval transcript-question-card">
-      <strong>Question</strong>
-      <div className="approval-with">{text}</div>
+      <div className="transcript-question-head">
+        <strong>Question</strong>
+        <span className="approval-with">{text}</span>
+      </div>
       {options && options.length > 0 && (
         <div className="approval-btns flex-wrap">
-          {options.map((option) => (
+          {options.map((option, index) => (
             <button
-              className="btn"
+              className="approval-option-row"
               key={option}
               type="button"
               onClick={() => onAnswer?.(option)}
             >
-              {option}
+              <span className="approval-option-key">{optionLabel(index)}</span>
+              <span>{option}</span>
             </button>
           ))}
         </div>
