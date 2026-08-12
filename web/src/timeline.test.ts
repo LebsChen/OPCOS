@@ -23,6 +23,31 @@ const saved = persisted as TimelineEvent[];
 const opcos = opcosEvents as TimelineEvent[];
 
 describe("single event-log timeline", () => {
+  it("translates provider error notices before transcript rendering", () => {
+    const nodes = buildTimeline([
+      {
+        type: "provider_error",
+        event_id: "provider-error",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "provider_error",
+          payload: {
+            message: "provider_request_failed: upstream overloaded",
+          },
+        },
+      },
+    ] as TimelineEvent[]);
+    const notice = nodes.find((node) => node.kind === "notice");
+    expect(notice).toMatchObject({
+      kind: "notice",
+      noticeKind: "provider_error",
+      text: "Provider request failed: upstream overloaded",
+    });
+    expect(notice?.kind === "notice" && notice.text).not.toContain(
+      "provider_request_failed:",
+    );
+  });
+
   it("replaces an optimistic user message with the persisted event", () => {
     const optimistic = optimisticUserMessageEvent("session-1", "  Hello  ");
     const persisted: TimelineEvent = {

@@ -1,5 +1,5 @@
 import type { Attachment } from "./types";
-import { translate } from "./i18n";
+import { translate, translateBackendError } from "./i18n";
 
 export type TimelineEvent = {
   type: string;
@@ -612,7 +612,8 @@ export function buildTimeline(
       if (text) {
         nodes.push({
           kind: "notice",
-          text,
+          // Backend error codes must be translated on every rendered path; keep provider detail raw.
+          text: type === "provider_error" ? translateBackendError(text) : text,
           noticeKind: type,
           retriable: type === "error" || type === "provider_error",
         });
