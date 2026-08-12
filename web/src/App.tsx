@@ -2350,14 +2350,14 @@ function ProjectCoordinationPanel({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-lg font-semibold text-ink">
-            Workflow 与 Lead 指挥
+            {translate("workflowLeadCommand")}
           </h2>
           <p className="mt-1 text-sm text-faint">
-            当前阶段：
+            {translate("currentStage")}：
             {snapshot?.status === "done"
-              ? "已完成"
+              ? translate("completed")
               : snapshot?.workflow?.workflow?.[snapshot.stage_index]?.stage ||
-                "未启动"}
+                translate("notStarted")}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -2371,21 +2371,21 @@ function ProjectCoordinationPanel({
                 .catch(onError)
             }
           >
-            启动全部
+            {translate("startAll")}
           </button>
           <button
             className="btn"
             disabled={loading}
             onClick={() => void setAllRoles("paused")}
           >
-            暂停
+            {translate("pause")}
           </button>
           <button
             className="btn"
             disabled={loading}
             onClick={() => void setAllRoles("active")}
           >
-            恢复
+            {translate("resume")}
           </button>
           <button
             className="btn"
@@ -2396,16 +2396,17 @@ function ProjectCoordinationPanel({
                 .catch(onError)
             }
           >
-            推进阶段
+            {translate("advanceStage")}
           </button>
         </div>
       </div>
       <div className="mt-5 grid gap-3">
         <div className="grid gap-2 rounded-lg border border-line p-4">
-          <h3 className="font-medium text-ink">Workflow 定义</h3>
+          <h3 className="font-medium text-ink">
+            {translate("workflowDefinition")}
+          </h3>
           <p className="text-xs text-faint">
-            使用 {"{ workflow: [{ stage, roles, gate }], serial }"} 格式；gate
-            支持 none、build+test、accept、pass。
+            {translate("workflowFormatHint")}
           </p>
           <textarea
             value={workflowText}
@@ -2424,24 +2425,24 @@ function ProjectCoordinationPanel({
                 .catch(onError)
             }
           >
-            保存 Workflow
+            {translate("saveWorkflow")}
           </button>
         </div>
         <div className="grid gap-2 rounded-lg border border-line p-4">
-          <h3 className="font-medium text-ink">任务</h3>
+          <h3 className="font-medium text-ink">{translate("task")}</h3>
           <div className="grid gap-2 md:grid-cols-[1fr_180px_auto]">
             <input
               value={taskTitle}
               onChange={(event) => setTaskTitle(event.target.value)}
-              placeholder="任务标题"
+              placeholder={translate("taskTitle")}
             />
             <input
               value={taskAssignee}
               onChange={(event) => setTaskAssignee(event.target.value)}
-              placeholder="指派角色 ID"
+              placeholder={translate("assigneeRoleId")}
             />
             <button className="btn approval-primary" onClick={createTask}>
-              新建任务
+              {translate("createTask")}
             </button>
           </div>
           <div className="grid gap-2">
@@ -2453,7 +2454,7 @@ function ProjectCoordinationPanel({
                 <span>
                   <strong>{task.title}</strong>
                   <span className="ml-2 text-faint">
-                    {task.phase} · {task.assignee || "未指派"}
+                    {task.phase} · {task.assignee || translate("unassigned")}
                   </span>
                 </span>
                 <div className="flex gap-2">
@@ -2469,7 +2470,7 @@ function ProjectCoordinationPanel({
                           .catch(onError)
                       }
                     >
-                      租约指派
+                      {translate("claimLease")}
                     </button>
                   )}
                   <button
@@ -2484,7 +2485,7 @@ function ProjectCoordinationPanel({
                         .catch(onError)
                     }
                   >
-                    同步回执
+                    {translate("syncReceipt")}
                   </button>
                 </div>
               </div>
@@ -2492,7 +2493,9 @@ function ProjectCoordinationPanel({
           </div>
         </div>
         <div className="grid gap-2 rounded-lg border border-line p-4">
-          <h3 className="font-medium text-ink">协同消息历史</h3>
+          <h3 className="font-medium text-ink">
+            {translate("coordinationMessageHistory")}
+          </h3>
           {(snapshot?.messages || []).map((message: any) => (
             <div
               className="rounded-lg border border-line p-3 text-xs"
@@ -2507,7 +2510,9 @@ function ProjectCoordinationPanel({
             </div>
           ))}
           {!snapshot?.messages?.length && (
-            <p className="text-sm text-faint">暂无协同消息。</p>
+            <p className="text-sm text-faint">
+              {translate("noCoordinationMessages")}
+            </p>
           )}
         </div>
       </div>
