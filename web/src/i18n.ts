@@ -983,6 +983,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     connectorTemplate: "Connector",
     acpAgentTemplate: "ACP agent",
     stateOpen: "In progress",
+    stateSleep: "Asleep",
     unknownCapabilities: "capabilities unknown",
     sourceLabel: "Source:",
     liveApiDiscovery: "Live API discovery",
@@ -2093,6 +2094,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     connectorTemplate: "连接器",
     acpAgentTemplate: "ACP 代理",
     stateOpen: "进行中",
+    stateSleep: "休眠中",
     unknownCapabilities: "能力未知",
     sourceLabel: "来源：",
     liveApiDiscovery: "API 实时发现",
@@ -2304,6 +2306,7 @@ export const backendValueKeys: Record<string, string> = {
   "acp-agent": "acpAgentTemplate",
   provider_error: "providerError",
   open: "stateOpen",
+  sleep: "stateSleep",
   finished: "finished",
   harness_error: "harnessError",
   internal_error: "internalError",
@@ -2329,6 +2332,13 @@ const backendErrorKeys: Record<string, string> = {
 
 export function translateBackendError(value: unknown): string {
   const text = String(value ?? "").trim();
+  const providerRequestPrefix = "provider_request_failed:";
+  if (text.toLowerCase().startsWith(providerRequestPrefix)) {
+    const detail = text.slice(providerRequestPrefix.length).trim();
+    return translate("providerRequestFailed", {
+      status: detail ? `: ${detail}` : "",
+    });
+  }
   return translate(backendErrorKeys[text.toLowerCase()] || text);
 }
 

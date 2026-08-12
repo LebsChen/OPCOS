@@ -3508,7 +3508,7 @@ has failed {} times and the last error code was {}",
                     }
                     self.notice(
                         "provider_error",
-                        format!("Provider request failed: {error}"),
+                        format!("provider_request_failed: {error}"),
                     )
                     .await?;
                     if matches!(error, ProviderError::ContextOverflow { .. })

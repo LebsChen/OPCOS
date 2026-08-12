@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { backendValueKeys, messages, translateBackendValue } from "./i18n";
+import {
+  backendValueKeys,
+  messages,
+  translateBackendError,
+  translateBackendValue,
+} from "./i18n";
 
 const sourceRoot = fileURLToPath(new URL(".", import.meta.url));
 const allowlist = [
@@ -518,6 +523,10 @@ describe("i18n source coverage", () => {
     }
     const i18nSource = readFileSync(`${sourceRoot}i18n.ts`, "utf8");
     expect(i18nSource).toContain("return key ? translate(key) : text;");
+    const roleStateValues = ["active", "sleep", "paused"];
+    for (const value of roleStateValues) {
+      expect(backendValueKeys[value]).toBeTruthy();
+    }
   });
 
   it("keeps backend-only display keys out of literal UI labels", () => {
@@ -562,13 +571,42 @@ describe("i18n source coverage", () => {
   it("localizes transcript summaries and role state options", () => {
     const transcriptSource = readFileSync(`${sourceRoot}transcript.ts`, "utf8");
     const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
+    const engineSource = readFileSync(
+      `${sourceRoot}../../crates/opcos-engine/src/lib.rs`,
+      "utf8",
+    );
+    const repoRoot = `${sourceRoot}../../`;
+    const backendSources = [
+      ...readdirSync(`${repoRoot}crates`, { recursive: true }).map(
+        (file) => `${repoRoot}crates/${String(file)}`,
+      ),
+      ...readdirSync(`${repoRoot}src-tauri`, { recursive: true }).map(
+        (file) => `${repoRoot}src-tauri/${String(file)}`,
+      ),
+    ]
+      .filter((file) => file.endsWith(".rs"))
+      .map((file) => readFileSync(file, "utf8"))
+      .join("\n");
     expect(transcriptSource).toContain(
       'translate("providerRequestFailed", { status: statusText })',
     );
-    expect(transcriptSource).not.toMatch(/summary:\s*`Provider request failed/);
+    expect(appSource).toContain("providerErrorPresentation");
+    expect(appSource).toContain("errorMessage(reason)");
+    expect(engineSource).toContain(
+      'format!("provider_request_failed: {error}")',
+    );
+    expect(backendSources).not.toMatch(
+      /format!\(\s*"Provider request failed(?::|\\s)/,
+    );
+    expect(
+      translateBackendError("provider_request_failed: upstream down"),
+    ).toBe("Provider request failed: upstream down");
     expect(appSource).toMatch(
       /options=\{\["active", "sleep", "paused"\]\.map\(\(value\) => \(\{\s*value,\s*label: translateBackendValue\(value\)/s,
     );
+    for (const value of ["active", "sleep", "paused"]) {
+      expect(backendValueKeys[value]).toBeTruthy();
+    }
     expect(appSource).not.toMatch(/label:\s*value,/);
   });
 
