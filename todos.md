@@ -84,10 +84,18 @@ Compaction summary cap 的提高尚未在真实运行中触发：四轮真实 su
 
 - [x] 会话 transcript、pending approval、Inbox、审计、暂停/恢复和 builtin
   TurnEngine（历史 #15–#17）。
+- [x] recovery 语义：dispatch marker、`execution_state_unknown`、安全 read 重试和
+  `side_effecting_unresolved` 不重放（#216）。
+- [x] 首轮先接受 user message，再执行 runtime/setup；setup 失败保留消息并进入
+  `harness_error`（#217）。
+- [x] idle activity tracking、断连/唤醒，以及 surface/IDE lease 生命周期（#218）。
 - [x] LocalHost/RVM Host、能力探测、远程显式失败、远程路径 containment 和
   SecretStore token 边界（历史 #14–#17）。
 - [x] OpenCode harness 和独立 ACP harness（历史 #15–#17）。
 - [x] provider registry、动态模型发现和缓存（#44–#45）。
+- [x] 自定义 provider model ID：非空 ID 可保存；内置 model 仅作为建议/默认值（#212）。
+- [x] 后端 structured UI message code 与前端中英文翻译（#215）。
+- [x] 前端完整中英文 i18n 与语言切换（#209）。
 
 ### 编码、Git、PR 和 CI
 
@@ -128,6 +136,10 @@ Compaction summary cap 的提高尚未在真实运行中触发：四轮真实 su
   只能引用 SecretStore（#53）。
 - [x] 多种 provider/connector catalog、OAuth/Token 配置和少数已实现 agent
   connector tools；catalog 不等于完整业务工具覆盖（历史 #33–#45）。
+- [x] Changes 面板（#210）。
+- [x] 生命周期 hooks（#168）。
+- [x] Linux/Windows GitHub Actions 未签名 release bundles 及统一 GitHub Release
+  发布（#219）。
 
 ## 已知限制
 
