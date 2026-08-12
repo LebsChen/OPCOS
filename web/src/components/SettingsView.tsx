@@ -1,6 +1,6 @@
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { Icon, type IconName } from "./Icon";
-import { translate } from "../i18n";
+import { subscribeLocale, translate } from "../i18n";
 
 // Shell source: OpenWorker surfaces/gui/src/components/SettingsView.tsx:85-123.
 // The body pages are OPCOS-only asset/host surfaces, so their data adapters stay
@@ -30,21 +30,21 @@ export type SettingsSection =
 
 const tabs: Array<{ key: SettingsSection; label: string; icon: IconName }> = [
   { key: "appearance", label: "general", icon: "sliders" },
-  { key: "agent", label: "Agent defaults", icon: "sparkle" },
-  { key: "environment", label: "Environment", icon: "folder" },
+  { key: "agent", label: "agentDefaults", icon: "sparkle" },
+  { key: "environment", label: "environmentSection", icon: "folder" },
   { key: "experts", label: "experts", icon: "sparkle" },
   { key: "teams", label: "teams", icon: "board" },
-  { key: "command", label: "Command", icon: "terminal" },
+  { key: "command", label: "commandSection", icon: "terminal" },
   { key: "provider", label: "provider", icon: "sparkle" },
   { key: "hosts", label: "hosts", icon: "folder" },
   { key: "agents", label: "rules", icon: "fileCode" },
   { key: "instructions", label: "instructions", icon: "fileCode" },
-  { key: "knowledge", label: "knowledge", icon: "file" },
-  { key: "playbook", label: "playbook", icon: "table" },
-  { key: "skill", label: "skill", icon: "sparkle" },
+  { key: "knowledge", label: "knowledgeSection", icon: "file" },
+  { key: "playbook", label: "playbookSection", icon: "table" },
+  { key: "skill", label: "skillSection", icon: "sparkle" },
   { key: "mcp", label: "mcp", icon: "plug" },
   { key: "connectors", label: "connectors", icon: "globe" },
-  { key: "ingress", label: "external events", icon: "globe" },
+  { key: "ingress", label: "externalEvents", icon: "globe" },
   { key: "index", label: "index", icon: "search" },
   { key: "secrets", label: "secrets", icon: "shield" },
   { key: "blueprint", label: "blueprint", icon: "code" },
@@ -59,6 +59,11 @@ export function SettingsView({
   onTabChange: (tab: SettingsSection) => void;
   children: ReactNode;
 }) {
+  const [, setLocaleVersion] = useState(0);
+  useEffect(
+    () => subscribeLocale(() => setLocaleVersion((value) => value + 1)),
+    [],
+  );
   return (
     <main className="flex-1 min-w-0 min-h-0 flex bg-paper">
       <nav className="page-subnav w-[208px] shrink-0 border-r border-line bg-panel/40 px-3 py-4">

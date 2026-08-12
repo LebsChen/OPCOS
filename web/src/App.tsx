@@ -1206,7 +1206,13 @@ function MemberDialog({
                 >
                   {(harnessOptions.length
                     ? harnessOptions
-                    : [{ id: "builtin", label: "Builtin", available: true }]
+                    : [
+                        {
+                          id: "builtin",
+                          label: translate("builtIn"),
+                          available: true,
+                        },
+                      ]
                   ).map((item) => (
                     <option
                       key={item.id}
@@ -1409,12 +1415,12 @@ function ProjectConfigPanel({
             ["experts", translate("experts")],
             ["teams", translate("teams")],
             ["command", translate("command")],
-            ["knowledge", "Knowledge"],
-            ["playbook", "Playbook"],
-            ["mcp", "MCP"],
-            ["acp-agent", "ACP agents"],
-            ["connectors", "Connectors"],
-            ["blueprint", "Blueprint"],
+            ["knowledge", "knowledgeSection"],
+            ["playbook", "playbookSection"],
+            ["mcp", "mcp"],
+            ["acp-agent", "acpAgents"],
+            ["connectors", "connectors"],
+            ["blueprint", "blueprintSection"],
           ].map(([value, label]) => (
             <button
               key={value}
@@ -1424,7 +1430,7 @@ function ProjectConfigPanel({
                 reset();
               }}
             >
-              {label}
+              {translate(label)}
             </button>
           ))}
         </div>
@@ -4039,7 +4045,7 @@ function ManageSections({
       .catch(onError);
   }, [tab, selected, onError]);
   const sectionCopy: Record<SettingsSection, [string, string]> = {
-    provider: ["Provider", translate("chooseProvider")],
+    provider: [translate("provider"), translate("chooseProvider")],
     hosts: [translate("hosts"), translate("hostsDescription")],
     agents: [translate("rulesSection"), translate("rulesDescription")],
     instructions: [
@@ -4052,8 +4058,8 @@ function ManageSections({
     ],
     playbook: [translate("playbookSection"), translate("playbookDescription")],
     skill: [translate("skillSection"), translate("skillDescription")],
-    mcp: ["MCP", translate("mcpDescription")],
-    connectors: ["Connectors", translate("connectorsDescription")],
+    mcp: [translate("mcp"), translate("mcpDescription")],
+    connectors: [translate("connectors"), translate("connectorsDescription")],
     ingress: [
       translate("externalEvents"),
       translate("externalEventsDescription"),
@@ -4254,10 +4260,10 @@ function ManageSections({
             <div className="flex gap-2 border-b border-line pb-2">
               {(
                 [
-                  ["blueprints", "Blueprints"],
-                  ["snapshots", "Snapshots"],
-                  ["advanced", "Advanced"],
-                  ["outposts", "Outposts"],
+                  ["blueprints", "blueprints"],
+                  ["snapshots", "snapshots"],
+                  ["advanced", "advanced"],
+                  ["outposts", "outposts"],
                 ] as const
               ).map(([value, label]) => (
                 <button
@@ -4545,14 +4551,14 @@ function ManageSections({
             </div>
             {(
               [
-                ["default_agent", "Default agent"],
-                ["api_default_agent", "API default agent"],
-                ["default_platform", "Default platform"],
+                ["default_agent", "defaultAgent"],
+                ["api_default_agent", "apiDefaultAgent"],
+                ["default_platform", "defaultPlatform"],
               ] as const
             ).map(([keyName, label]) => (
               <label className="settings-row" key={keyName}>
                 <div>
-                  <strong>{label}</strong>
+                  <strong>{translate(label)}</strong>
                   <small>{translate("newSessionDefaults")}</small>
                 </div>
                 <input
@@ -4603,9 +4609,9 @@ function ManageSections({
             </label>
             {(
               [
-                ["share_prompts_in_prs", "Share prompts in PRs"],
-                ["require_agent_mention", "Require the agent to respond"],
-                ["auto_add_reviewer", "Auto-add reviewer"],
+                ["share_prompts_in_prs", "sharePromptsInPrs"],
+                ["require_agent_mention", "requireAgentMention"],
+                ["auto_add_reviewer", "autoAddReviewer"],
               ] as const
             ).map(([keyName, label]) => (
               <label className="settings-row" key={keyName}>
@@ -4654,8 +4660,8 @@ function ManageSections({
                   })
                 }
                 options={[
-                  { value: "ready", label: "Ready" },
-                  { value: "draft", label: "Draft" },
+                  { value: "ready", label: translate("ready") },
+                  { value: "draft", label: translate("draft") },
                 ]}
               />
             </label>
@@ -4673,8 +4679,8 @@ function ManageSections({
                   })
                 }
                 options={[
-                  { value: "ignore", label: "Ignore" },
-                  { value: "respond", label: "Respond" },
+                  { value: "ignore", label: translate("ignore") },
+                  { value: "respond", label: translate("respond") },
                 ]}
               />
             </label>
@@ -11136,7 +11142,7 @@ function SessionRightPanel({
                   <Field k={translate("sessionId")} v={selected.id} />
                   <Field
                     k={translate("status")}
-                    v={running ? "Running" : "Ready"}
+                    v={running ? translate("running") : translate("ready")}
                   />
                   <Field k={translate("host")} v={selected.host_name} />
                   <Field
@@ -13393,7 +13399,13 @@ function AppContent() {
                     >
                       {(harnessOptions.length
                         ? harnessOptions
-                        : [{ id: "builtin", label: "Builtin", available: true }]
+                        : [
+                            {
+                              id: "builtin",
+                              label: translate("builtIn"),
+                              available: true,
+                            },
+                          ]
                       ).map((option) => (
                         <option
                           key={option.id}

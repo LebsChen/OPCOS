@@ -133,6 +133,32 @@ describe("i18n source coverage", () => {
     expect(missing).toEqual([]);
   });
 
+  it("keeps static label sources backed by dictionary keys", () => {
+    const keys = new Set(Object.keys(messages.en));
+    const settingsSource = readFileSync(
+      `${sourceRoot}components/SettingsView.tsx`,
+      "utf8",
+    );
+    const approvalSource = readFileSync(
+      `${sourceRoot}components/ApprovalCard.tsx`,
+      "utf8",
+    );
+    const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
+    const toolVerbBlock =
+      approvalSource.match(
+        /const TOOL_VERBS[\s\S]*?=\s*\{([\s\S]*?)\};/,
+      )?.[1] ?? "";
+    const staticLabels = [
+      ...settingsSource.matchAll(/label:\s*"([^"]+)"/g),
+      ...appSource.matchAll(
+        /\["(?:agents|experts|teams|command|knowledge|playbook|mcp|acp-agent|connectors|blueprint|blueprints|snapshots|advanced|outposts)",\s*"([^"]+)"\]/g,
+      ),
+      ...toolVerbBlock.matchAll(/:\s*"([^"]+)"/g),
+    ].map((match) => match[1]);
+    staticLabels.push("light", "dark", "auto");
+    expect(staticLabels.filter((key) => !keys.has(key))).toEqual([]);
+  });
+
   it("does not leave bare product copy in JSX text or visible attributes", () => {
     const violations: string[] = [];
     for (const file of sourceFiles().filter((name) => name.endsWith(".tsx"))) {

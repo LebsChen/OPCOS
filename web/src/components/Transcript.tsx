@@ -517,7 +517,7 @@ export function Transcript({
   hostName,
   running,
   onRetry,
-  retryLabel = "Retry",
+  retryLabel,
   onQuestionAnswer,
 }: {
   events: TimelineEvent[];
@@ -615,7 +615,7 @@ export function Transcript({
               )}
               {node.retriable && onRetry && !running && (
                 <button className="btn ml-2" onClick={onRetry}>
-                  {retryLabel}
+                  {retryLabel || translate("retry")}
                 </button>
               )}
             </div>

@@ -47,18 +47,18 @@ const stopDictation = async (): Promise<string | null> => null;
 const PERMISSION_OPTIONS: Option[] = [
   {
     value: "discuss",
-    label: "Discuss",
-    description: "Chat and explore — no edits or commands",
+    label: "discuss",
+    description: "discussDescription",
   },
   {
     value: "interactive",
-    label: "Ask for approval",
-    description: "Ask before edits and commands",
+    label: "askForApproval",
+    description: "askForApprovalDescription",
   },
   {
     value: "auto",
-    label: "Full access",
-    description: "Run everything without asking",
+    label: "fullAccess",
+    description: "fullAccessDescription",
   },
 ];
 
@@ -1043,25 +1043,25 @@ export function PlusMenu({
   const categories = [
     {
       kind: "agents",
-      label: "Rules",
+      label: "rules",
       reference: "@AGENTS.md",
       icon: "shield" as const,
     },
     {
       kind: "knowledge",
-      label: "Knowledge",
+      label: "knowledge",
       reference: "@Knowledge",
       icon: "inbox" as const,
     },
     {
       kind: "playbook",
-      label: "Playbooks",
+      label: "playbooks",
       reference: "@Playbook",
       icon: "board" as const,
     },
     {
       kind: "skill",
-      label: "Skills",
+      label: "skills",
       reference: "@Skill",
       icon: "wrench" as const,
     },
@@ -1141,7 +1141,7 @@ export function PlusMenu({
                   }}
                 >
                   <Icon name={category.icon} size={15} className="pm-icon" />
-                  <span>{category.label}</span>
+                  <span>{translate(category.label)}</span>
                   {hasSubmenu && (
                     <Icon
                       name="chevronRight"
@@ -1464,11 +1464,11 @@ function ModeMenu({
                     (o.value === mode ? "font-medium text-accent" : "text-ink")
                   }
                 >
-                  {o.label}
+                  {translate(o.label)}
                   {o.value === mode && <span className="ml-1.5">✓</span>}
                 </span>
                 <span className="text-[11px] text-faint leading-snug">
-                  {o.description}
+                  {translate(o.description || "")}
                 </span>
               </button>
             ))}
