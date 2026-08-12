@@ -1166,7 +1166,7 @@ function MemberDialog({
           {mode === "add" ? (
             <>
               <label className="field-label">
-                Provider
+                {translate("provider")}
                 <select
                   className="input"
                   value={provider}
@@ -1200,7 +1200,7 @@ function MemberDialog({
                 </select>
               </label>
               <label className="field-label">
-                Harness
+                {translate("harness")}
                 <select
                   className="input"
                   value={harness}
@@ -3692,7 +3692,7 @@ function WorklogView({
       <div className="surface-toolbar">
         <span>{translate("worklogTimeline")}</span>
         <Button onClick={load}>
-          <Icon name="refresh" /> Reload
+          <Icon name="refresh" /> {translate("reload")}
         </Button>
       </div>
       {Boolean(worklog?.window_lost) && (
@@ -4858,7 +4858,7 @@ function ManageSections({
                         .catch(onError)
                     }
                   >
-                    Add Command
+                    {translate("addCommand")}
                   </Button>
                 </div>
               </div>
@@ -5045,7 +5045,7 @@ function ManageSections({
                     )}
                     {descriptor.needs_key && (
                       <label>
-                        Provider key
+                              {translate("providerKey")}
                         <input
                           type="password"
                           value={providerKeys[descriptor.name] || ""}
@@ -5062,7 +5062,7 @@ function ManageSections({
                       </label>
                     )}
                     <label>
-                      Model
+                              {translate("model")}
                       <SelectMenu
                         value={
                           providerModels[descriptor.name] ||
@@ -5184,7 +5184,7 @@ function ManageSections({
                           )
                       }
                     >
-                      Test / Save
+                            {translate("testSave")}
                     </Button>
                     {config?.configured && (
                       <Button
@@ -5204,7 +5204,7 @@ function ManageSections({
                             .catch(onError)
                         }
                       >
-                        Clear key
+                            {translate("clearKey")}
                       </Button>
                     )}
                   </div>
@@ -5303,7 +5303,7 @@ function ManageSections({
                     })
                 }
               >
-                Save and validate
+                        {translate("saveAndValidate")}
               </Button>
             </div>
             {providerStatus && (
@@ -5341,7 +5341,7 @@ function ManageSections({
               </div>
               <div className="form-grid">
                 <label>
-                  Name
+                  {translate("name")}
                   <input
                     className="input"
                     value={customProviderName}
@@ -5352,7 +5352,7 @@ function ManageSections({
                   />
                 </label>
                 <label>
-                  API dialect
+                  {translate("apiDialect")}
                   <select
                     className="input"
                     value={customProviderDialect}
@@ -5367,7 +5367,7 @@ function ManageSections({
                   </select>
                 </label>
                 <label>
-                  Base URL
+                  {translate("baseUrl")}
                   <input
                     className="input"
                     type="url"
@@ -5379,7 +5379,7 @@ function ManageSections({
                   />
                 </label>
                 <label>
-                  Model
+                  {translate("model")}
                   <input
                     className="input"
                     value={customProviderModel}
@@ -5390,7 +5390,7 @@ function ManageSections({
                   />
                 </label>
                 <label className="sm:col-span-2">
-                  Key
+                  {translate("key")}
                   <input
                     className="input"
                     type="password"
@@ -5490,7 +5490,7 @@ function ManageSections({
                   setHostFormOpen(true);
                 }}
               >
-                Add host
+                    {translate("addHost")}
               </Button>
             }
             bare
@@ -5523,7 +5523,7 @@ function ManageSections({
                                   .catch(onError);
                               }}
                             >
-                              Edit
+                        {translate("edit")}
                             </Button>
                           )}
                           <Button
@@ -5615,7 +5615,7 @@ function ManageSections({
                       setHostFormOpen(false);
                     }}
                   >
-                    Cancel
+                      {translate("cancel")}
                   </Button>
                 </form>
               ) : undefined
@@ -6484,7 +6484,7 @@ function ManageSections({
                                     .catch(onError);
                                 }}
                               >
-                                History
+                    {translate("history")}
                               </Button>
                               <Button
                                 className="bordered"
@@ -6555,7 +6555,7 @@ function ManageSections({
                       setCompareVersionId(null);
                     }}
                   >
-                    Close
+                      {translate("close")}
                   </Button>
                 </div>
                 {assetVersions.map((version) => {
