@@ -6514,7 +6514,7 @@ function ManageSections({
             {versionHistoryAsset && (
               <div className="manage-card mt-4">
                 <div className="flex items-center justify-between">
-                  <strong>Version history</strong>
+                  <strong>{translate("versionHistory")}</strong>
                   <Button
                     className="bordered"
                     onClick={() => {
@@ -6645,8 +6645,8 @@ function ManageSections({
                         )
                       }
                     >
-                      <option value="global">Global</option>
-                      <option value="repo">Repository</option>
+                    <option value="global">{translate("global")}</option>
+                    <option value="repo">{translate("repository")}</option>
                     </select>
                     <input
                       value={assetScope}
@@ -6733,8 +6733,10 @@ function ManageSections({
                       setIngressProvider(event.target.value as "github" | "rss")
                     }
                   >
-                    <option value="github">GitHub repository events</option>
-                    <option value="rss">RSS / Atom feed</option>
+                    <option value="github">
+                      {translate("githubRepositoryEvents")}
+                    </option>
+                    <option value="rss">{translate("rssAtomFeed")}</option>
                   </select>
                 </label>
                 <label className="field-label">
@@ -6755,9 +6757,9 @@ function ManageSections({
                     value={ingressInterval}
                     onChange={(event) => setIngressInterval(event.target.value)}
                   >
-                    <option value="30">30 seconds</option>
-                    <option value="60">1 minute</option>
-                    <option value="300">5 minutes</option>
+                    <option value="30">{translate("seconds30")}</option>
+                    <option value="60">{translate("minute1")}</option>
+                    <option value="300">{translate("minutes5")}</option>
                     <option value="900">15 minutes</option>
                   </select>
                 </label>
