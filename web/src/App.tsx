@@ -9985,12 +9985,14 @@ function StandalonePane({ route }: { route: PaneRoute }) {
 const insightFieldKeys: Record<string, string> = {
   message_count: "messageCount",
   tool_calls: "toolCalls",
+  approval_count: "approvalCount",
+  token_usage: "tokenUsage",
   duration_ms: "duration",
 };
 
 function insightFieldLabel(key: string): string {
   const translationKey = insightFieldKeys[key];
-  return translationKey ? translate(translationKey) : key;
+  return translationKey ? translate(translationKey) : translate("unknownValue");
 }
 
 function StandaloneInsights({
@@ -10819,7 +10821,9 @@ function AgentRosterPane({
                     <div>
                       <dt>{translate("hostLabel")}</dt>
                       <dd>
-                        {translateBackendValue(projectAgentRosterHost(session))}
+                        {projectAgentRosterHost(session) === "Unknown"
+                          ? translate("unknownValue")
+                          : projectAgentRosterHost(session)}
                       </dd>
                     </div>
                     <div>
@@ -11009,8 +11013,8 @@ function SessionRightPanel({
     label: string;
     icon: RailIconName;
   }> = [
-    { id: "info", label: "Info", icon: "info" },
-    { id: "shell", label: "Shell", icon: "terminal" },
+    { id: "info", label: translate("information"), icon: "info" },
+    { id: "shell", label: translate("shell"), icon: "terminal" },
     { id: "changes", label: translate("changes"), icon: "diff" },
     { id: "progress", label: translate("progress"), icon: "progress" },
     { id: "tasks", label: translate("panelTasks"), icon: "tasks" },
@@ -11022,7 +11026,7 @@ function SessionRightPanel({
   if (selected.host_id !== "local") {
     informationTabs.splice(3, 0, {
       id: "worklog",
-      label: "Worklog",
+      label: translate("worklog"),
       icon: "progress",
     });
   }
@@ -11030,7 +11034,7 @@ function SessionRightPanel({
     id: typeof panelTab;
     label: string;
     icon: RailIconName;
-  }> = [{ id: "review", label: "Diff", icon: "diff" }];
+  }> = [{ id: "review", label: translate("diff"), icon: "diff" }];
   const remoteTabs: Array<{
     id: typeof panelTab;
     label: string;

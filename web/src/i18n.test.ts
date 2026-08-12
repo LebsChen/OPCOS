@@ -73,7 +73,6 @@ const zhEnglishKeyAllowlist = new Set([
   "mcpServerId",
   "accountId",
   "secretsLabel",
-  "worktree",
   "worktreeLabel",
   "panelAgents",
   "artifactCount",
@@ -87,6 +86,92 @@ const zhFreeTextKeyAllowlist = new Set([
   "jsonWorkflowExample",
   "jsonRolesExample",
   "jsonEnvelopeExample",
+  "cloneExample",
+  "ciRepairLoop",
+  "workflowFormatHint",
+  "environmentPerLine",
+  "githubEnterpriseDescription",
+  "setupExecutorDescription",
+  "commandManagementDescription",
+  "issueIdentifierExample",
+  "ownerRepository",
+]);
+const zhEnglishWordAllowlist = new Set([
+  "MCP",
+  "ACP",
+  "IDE",
+  "CDP",
+  "VNC",
+  "SSH",
+  "API",
+  "URL",
+  "JSON",
+  "YAML",
+  "stdio",
+  "HTTP",
+  "SSE",
+  "Token",
+  "Shell",
+  "PTY",
+  "Git",
+  "Cron",
+  "Blueprint",
+  "Outposts",
+  "Agent",
+  "Agents",
+  "Secret",
+  "Persona",
+  "Playbook",
+  "Skill",
+  "Devin",
+  "OPCOS",
+  "RVM",
+  "DevBox",
+  "Slack",
+  "Linear",
+  "Jira",
+  "Dropbox",
+  "GitHub",
+  "Notion",
+  "OpenAI",
+  "Google",
+  "Microsoft",
+  "Telegram",
+  "WhatsApp",
+  "IMAP",
+  "OAuth",
+  "GraphQL",
+  "RSS",
+  "Atom",
+  "OpenWorker",
+  "CI",
+  "SHA",
+  "Hash",
+  "PNG",
+  "PR",
+  "English",
+  "Bearer",
+  "OpenCode",
+  "opencode",
+  "Harness",
+  "schema",
+  "Rust",
+  "Cloudflare",
+  "Streamable",
+  "server",
+  "Account",
+  "working_event",
+  "KEY",
+  "VALUE",
+  "task",
+  "BETA",
+  "Discord",
+  "CRM",
+  "Box",
+  "Drive",
+  "Cloud",
+  "webhook",
+  "SecretStore",
 ]);
 
 describe("i18n source coverage", () => {
@@ -112,6 +197,27 @@ describe("i18n source coverage", () => {
       .map(([key, value]) => `${key}:${value}`);
     expect(zhWithoutChinese).toEqual([]);
     expect(englishWithChinese).toEqual([]);
+  });
+
+  it("does not mix unapproved English words into Chinese translations", () => {
+    const violations: string[] = [];
+    for (const [key, value] of Object.entries(messages.zh)) {
+      if (zhFreeTextKeyAllowlist.has(key)) continue;
+      const normalized = value
+        .replace(/\{[^}]*\}/g, "")
+        .replace(/https?:\/\/\S+/g, "")
+        .replace(/\/[\w./-]+/g, "");
+      const words = normalized.match(/[A-Za-z]{3,}/g) || [];
+      const unexpected = words.filter(
+        (word) =>
+          !zhEnglishWordAllowlist.has(word) &&
+          !zhEnglishWordAllowlist.has(
+            word[0].toUpperCase() + word.slice(1).toLowerCase(),
+          ),
+      );
+      if (unexpected.length) violations.push(`${key}:${unexpected.join(",")}`);
+    }
+    expect(violations).toEqual([]);
   });
 
   it("defines every literal translate key used by the frontend", () => {
@@ -193,9 +299,15 @@ describe("i18n source coverage", () => {
     );
     expect(appSource).toMatch(/translateBackendValue\(workflow\.status\)/);
     expect(appSource).toMatch(
-      /translateBackendValue\(projectAgentRosterHost\(session\)\)/,
+      /projectAgentRosterHost\(session\) === "Unknown"[\s\S]*translate\("unknownValue"\)/,
     );
     expect(appSource).toMatch(/insightFieldLabel\(key\)/);
+    expect(appSource).not.toMatch(
+      /translateBackendValue\(\s*projectAgentRosterHost/,
+    );
+    expect(appSource).not.toMatch(
+      /translateBackendValue\(\s*(?:selected\.)?(?:host_name|workspace|model|name|branch|worktree)/,
+    );
   });
 
   it("covers every seeded workflow stage in the dictionaries", () => {
