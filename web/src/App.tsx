@@ -9041,7 +9041,7 @@ function Activity({
                         !loginBackupDir.trim()
                       }
                     >
-                      Save profile
+                      {translate("saveProfile")}
                     </Button>
                     <Button
                       onClick={() =>
@@ -9061,7 +9061,7 @@ function Activity({
                       }
                       disabled={!accountId.trim() || !loginProfile}
                     >
-                      Backup
+                      {translate("backup")}
                     </Button>
                   </div>
                   {loginProfile ? (
@@ -9126,7 +9126,7 @@ function Activity({
                       !loginExpectedSignal.trim()
                     }
                   >
-                    Check login
+                    {translate("checkLogin")}
                   </Button>
                   <CollectionPage
                     search=""
@@ -9205,7 +9205,7 @@ function Activity({
                     }
                     disabled={!goalDescription.trim() || !selected}
                   >
-                    Create goal
+                    {translate("createGoal")}
                   </Button>
                 </div>
                 <CollectionPage
@@ -9245,7 +9245,7 @@ function Activity({
                                       .catch(onError)
                                   }
                                 >
-                                  plan now
+                                  {translate("planNow")}
                                 </button>
                               </small>
                             </span>
@@ -9291,7 +9291,7 @@ function Activity({
               <div className="rounded-xl2 border border-line bg-panel p-5">
                 {!selected ? (
                   <p className="empty-state">
-                    Select a session to load insights.
+                    {translate("selectSessionInsights")}
                   </p>
                 ) : (
                   <pre>{JSON.stringify(insights, null, 2)}</pre>
@@ -9343,7 +9343,7 @@ function Activity({
                             })
                             .catch(onError);
                         } catch {
-                          onError("Roles must be valid JSON.");
+                          onError(translate("rolesValidJson"));
                         }
                       }}
                     >
@@ -9424,7 +9424,7 @@ function Activity({
                           className="primary"
                           onClick={() => setTaskFormOpen(true)}
                         >
-                          New task
+                          {translate("newTaskAction")}
                         </Button>
                       }
                       rows={
@@ -9453,7 +9453,7 @@ function Activity({
                                         .catch(onError)
                                     }
                                   >
-                                    Claim
+                                    {translate("claim")}
                                   </Button>
                                   <Button
                                     className="bordered"
@@ -9467,7 +9467,7 @@ function Activity({
                                         .catch(onError)
                                     }
                                   >
-                                    Complete
+                                    {translate("complete")}
                                   </Button>
                                 </span>
                               </div>
@@ -9514,7 +9514,7 @@ function Activity({
                                     .catch(onError)
                                 }
                               >
-                                Create
+                                {translate("create")}
                               </Button>
                             </div>
                           </div>
@@ -9532,7 +9532,7 @@ function Activity({
                           className="primary"
                           onClick={() => setMessageFormOpen(true)}
                         >
-                          New message
+                          {translate("newMessage")}
                         </Button>
                       }
                       rows={
@@ -9562,7 +9562,7 @@ function Activity({
                         messageFormOpen ? (
                           <div className="rounded-xl2 border border-line bg-panel p-5">
                             <label className="field-label">
-                              Message envelope
+                              {translate("messageEnvelope")}
                             </label>
                             <textarea
                               value={message}
@@ -9587,11 +9587,11 @@ function Activity({
                                     })
                                     .catch(onError);
                                 } catch {
-                                  onError("Message must be valid JSON.");
+                                  onError(translate("validJson"));
                                 }
                               }}
                             >
-                              Send message
+                              {translate("sendMessage")}
                             </Button>
                           </div>
                         ) : undefined
@@ -9605,7 +9605,7 @@ function Activity({
                         className="primary"
                         onClick={() => setTaskFormOpen(true)}
                       >
-                        New task
+                        {translate("newTaskAction")}
                       </Button>
                     </div>
                     {taskFormOpen && (
@@ -9638,7 +9638,7 @@ function Activity({
                               .catch(onError)
                           }
                         >
-                          Create
+                              {translate("create")}
                         </Button>
                       </div>
                     )}
@@ -9662,7 +9662,7 @@ function Activity({
                                   .catch(onError)
                               }
                             >
-                              Claim
+                              {translate("claim")}
                             </Button>
                             <Button
                               className="bordered"
@@ -9676,14 +9676,14 @@ function Activity({
                                   .catch(onError)
                               }
                             >
-                              Complete
+                              {translate("complete")}
                             </Button>
                             <Button
                               className="bordered"
                               onClick={() => {
                                 if (!task.verified_pr_url && !task.pr) {
                                   onError(
-                                    "Cannot accept task without a verified PR URL.",
+                                    translate("verifiedPrRequired"),
                                   );
                                   return;
                                 }
@@ -9694,7 +9694,7 @@ function Activity({
                                   .catch(onError);
                               }}
                             >
-                              Accept
+                              {translate("accept")}
                             </Button>
                           </div>
                         </div>
@@ -9712,7 +9712,7 @@ function Activity({
                         className="primary"
                         onClick={() => setMessageFormOpen(true)}
                       >
-                        New message
+                        {translate("newMessage")}
                       </Button>
                     </div>
                     {messageFormOpen && (
@@ -9745,11 +9745,11 @@ function Activity({
                                 })
                                 .catch(onError);
                             } catch {
-                              onError("Message must be valid JSON.");
+                              onError(translate("validJson"));
                             }
                           }}
                         >
-                          Send message
+                          {translate("sendMessage")}
                         </Button>
                       </>
                     )}
