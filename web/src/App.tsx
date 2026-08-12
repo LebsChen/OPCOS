@@ -4270,7 +4270,7 @@ function ManageSections({
             {environmentTab === "blueprints" && (
               <section className="rounded-lg border border-line p-4 space-y-3">
                 <div>
-                  <strong>Blueprints</strong>
+                <strong>{translate("blueprints")}</strong>
                   <small className="block">
                     当前生效来源：
                     {blueprintStatus?.source === "project"
@@ -4294,7 +4294,7 @@ function ManageSections({
                       onChange={(event) =>
                         setBlueprintDraft(event.target.value)
                       }
-                      placeholder="YAML Blueprint"
+                      placeholder={translate("yamlBlueprint")}
                     />
                     <div className="flex justify-end gap-2">
                       <Button
@@ -4343,7 +4343,7 @@ function ManageSections({
             )}
             {environmentTab === "snapshots" && (
               <section className="rounded-lg border border-line p-4">
-                <strong>Snapshots</strong>
+                <strong>{translate("snapshots")}</strong>
                 <p className="mt-2 text-sm text-muted">
                   本产品不适用：Local/RVM
                   是长期固定环境，不提供快照，也不伪造等价的快照能力。
@@ -4353,7 +4353,7 @@ function ManageSections({
             {environmentTab === "advanced" && (
               <section className="rounded-lg border border-line p-4 space-y-3">
                 <div>
-                  <strong>Advanced · Repositories</strong>
+                  <strong>{translate("advancedRepositories")}</strong>
                   <small className="block">
                     setup executor 会按此列表顺序执行 clone 与 setup。
                   </small>
@@ -4365,7 +4365,7 @@ function ManageSections({
                   >
                     <input
                       value={item.repository}
-                      placeholder="仓库 URL"
+                      placeholder={translate("repositoryUrl")}
                       onChange={(event) =>
                         setEnvironmentRepositories((current) =>
                           current.map((entry, entryIndex) =>
@@ -4378,7 +4378,7 @@ function ManageSections({
                     />
                     <input
                       value={item.setup_command}
-                      placeholder="setup 命令（可留空）"
+                      placeholder={translate("setupCommand")}
                       onChange={(event) =>
                         setEnvironmentRepositories((current) =>
                           current.map((entry, entryIndex) =>
@@ -4470,14 +4470,16 @@ function ManageSections({
             )}
             {environmentTab === "outposts" && (
               <section className="rounded-lg border border-line p-4">
-                <strong>Outposts</strong>
+                <strong>{translate("outposts")}</strong>
                 <p className="mt-2 text-sm text-muted">
                   OPCOS 将 Outposts 映射为已登记的长期主机（Local/RVM）；
                   这里展示主机清单，不额外虚构独立 Outpost 资源。
                 </p>
                 <div className="mt-3 space-y-2">
                   {hosts.length === 0 ? (
-                    <div className="text-sm text-muted">暂无已登记主机</div>
+                    <div className="text-sm text-muted">
+                      {translate("noRegisteredHosts")}
+                    </div>
                   ) : (
                     hosts.map((host) => (
                       <div
@@ -4500,8 +4502,8 @@ function ManageSections({
           <div className="divide-y divide-line">
             <label className="settings-row">
               <div>
-                <strong>配置作用域</strong>
-                <small>项目设置覆盖全局设置；未选择项目时编辑全局设置。</small>
+                <strong>{translate("configurationScope")}</strong>
+                <small>{translate("configurationScopeDescription")}</small>
               </div>
               <SelectMenu
                 value={settingsProjectId || ""}
@@ -4517,8 +4519,8 @@ function ManageSections({
             </label>
             <div className="settings-row">
               <div>
-                <strong>Computer use</strong>
-                <small>关闭后不允许打开远程桌面和浏览器控制面。</small>
+                <strong>{translate("computerUse")}</strong>
+                <small>{translate("computerUseDescription")}</small>
               </div>
               <input
                 type="checkbox"
@@ -4541,7 +4543,7 @@ function ManageSections({
               <label className="settings-row" key={keyName}>
                 <div>
                   <strong>{label}</strong>
-                  <small>用于没有显式覆盖的新建会话。</small>
+                  <small>{translate("newSessionDefaults")}</small>
                 </div>
                 <input
                   value={agentSettings[keyName]}
@@ -4556,8 +4558,8 @@ function ManageSections({
             ))}
             <label className="settings-row">
               <div>
-                <strong>Batch limit</strong>
-                <small>一分钟内最多创建的会话数（1–500）。</small>
+                <strong>{translate("batchLimit")}</strong>
+                <small>{translate("batchLimitDescription")}</small>
               </div>
               <input
                 type="number"
@@ -4574,8 +4576,8 @@ function ManageSections({
             </label>
             <label className="settings-row">
               <div>
-                <strong>Message usage limit</strong>
-                <small>单条消息允许消耗的 token 数，0 表示不限制。</small>
+                <strong>{translate("messageUsageLimit")}</strong>
+                <small>{translate("messageUsageLimitDescription")}</small>
               </div>
               <input
                 type="number"
@@ -4599,7 +4601,7 @@ function ManageSections({
               <label className="settings-row" key={keyName}>
                 <div>
                   <strong>{label}</strong>
-                  <small>应用于后续 Pull request 工作流。</small>
+                  <small>{translate("pullRequestWorkflow")}</small>
                 </div>
                 <input
                   type="checkbox"
@@ -4615,8 +4617,8 @@ function ManageSections({
             ))}
             <label className="settings-row">
               <div>
-                <strong>Reviewer</strong>
-                <small>自动添加 reviewer 时使用的 GitHub 用户名。</small>
+                <strong>{translate("reviewer")}</strong>
+                <small>{translate("reviewerDescription")}</small>
               </div>
               <input
                 value={agentSettings.reviewer}
@@ -4630,8 +4632,8 @@ function ManageSections({
             </label>
             <label className="settings-row">
               <div>
-                <strong>Open PRs as</strong>
-                <small>创建 Pull request 时的初始状态。</small>
+                <strong>{translate("openPrsAs")}</strong>
+                <small>{translate("openPrsAsDescription")}</small>
               </div>
               <SelectMenu
                 value={agentSettings.open_prs_as}
@@ -4649,8 +4651,8 @@ function ManageSections({
             </label>
             <label className="settings-row">
               <div>
-                <strong>Responding to bots</strong>
-                <small>是否响应机器人触发的消息。</small>
+                <strong>{translate("respondingToBots")}</strong>
+                <small>{translate("respondingToBotsDescription")}</small>
               </div>
               <SelectMenu
                 value={agentSettings.responding_to_bots}
