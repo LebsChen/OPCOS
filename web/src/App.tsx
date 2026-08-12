@@ -8499,7 +8499,7 @@ function Activity({
       <div className="flex flex-1 min-w-0 min-h-0">
         <nav className="page-subnav w-[208px] shrink-0 border-r border-line bg-panel/40 px-3 py-4">
           <div className="px-2 text-[13.5px] font-semibold mb-3 flex items-center gap-2">
-            <Icon name="audit" size={16} /> Activity
+            <Icon name="audit" size={16} /> {translate("activity")}
           </div>
           {(
             [
@@ -8646,23 +8646,19 @@ function Activity({
                 {
                   (
                     {
-                      audit:
-                        "Review durable security and configuration events.",
-                      actions:
-                        "Review cross-session records of OPCOS external actions.",
-                      queue:
-                        "Review durable work items, retries, and dead-letter records.",
-                      events:
-                        "Review durable events, causal chains, and bounded effect rules.",
+                      audit: translate("reviewSecurityEvents"),
+                      actions: translate("reviewExternalActions"),
+                      queue: translate("reviewWorkQueue"),
+                      events: translate("reviewEventRules"),
                       goals:
                         "Define bounded autonomous goals and review planning rounds.",
                       board: "Start or observe the active coordination board.",
-                      roles: "Review board roles and their current state.",
+                      roles: translate("reviewRoles"),
                       tasks:
                         "Create, claim, complete, and verify coordination tasks.",
                       messages: "Send and review coordination messages.",
                       worklog: "Inspect the remote session worklog timeline.",
-                      insights: "Review cross-session activity insights.",
+                      insights: translate("reviewInsights"),
                     } as const
                   )[activityTab]
                 }
@@ -8692,7 +8688,7 @@ function Activity({
               <CollectionPage
                 search=""
                 onSearch={() => undefined}
-                searchPlaceholder="Filter audit events"
+                searchPlaceholder={translate("filterAudit")}
                 rows={
                   auditEvents.length ? (
                     <>
@@ -8710,14 +8706,14 @@ function Activity({
                     </>
                   ) : null
                 }
-                empty="No audit events recorded yet."
+                empty={translate("noAuditEvents")}
               />
             )}
             {activityTab === "actions" && (
               <CollectionPage
                 search=""
                 onSearch={() => undefined}
-                searchPlaceholder="Filter action history"
+                searchPlaceholder={translate("filterActionHistory")}
                 rows={
                   actionLedger.length ? (
                     <>
@@ -8742,14 +8738,14 @@ function Activity({
                     </>
                   ) : null
                 }
-                empty="No action ledger records yet."
+                empty={translate("noActionLedger")}
               />
             )}
             {activityTab === "queue" && (
               <CollectionPage
                 search=""
                 onSearch={() => undefined}
-                searchPlaceholder="Filter durable work queue"
+                searchPlaceholder={translate("filterWorkQueue")}
                 rows={
                   workQueue.length ? (
                     <>
@@ -8793,7 +8789,7 @@ function Activity({
                     </>
                   ) : null
                 }
-                empty="No durable work queue records yet."
+                empty={translate("noWorkQueue")}
               />
             )}
             {activityTab === "events" && (
@@ -8801,7 +8797,7 @@ function Activity({
                 <CollectionPage
                   search=""
                   onSearch={() => undefined}
-                  searchPlaceholder="Filter event stream"
+                  searchPlaceholder={translate("filterEventStream")}
                   rows={
                     events.length ? (
                       <>
@@ -8826,12 +8822,12 @@ function Activity({
                       </>
                     ) : null
                   }
-                  empty="No durable events yet."
+                  empty={translate("noEvents")}
                 />
                 <CollectionPage
                   search=""
                   onSearch={() => undefined}
-                  searchPlaceholder="Filter event rules"
+                  searchPlaceholder={translate("filterEventRules")}
                   rows={
                     eventRules.length ? (
                       <>
@@ -8876,7 +8872,7 @@ function Activity({
                       </>
                     ) : null
                   }
-                  empty="No event rules configured."
+                  empty={translate("noEventRules")}
                 />
               </div>
             )}
@@ -8965,7 +8961,7 @@ function Activity({
                   <CollectionPage
                     search=""
                     onSearch={() => undefined}
-                    searchPlaceholder="Filter bindings"
+                    searchPlaceholder={translate("filterBindings")}
                     rows={
                       accountBindings.length ? (
                         <>
@@ -8983,7 +8979,7 @@ function Activity({
                         </>
                       ) : null
                     }
-                    empty="No account host bindings."
+                    empty={translate("noBindings")}
                   />
                 </div>
                 <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
@@ -9118,7 +9114,7 @@ function Activity({
                   <CollectionPage
                     search=""
                     onSearch={() => undefined}
-                    searchPlaceholder="Filter login backups"
+                    searchPlaceholder={translate("filterLoginBackups")}
                     rows={
                       loginBackups.length ? (
                         <>
@@ -9152,7 +9148,7 @@ function Activity({
                         </>
                       ) : null
                     }
-                    empty="No login-state backups."
+                    empty={translate("noLoginBackups")}
                   />
                 </div>
                 <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
@@ -9198,7 +9194,7 @@ function Activity({
                 <CollectionPage
                   search=""
                   onSearch={() => undefined}
-                  searchPlaceholder="Filter goals"
+                  searchPlaceholder={translate("filterGoals")}
                   rows={
                     goals.length ? (
                       <>
@@ -9241,12 +9237,12 @@ function Activity({
                       </>
                     ) : null
                   }
-                  empty="No autonomous goals yet."
+                  empty={translate("noGoals")}
                 />
                 <CollectionPage
                   search=""
                   onSearch={() => undefined}
-                  searchPlaceholder="Filter planning rounds"
+                  searchPlaceholder={translate("filterPlanningRounds")}
                   rows={
                     planningHistory.length ? (
                       <>
@@ -9270,7 +9266,7 @@ function Activity({
                       </>
                     ) : null
                   }
-                  empty="No planning rounds yet."
+                  empty={translate("noPlanningRounds")}
                 />
               </div>
             )}
@@ -9544,7 +9540,7 @@ function Activity({
                           </>
                         ) : null
                       }
-                      empty="No coordination messages yet."
+                      empty={translate("noCoordinationMessages")}
                       form={
                         messageFormOpen ? (
                           <div className="rounded-xl2 border border-line bg-panel p-5">
