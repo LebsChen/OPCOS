@@ -10980,13 +10980,15 @@ function SessionRightPanel({
             <strong className="drawer-title">
               {tabs.find((item) => item.id === panelTab)?.label}
             </strong>
-            {running && <span className="live-pill">Live</span>}
+            {running && (
+              <span className="live-pill">{translate("live")}</span>
+            )}
             <div className="drawer-actions">
               {isWorkspaceTab && (
                 <button
                   className="drawer-action"
-                  title="放大（独立窗口打开）"
-                  aria-label="放大（独立窗口打开）"
+                  title={translate("enlargeWindow")}
+                  aria-label={translate("enlargeWindow")}
                   onClick={() => void openStandalonePane().catch(onError)}
                 >
                   <Icon name="windowOpen" />
@@ -11023,13 +11025,13 @@ function SessionRightPanel({
                   />
                   <Field k={translate("Model")} v={selected.model} />
                   <div className="field">
-                    <label>Provider</label>
+                    <label>{translate("provider")}</label>
                     <select
                       value={selected.provider || ""}
                       onChange={(event) => onProviderChange(event.target.value)}
-                      aria-label="Provider"
+                      aria-label={translate("provider")}
                     >
-                      <option value="">Global default</option>
+                      <option value="">{translate("globalDefault")}</option>
                       {providers.map((item) => (
                         <option
                           key={item.name}
@@ -11085,7 +11087,7 @@ function SessionRightPanel({
                         ))}
                     </dl>
                   ) : (
-                    <div className="muted">Loading insights…</div>
+                    <div className="muted">{translate("loading")}</div>
                   )}
                 </div>
               </div>
@@ -11204,7 +11206,7 @@ function SessionRightPanel({
         />
       )}
       <div className="icon-rail session-icon-rail">
-        <div className="rail-group" aria-label="Information">
+        <div className="rail-group" aria-label={translate("information")}>
           {informationTabs.map((item) => (
             <button
               key={item.id}
@@ -11217,7 +11219,7 @@ function SessionRightPanel({
           ))}
         </div>
         <div className="rail-sep" />
-        <div className="rail-group" aria-label="Workspace">
+        <div className="rail-group" aria-label={translate("workspace")}>
           {workspaceTabs.map((item) => (
             <button
               key={item.id}
@@ -11230,7 +11232,10 @@ function SessionRightPanel({
           ))}
         </div>
         <div className="rail-sep" />
-        <div className="rail-group" aria-label="Remote host capabilities">
+        <div
+          className="rail-group"
+          aria-label={translate("remoteCapabilities")}
+        >
           {remoteTabs.map((item) => (
             <button
               key={item.id}
@@ -11288,11 +11293,13 @@ function InboxPane({
   return (
     <div className="surface-panel p-4">
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-base font-semibold">Inbox</h2>
+        <h2 className="text-base font-semibold">{translate("inbox")}</h2>
         <span className="text-xs text-faint">{pending.length} pending</span>
       </div>
       <div className="space-y-3">
-        {pending.length === 0 && <div className="muted">No pending items.</div>}
+        {pending.length === 0 && (
+          <div className="muted">{translate("noPendingItems")}</div>
+        )}
         {pending.map((item) => (
           <div
             key={`${item.session_id}:${item.call_id}`}
