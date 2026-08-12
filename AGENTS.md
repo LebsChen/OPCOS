@@ -16,9 +16,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 2. RVM tokens are sent only in `Authorization: Bearer` headers, except for the
    remote IDE front-door bootstrap: the host requires `/ide/?tkn=...` and
    rejects bearer-only IDE requests with 403, so that sanctioned URL is used
-   only to obtain IDE cookies. All other `/api/*` calls, logs, errors,
-   transcripts, fixtures, and UI remain header-only and must never expose token
-   values.
+   only to obtain IDE cookies. Surface WebSockets (`/pty-ws`, `/vnc-ws`, and
+   `/cdp-ws`) are an additional explicit exception: direct webview connections
+   use `?token=...` as required by the host. All other `/api/*` calls, logs,
+   errors, transcripts, fixtures, and UI remain header-only and must never
+   expose token values.
 3. A unavailable remote host returns an explicit error; never silently fall back
    to local execution.
 4. Remote paths use remote path algebra and containment checks, never local

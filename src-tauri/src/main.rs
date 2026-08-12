@@ -123,7 +123,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_tungstenite::{
-    accept_async, accept_hdr_async, connect_async,
+    accept_hdr_async, connect_async,
     tungstenite::{
         Message as WsMessage,
         client::IntoClientRequest,
@@ -646,7 +646,6 @@ struct DesktopState {
     trigger_http_port: u16,
     trigger_watcher_reload: Mutex<Option<std_mpsc::Sender<()>>>,
     trigger_watcher_stop: Mutex<Option<std_mpsc::Sender<()>>>,
-    surfaces: AsyncMutex<HashMap<u16, SurfaceRuntime>>,
     coordination: Arc<AsyncMutex<HashMap<String, CoordinationRuntime>>>,
     index_root: PathBuf,
     artifact_root: PathBuf,
@@ -664,14 +663,6 @@ struct DesktopState {
     idle_sleep_shutdown: tokio::sync::watch::Sender<bool>,
     idle_sleep_task: Mutex<Option<tauri::async_runtime::JoinHandle<()>>>,
     mcp_leases: AsyncMutex<HashMap<String, HashSet<(String, String)>>>,
-}
-
-struct SurfaceRuntime {
-    session_id: String,
-    host_id: String,
-    kind: WsKind,
-    identity: Arc<()>,
-    task: tauri::async_runtime::JoinHandle<()>,
 }
 
 const CAPABILITY_RECHECK_INTERVAL: ChronoDuration = ChronoDuration::minutes(2);
@@ -761,28 +752,9 @@ async fn release_mcp_leases(state: &DesktopState, session_id: &str) {
     }
 }
 
-async fn release_session_runtime(state: &DesktopState, session_id: &str) -> Vec<Value> {
-    let surfaces = {
-        let mut surfaces = state.surfaces.lock().await;
-        surfaces
-            .extract_if(|_, surface| surface.session_id == session_id)
-            .map(|(_, surface)| {
-                surface.task.abort();
-                json!({"host_id": surface.host_id, "kind": format!("{:?}", surface.kind)})
-            })
-            .collect::<Vec<_>>()
-    };
+async fn release_session_runtime(state: &DesktopState, session_id: &str) {
     detach_session_runtime(state, session_id).await;
     release_mcp_leases(state, session_id).await;
-    if !surfaces.is_empty() {
-        audit(
-            state,
-            session_id,
-            "session_surfaces_stopped",
-            json!({"surfaces": surfaces}),
-        );
-    }
-    surfaces
 }
 
 fn session_can_idle_sleep(
@@ -845,7 +817,7 @@ async fn sleep_session_inner(
     if !session_can_idle_sleep(&session, &pending, has_active_turn) {
         return Ok(());
     }
-    let surfaces = release_session_runtime(state, session_id).await;
+    release_session_runtime(state, session_id).await;
     let now = Utc::now();
     state
         .store
@@ -856,7 +828,7 @@ async fn sleep_session_inner(
         app,
         "session-sleep",
         Some(session_id),
-        json!({"session_id": session_id, "surfaces": surfaces}),
+        json!({"session_id": session_id}),
     );
     Ok(())
 }
@@ -11243,99 +11215,6 @@ fn session_workspace(state: &DesktopState, session_id: &str) -> Result<Option<St
     Ok((!workspace.is_empty()).then_some(workspace))
 }
 
-fn surface_runtime_identity_is_current(current: &Arc<()>, candidate: &Arc<()>) -> bool {
-    Arc::ptr_eq(current, candidate)
-}
-
-async fn finish_surface(app: &tauri::AppHandle, port: u16, identity: &Arc<()>, reason: String) {
-    let Some(state) = app.try_state::<DesktopState>() else {
-        return;
-    };
-    let removed = {
-        let mut surfaces = state.surfaces.lock().await;
-        if surfaces
-            .get(&port)
-            .is_some_and(|surface| surface_runtime_identity_is_current(&surface.identity, identity))
-        {
-            surfaces.remove(&port)
-        } else {
-            None
-        }
-    };
-    let Some(surface) = removed else {
-        return;
-    };
-    emit(
-        app,
-        "surface-ended",
-        Some(&surface.session_id),
-        json!({
-            "port": port,
-            "surface": format!("{:?}", surface.kind),
-            "reason": reason,
-        }),
-    );
-}
-
-async fn relay_surface(
-    app: tauri::AppHandle,
-    port: u16,
-    identity: Arc<()>,
-    listener: TcpListener,
-    client: HttpRvmClient,
-    kind: WsKind,
-    params: WsParams,
-) {
-    let (stream, _) = match listener.accept().await {
-        Ok(value) => value,
-        Err(error) => {
-            finish_surface(&app, port, &identity, error.to_string()).await;
-            return;
-        }
-    };
-    let browser = match accept_async(stream).await {
-        Ok(value) => value,
-        Err(error) => {
-            finish_surface(&app, port, &identity, error.to_string()).await;
-            return;
-        }
-    };
-    let upstream = match client.open_ws(kind, params).await {
-        Ok(value) => value,
-        Err(error) => {
-            finish_surface(&app, port, &identity, error.to_string()).await;
-            return;
-        }
-    };
-    let (mut browser_write, mut browser_read) = browser.split();
-    let (mut upstream_write, mut upstream_read) = upstream.split();
-    let browser_to_upstream = async {
-        while let Some(Ok(message)) = browser_read.next().await {
-            if upstream_write.send(message).await.is_err() {
-                break;
-            }
-        }
-    };
-    let upstream_to_browser = async {
-        while let Some(Ok(message)) = upstream_read.next().await {
-            if browser_write.send(message).await.is_err() {
-                break;
-            }
-        }
-    };
-    tokio::select! {
-        _ = browser_to_upstream => {},
-        _ = upstream_to_browser => {},
-    }
-    finish_surface(
-        &app,
-        port,
-        &identity,
-        "Remote surface disconnected.".to_owned(),
-    )
-    .await;
-}
-
 fn effective_config_objects(
     connection: &Connection,
     workspace: &str,
@@ -13942,9 +13821,15 @@ fn delete_host(state: State<'_, DesktopState>, host_id: String) -> Result<(), St
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+struct SurfaceConnection {
+    url: String,
+    vnc_password: Option<String>,
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
-async fn start_surface(
+async fn surface_url(
     state: State<'_, DesktopState>,
     session_id: String,
     host_id: String,
@@ -13953,7 +13838,7 @@ async fn start_surface(
     rows: Option<u16>,
     cwd: Option<String>,
     project_id: Option<String>,
-) -> Result<u16, String> {
+) -> Result<SurfaceConnection, String> {
     wake_session_inner(&state, &session_id).await?;
     state
         .store
@@ -13978,43 +13863,22 @@ async fn start_surface(
         });
     }
     let client = client_for(&state, &host_id)?;
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
+    client.health().await.map_err(|error| error.to_string())?;
+    let url = client
+        .websocket_url(kind, WsParams { cols, rows, cwd })
         .map_err(|error| error.to_string())?;
-    let port = listener
-        .local_addr()
-        .map_err(|error| error.to_string())?
-        .port();
-    let params = WsParams { cols, rows, cwd };
-    let identity = Arc::new(());
-    let task = tauri::async_runtime::spawn(relay_surface(
-        state.mcp_notification_app.clone(),
-        port,
-        Arc::clone(&identity),
-        listener,
-        client,
-        kind,
-        params,
-    ));
-    state.surfaces.lock().await.insert(
-        port,
-        SurfaceRuntime {
-            session_id,
-            host_id,
-            kind,
-            identity,
-            task,
-        },
-    );
-    Ok(port)
-}
-
-#[tauri::command]
-async fn stop_surface(state: State<'_, DesktopState>, port: u16) -> Result<(), String> {
-    if let Some(surface) = state.surfaces.lock().await.remove(&port) {
-        surface.task.abort();
-    }
-    Ok(())
+    let vnc_password = if matches!(kind, WsKind::Vnc) {
+        state
+            .secrets
+            .get(&secret_key("rvm-vnc-password", &host_id))
+            .map_err(|error| error.to_string())?
+    } else {
+        None
+    };
+    Ok(SurfaceConnection {
+        url: url.to_string(),
+        vnc_password,
+    })
 }
 
 #[tauri::command]
@@ -29802,7 +29666,6 @@ fn main() {
                 acp_event_sessions: AsyncMutex::new(HashSet::new()),
                 acp_streams: Mutex::new(HashMap::new()),
                 trigger_runs: AsyncMutex::new(HashSet::new()),
-                surfaces: AsyncMutex::new(HashMap::new()),
                 coordination: Arc::clone(&coordination),
                 index_root: {
                     let mut root = path.clone();
@@ -30027,7 +29890,6 @@ fn main() {
             change_mode,
             restart_session_runtime,
             retry_session,
-            stop_surface,
             resolve_inbox,
             change_model,
             change_provider,
@@ -30176,7 +30038,7 @@ fn main() {
             save_connector_token,
             delete_provider_key,
             validate_provider_key,
-            start_surface,
+            surface_url,
             capture_remote_browser_frame,
             ide_url
         ])
@@ -30214,12 +30076,6 @@ fn main() {
                 {
                     task.abort();
                 }
-                tauri::async_runtime::block_on(async {
-                    let mut surfaces = state.surfaces.lock().await;
-                    for (_, surface) in surfaces.drain() {
-                        surface.task.abort();
-                    }
-                });
                 let mcp = Arc::clone(&state.mcp);
                 tauri::async_runtime::block_on(async move {
                     mcp.shutdown().await;
@@ -30231,14 +30087,6 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
-
-    #[test]
-    fn surface_runtime_identity_prevents_stale_cleanup() {
-        let current = Arc::new(());
-        let replacement = Arc::new(());
-        assert!(surface_runtime_identity_is_current(&current, &current));
-        assert!(!surface_runtime_identity_is_current(&current, &replacement));
-    }
 
     #[test]
     fn computer_use_arguments_accept_flat_nested_and_report_missing_action() {

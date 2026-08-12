@@ -134,13 +134,13 @@ export function shouldShowSurfaceReconnect(
 
 export function surfaceNeedsConnection(
   tab: SurfaceTab | "pr",
-  port: number | null,
+  connected: boolean,
   sleeping: boolean,
   failed = false,
 ): boolean {
   return (
     (tab === "terminal" || tab === "desktop" || tab === "browser") &&
-    port === null &&
+    !connected &&
     !sleeping &&
     !failed
   );
@@ -148,54 +148,38 @@ export function surfaceNeedsConnection(
 
 export function shouldRetrySurfaceStart({
   invalidated,
-  port,
+  connected,
   sleeping,
   tab,
   failed = false,
 }: {
   invalidated: boolean;
-  port: number | null;
+  connected: boolean;
   sleeping: boolean;
   tab: SurfaceTab | "pr";
   failed?: boolean;
 }): boolean {
-  return invalidated && surfaceNeedsConnection(tab, port, sleeping, failed);
+  return (
+    invalidated && surfaceNeedsConnection(tab, connected, sleeping, failed)
+  );
 }
 
 export function shouldShowSurfaceRetry({
-  port,
+  connected,
   sleeping,
   failed,
 }: {
-  port: number | null;
+  connected: boolean;
   sleeping: boolean;
   failed: boolean;
 }): boolean {
-  return !sleeping && failed && port === null;
+  return !sleeping && failed && !connected;
 }
 
 export function preserveSurfaceTabWhileSleeping(
   sleepState: string | undefined,
 ): boolean {
   return sleepState === "asleep";
-}
-
-export function surfaceLifecycleEventMatches({
-  eventSessionId,
-  eventPort,
-  currentSessionId,
-  currentPort,
-}: {
-  eventSessionId?: string;
-  eventPort: unknown;
-  currentSessionId: string;
-  currentPort: number | null;
-}): boolean {
-  return (
-    eventSessionId === currentSessionId &&
-    typeof eventPort === "number" &&
-    eventPort === currentPort
-  );
 }
 
 export type PendingQuestionData = {

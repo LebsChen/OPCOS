@@ -597,6 +597,49 @@ impl HttpRvmClient {
         self
     }
 
+    pub fn websocket_url(&self, kind: WsKind, params: WsParams) -> Result<Url, RvmError> {
+        self.websocket_url_inner(kind, params, true)
+    }
+
+    fn websocket_url_inner(
+        &self,
+        kind: WsKind,
+        params: WsParams,
+        include_token: bool,
+    ) -> Result<Url, RvmError> {
+        let path = match kind {
+            WsKind::Pty => "/pty-ws",
+            WsKind::Vnc => "/vnc-ws",
+            WsKind::Cdp => "/cdp-ws",
+        };
+        let mut url = self.config.base_url.clone();
+        url.set_scheme(match url.scheme() {
+            "https" => "wss",
+            _ => "ws",
+        })
+        .map_err(|_| RvmError::InvalidUrl)?;
+        url.set_path(path);
+        {
+            let mut pairs = url.query_pairs_mut();
+            if matches!(kind, WsKind::Pty) {
+                if let Some(cols) = params.cols {
+                    pairs.append_pair("cols", &cols.to_string());
+                }
+                if let Some(rows) = params.rows {
+                    pairs.append_pair("rows", &rows.to_string());
+                }
+                if let Some(cwd) = params.cwd {
+                    let cwd = self.remote_path(&cwd)?;
+                    pairs.append_pair("cwd", &cwd);
+                }
+            }
+            if include_token {
+                pairs.append_pair("token", &self.config.token);
+            }
+        }
+        Ok(url)
+    }
+
     pub async fn capture_cdp_screenshot(&self) -> Result<CdpScreenshot, RvmError> {
         let mut socket = self.open_ws(WsKind::Cdp, WsParams::default()).await?;
         let host = self
@@ -1168,33 +1211,7 @@ impl RvmClient for HttpRvmClient {
     }
 
     async fn open_ws(&self, kind: WsKind, params: WsParams) -> Result<RvmWebSocket, RvmError> {
-        let path = match kind {
-            WsKind::Pty => "/pty-ws",
-            WsKind::Vnc => "/vnc-ws",
-            WsKind::Cdp => "/cdp-ws",
-        };
-        let mut url = self.config.base_url.clone();
-        url.set_scheme(match url.scheme() {
-            "https" => "wss",
-            _ => "ws",
-        })
-        .map_err(|_| RvmError::InvalidUrl)?;
-        url.set_path(path);
-        {
-            let mut pairs = url.query_pairs_mut();
-            if matches!(kind, WsKind::Pty) {
-                if let Some(cols) = params.cols {
-                    pairs.append_pair("cols", &cols.to_string());
-                }
-                if let Some(rows) = params.rows {
-                    pairs.append_pair("rows", &rows.to_string());
-                }
-                if let Some(cwd) = params.cwd {
-                    let cwd = self.remote_path(&cwd)?;
-                    pairs.append_pair("cwd", &cwd);
-                }
-            }
-        }
+        let url = self.websocket_url_inner(kind, params, false)?;
         let mut request = url.as_str().into_client_request().map_err(|error| {
             RvmError::WebSocket(RvmError::redact(&error.to_string(), &self.config.token))
         })?;
@@ -1515,6 +1532,37 @@ mod tests {
                     "folder".into(),
                     "vscode-remote://linux.example.test/workspace".into()
                 )
+            ]
+        );
+    }
+
+    #[test]
+    fn websocket_url_uses_direct_surface_route_and_query_token() {
+        let client = HttpRvmClient::new(RvmClientConfig {
+            base_url: Url::parse("https://linux.example.test").unwrap(),
+            token: "test-token".into(),
+            request_timeout: Duration::from_secs(5),
+        })
+        .unwrap();
+        let url = client
+            .websocket_url(
+                WsKind::Pty,
+                WsParams {
+                    cols: Some(100),
+                    rows: Some(30),
+                    cwd: Some("/workspace/project".into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(url.scheme(), "wss");
+        assert_eq!(url.path(), "/pty-ws");
+        assert_eq!(
+            url.query_pairs().collect::<Vec<_>>(),
+            vec![
+                ("cols".into(), "100".into()),
+                ("rows".into(), "30".into()),
+                ("cwd".into(), "/workspace/project".into()),
+                ("token".into(), "test-token".into()),
             ]
         );
     }

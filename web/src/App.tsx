@@ -41,7 +41,6 @@ import {
   shouldShowSurfaceReconnect,
   shouldShowSurfaceRetry,
   preserveSurfaceTabWhileSleeping,
-  surfaceLifecycleEventMatches,
   surfaceNeedsConnection,
   type PendingQuestionData,
   reconcileSelectedIdAfterRefresh,
@@ -2529,8 +2528,8 @@ function SurfaceView({
 }) {
   const terminalHost = useRef<HTMLDivElement>(null);
   const vncHost = useRef<HTMLDivElement>(null);
-  const [port, setPort] = useState<number | null>(null);
-  const portRef = useRef<number | null>(null);
+  const [surfaceUrl, setSurfaceUrl] = useState("");
+  const surfaceUrlRef = useRef("");
   const surfaceGenerationRef = useRef(0);
   const [vncPassword, setVncPassword] = useState<string | null>(null);
   const [surfaceError, setSurfaceError] = useState("");
@@ -2591,7 +2590,10 @@ function SurfaceView({
       startInFlightRef.current = true;
       setBusy(true);
       clearSurfaceFailure();
-      const nextPort = await command<number>("start_surface", {
+      const connection = await command<{
+        url: string;
+        vnc_password: string | null;
+      }>("surface_url", {
         sessionId: selected.id,
         hostId: selected.host_id,
         surface,
@@ -2602,18 +2604,13 @@ function SurfaceView({
       });
       if (generation !== surfaceGenerationRef.current) {
         invalidated = true;
-        await command("stop_surface", { port: nextPort });
+        surfaceUrlRef.current = "";
+        setSurfaceUrl("");
         return;
       }
-      portRef.current = nextPort;
-      setPort(nextPort);
-      if (surface === "vnc") {
-        setVncPassword(
-          await command<string | null>("vnc_password", {
-            hostId: selected.host_id,
-          }),
-        );
-      }
+      surfaceUrlRef.current = connection.url;
+      setSurfaceUrl(connection.url);
+      setVncPassword(connection.vnc_password);
     } catch (error) {
       markSurfaceFailed(errorMessage(error));
       onError(error);
@@ -2623,7 +2620,7 @@ function SurfaceView({
       const retryRequested = invalidated || retryAfterStartRef.current;
       const shouldRetry = shouldRetrySurfaceStart({
         invalidated: retryRequested,
-        port: portRef.current,
+        connected: Boolean(surfaceUrlRef.current),
         sleeping: sleepingRef.current,
         tab: surfaceTabRef.current,
         failed: surfaceFailedRef.current,
@@ -2637,11 +2634,8 @@ function SurfaceView({
     selectedSleepStateRef.current = selected.sleep_state;
     if (shouldResetSurfaceForSleep(previousSleepState, selected.sleep_state)) {
       surfaceGenerationRef.current += 1;
-      const activePort = portRef.current;
-      portRef.current = null;
-      setPort(null);
-      if (activePort !== null)
-        void command("stop_surface", { port: activePort });
+      surfaceUrlRef.current = "";
+      setSurfaceUrl("");
       setSleeping(true);
       clearSurfaceFailure();
     } else if (!shouldShowSurfaceReconnect(selected.sleep_state) && sleeping) {
@@ -2650,50 +2644,14 @@ function SurfaceView({
     }
   }, [selected.sleep_state, sleeping]);
   useEffect(() => {
-    let cancelled = false;
-    const subscription = listen<UiEvent>("opcos://event", (event) => {
-      if (cancelled || event.payload.kind !== "surface-ended") return;
-      const surfacePayload = event.payload.payload as {
-        port?: unknown;
-        reason?: unknown;
-      };
-      const eventPort = surfacePayload.port;
-      if (
-        !surfaceLifecycleEventMatches({
-          eventSessionId: event.payload.session_id,
-          eventPort,
-          currentSessionId: selected.id,
-          currentPort: portRef.current,
-        })
-      )
-        return;
-      portRef.current = null;
-      setPort(null);
-      setBusy(false);
-      markSurfaceFailed(
-        typeof surfacePayload.reason === "string"
-          ? surfacePayload.reason
-          : translate("surfaceUnavailable"),
-      );
-    });
-    return () => {
-      cancelled = true;
-      void subscription.then((unlisten) => unlisten());
-    };
-  }, [selected.id]);
-  useEffect(() => {
     return () => {
       surfaceGenerationRef.current += 1;
-      const activePort = portRef.current;
-      portRef.current = null;
-      if (activePort !== null) {
-        void command("stop_surface", { port: activePort });
-      }
+      surfaceUrlRef.current = "";
     };
   }, [selected.id, tab]);
   useEffect(() => {
-    portRef.current = null;
-    setPort(null);
+    surfaceUrlRef.current = "";
+    setSurfaceUrl("");
     setVncPassword(null);
     surfaceFailedRef.current = false;
     setSurfaceFailed(false);
@@ -2711,12 +2669,11 @@ function SurfaceView({
     clearSurfaceFailure();
   }, [tab]);
   useEffect(() => {
-    if (tab === "terminal" || tab === "desktop" || tab === "browser") {
-      if (surfaceNeedsConnection(tab, port, sleeping, surfaceFailed)) {
-        void start(
-          tab === "terminal" ? "pty" : tab === "desktop" ? "vnc" : "cdp",
-        );
-      }
+    if (
+      (tab === "terminal" || tab === "desktop") &&
+      surfaceNeedsConnection(tab, Boolean(surfaceUrl), sleeping, surfaceFailed)
+    ) {
+      void start(tab === "terminal" ? "pty" : "vnc");
     } else if (tab === "ide" && !ideUrl && !ideError) {
       if (!selected.workspace) {
         setIdeError("Remote IDE workspace is not configured for this session.");
@@ -2740,7 +2697,7 @@ function SurfaceView({
     selected.host_id,
     selected.host_name,
     selected.workspace,
-    port,
+    surfaceUrl,
     ideUrl,
     ideError,
     sleeping,
@@ -2748,7 +2705,7 @@ function SurfaceView({
     surfaceRetryToken,
   ]);
   useEffect(() => {
-    if (tab !== "browser") return;
+    if (tab !== "browser" || sleeping) return;
     let cancelled = false;
     let timer: number | undefined;
     const poll = async () => {
@@ -2763,7 +2720,9 @@ function SurfaceView({
           if (!surfaceFailedRef.current) setSurfaceError("");
         }
       } catch (error) {
-        if (!cancelled) setSurfaceError(errorMessage(error));
+        if (!cancelled) {
+          markSurfaceFailed(errorMessage(error));
+        }
       }
       if (!cancelled) timer = window.setTimeout(() => void poll(), 1000);
     };
@@ -2772,16 +2731,16 @@ function SurfaceView({
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [tab, selected.id]);
+  }, [tab, selected.id, sleeping, surfaceRetryToken]);
   useEffect(() => {
-    if (tab !== "terminal" || !port || !terminalHost.current) return;
+    if (tab !== "terminal" || !surfaceUrl || !terminalHost.current) return;
     const terminal = new Terminal({
       convertEol: false,
       cursorBlink: true,
       theme: { background: "#11151d", foreground: "#d7dbe5" },
     });
     terminal.open(terminalHost.current);
-    const socket = new WebSocket(`ws://127.0.0.1:${port}`);
+    const socket = new WebSocket(surfaceUrl);
     socket.binaryType = "arraybuffer";
     const pending: Array<string | Uint8Array> = [];
     const send = (data: string | Uint8Array) => {
@@ -2789,8 +2748,17 @@ function SurfaceView({
       else pending.push(data);
     };
     socket.onopen = () => {
+      clearSurfaceFailure();
       while (pending.length) socket.send(pending.shift()!);
     };
+    const reportFailure = () => {
+      surfaceUrlRef.current = "";
+      setSurfaceUrl("");
+      if (!surfaceFailedRef.current)
+        markSurfaceFailed(translate("surfaceUnavailable"));
+    };
+    socket.onerror = reportFailure;
+    socket.onclose = reportFailure;
     socket.onmessage = (event) =>
       terminal.write(
         typeof event.data === "string"
@@ -2823,18 +2791,22 @@ function SurfaceView({
       socket.close();
       terminal.dispose();
     };
-  }, [selected.id, port, sleeping]);
+  }, [selected.id, surfaceUrl, sleeping]);
   useEffect(() => {
-    if (tab !== "desktop" || !port || !vncHost.current) return;
-    const rfb = new RFB(vncHost.current, `ws://127.0.0.1:${port}`, {
+    if (tab !== "desktop" || !surfaceUrl || !vncHost.current) return;
+    const rfb = new RFB(vncHost.current, surfaceUrl, {
       credentials: vncPassword ? { password: vncPassword } : undefined,
     });
     rfb.scaleViewport = true;
     let connected = false;
-    const report = (message: string) => setSurfaceError(message);
+    const report = (message: string) => {
+      surfaceUrlRef.current = "";
+      setSurfaceUrl("");
+      markSurfaceFailed(message);
+    };
     rfb.addEventListener("connect", () => {
       connected = true;
-      setSurfaceError("");
+      clearSurfaceFailure();
     });
     rfb.addEventListener("securityfailure", (event) => {
       report(
@@ -2869,14 +2841,22 @@ function SurfaceView({
       host?.removeEventListener("wheel", onUserInput);
       rfb.disconnect();
     };
-  }, [selected.id, port, tab, vncPassword, sleeping]);
-  const reconnect = () => {
-    setSleeping(false);
+  }, [selected.id, surfaceUrl, tab, vncPassword, sleeping]);
+  const reconnect = async () => {
     clearSurfaceFailure();
-    if (tab === "terminal" || tab === "desktop" || tab === "browser")
-      void start(
-        tab === "terminal" ? "pty" : tab === "desktop" ? "vnc" : "cdp",
-      );
+    if (tab === "browser") {
+      try {
+        await command("wake_session", { sessionId: selected.id });
+        setSleeping(false);
+        setSurfaceRetryToken((token) => token + 1);
+      } catch (error) {
+        markSurfaceFailed(errorMessage(error));
+        onError(error);
+      }
+      return;
+    }
+    setSleeping(false);
+    void start(tab === "terminal" ? "pty" : "vnc");
   };
   const retrySurface = () => {
     clearSurfaceFailure();
@@ -2896,10 +2876,14 @@ function SurfaceView({
             Connecting to the bound remote host…
           </div>
         )}
-        {surfaceError && (
+        {surfaceError && !sleeping && (
           <div className="surface-status error">{surfaceError}</div>
         )}
-        {shouldShowSurfaceRetry({ port, sleeping, failed: surfaceFailed }) && (
+        {shouldShowSurfaceRetry({
+          connected: Boolean(surfaceUrl),
+          sleeping,
+          failed: surfaceFailed,
+        }) && (
           <div className="surface-status warning">
             <p>{translate("surfaceUnavailable")}</p>
             <Button onClick={retrySurface}>{translate("retrySurface")}</Button>
@@ -2918,7 +2902,7 @@ function SurfaceView({
               <img
                 className="browser-preview-image"
                 src={`data:${browserFrame.mime};base64,${browserFrame.image}`}
-                alt={`Remote browser page ${browserFrame.target_url || ""}`}
+                alt="Remote browser page"
               />
             ) : (
               <div className="empty-surface">
@@ -2926,10 +2910,7 @@ function SurfaceView({
                 <p>Waiting for a remote browser page target…</p>
               </div>
             )}
-            <p className="surface-status muted">
-              CDP relay for an external client:{" "}
-              <code>ws://127.0.0.1:{port || "…"}</code>
-            </p>
+            <p className="surface-status muted">Remote browser preview (CDP)</p>
           </div>
         )}
       </div>
