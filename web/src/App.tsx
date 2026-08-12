@@ -2521,10 +2521,12 @@ function SurfaceView({
   tab,
   selected,
   onError,
+  visible = true,
 }: {
   tab: SurfaceTab | "pr";
   selected: Session;
   onError: (error: unknown) => void;
+  visible?: boolean;
 }) {
   const terminalHost = useRef<HTMLDivElement>(null);
   const vncHost = useRef<HTMLDivElement>(null);
@@ -2554,6 +2556,7 @@ function SurfaceView({
   const retryAfterStartRef = useRef(false);
   const sleepingRef = useRef(sleeping);
   const surfaceTabRef = useRef(tab);
+  const surfaceVisibleRef = useRef(visible);
   const [surfaceRetryToken, setSurfaceRetryToken] = useState(0);
   const markSurfaceFailed = (reason: string) => {
     surfaceFailedRef.current = true;
@@ -2568,6 +2571,7 @@ function SurfaceView({
   const lastTouchRef = useRef(0);
   sleepingRef.current = sleeping;
   surfaceTabRef.current = tab;
+  surfaceVisibleRef.current = visible;
   const touchSessionActivity = () => {
     const now = Date.now();
     if (
@@ -2624,6 +2628,7 @@ function SurfaceView({
         sleeping: sleepingRef.current,
         tab: surfaceTabRef.current,
         failed: surfaceFailedRef.current,
+        visible: surfaceVisibleRef.current,
       });
       retryAfterStartRef.current = false;
       if (shouldRetry) setSurfaceRetryToken((token) => token + 1);
@@ -2670,8 +2675,15 @@ function SurfaceView({
   }, [tab]);
   useEffect(() => {
     if (
+      visible &&
       (tab === "terminal" || tab === "desktop") &&
-      surfaceNeedsConnection(tab, Boolean(surfaceUrl), sleeping, surfaceFailed)
+      surfaceNeedsConnection(
+        tab,
+        Boolean(surfaceUrl),
+        sleeping,
+        surfaceFailed,
+        visible,
+      )
     ) {
       void start(tab === "terminal" ? "pty" : "vnc");
     } else if (tab === "ide" && !ideUrl && !ideError) {
@@ -2693,6 +2705,7 @@ function SurfaceView({
     }
   }, [
     tab,
+    visible,
     selected.id,
     selected.host_id,
     selected.host_name,
@@ -2705,7 +2718,7 @@ function SurfaceView({
     surfaceRetryToken,
   ]);
   useEffect(() => {
-    if (tab !== "browser" || sleeping) return;
+    if (tab !== "browser" || !visible || sleeping) return;
     let cancelled = false;
     let timer: number | undefined;
     const poll = async () => {
@@ -2734,9 +2747,10 @@ function SurfaceView({
       cancelled = true;
       if (timer !== undefined) window.clearTimeout(timer);
     };
-  }, [tab, selected.id, sleeping, surfaceRetryToken]);
+  }, [tab, selected.id, sleeping, surfaceRetryToken, visible]);
   useEffect(() => {
-    if (tab !== "terminal" || !surfaceUrl || !terminalHost.current) return;
+    if (!visible || tab !== "terminal" || !surfaceUrl || !terminalHost.current)
+      return;
     const terminal = new Terminal({
       convertEol: false,
       cursorBlink: true,
@@ -2795,11 +2809,16 @@ function SurfaceView({
       observer.disconnect();
       input.dispose();
       socket.close();
+      if (surfaceUrlRef.current === surfaceUrl) {
+        surfaceUrlRef.current = "";
+        setSurfaceUrl("");
+      }
       terminal.dispose();
     };
-  }, [selected.id, surfaceUrl, tab, sleeping]);
+  }, [selected.id, surfaceUrl, tab, sleeping, visible]);
   useEffect(() => {
-    if (tab !== "desktop" || !surfaceUrl || !vncHost.current) return;
+    if (!visible || tab !== "desktop" || !surfaceUrl || !vncHost.current)
+      return;
     const rfb = new RFB(vncHost.current, surfaceUrl, {
       credentials: vncPassword ? { password: vncPassword } : undefined,
     });
@@ -2849,8 +2868,12 @@ function SurfaceView({
       host?.removeEventListener("keydown", onUserInput);
       host?.removeEventListener("wheel", onUserInput);
       rfb.disconnect();
+      if (surfaceUrlRef.current === surfaceUrl) {
+        surfaceUrlRef.current = "";
+        setSurfaceUrl("");
+      }
     };
-  }, [selected.id, surfaceUrl, tab, vncPassword, sleeping]);
+  }, [selected.id, surfaceUrl, tab, vncPassword, sleeping, visible]);
   const reconnect = async () => {
     clearSurfaceFailure();
     if (tab === "browser") {
@@ -9783,6 +9806,7 @@ function StandalonePane({ route }: { route: PaneRoute }) {
               tab={route.tab as SurfaceTab | "pr"}
               selected={selected}
               onError={(reason) => setError(errorMessage(reason))}
+              visible
             />
           )}
       </div>
@@ -11033,13 +11057,19 @@ function SessionRightPanel({
                     tab="desktop"
                     selected={selected}
                     onError={onError}
+                    visible
                   />
                 )}
               </div>
             )}
             {opened.includes("ide") && panelTab === "ide" && (
               <div className="session-pane">
-                <SurfaceView tab="ide" selected={selected} onError={onError} />
+                <SurfaceView
+                  tab="ide"
+                  selected={selected}
+                  onError={onError}
+                  visible
+                />
               </div>
             )}
             {tabs
@@ -11073,6 +11103,7 @@ function SessionRightPanel({
                       tab={item.id as Exclude<SurfaceTab, "chat">}
                       selected={selected}
                       onError={onError}
+                      visible={panelTab === item.id}
                     />
                   )}
                 </div>

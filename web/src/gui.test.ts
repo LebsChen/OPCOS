@@ -50,6 +50,9 @@ describe("GUI boundary behavior", () => {
     expect(shouldShowSurfaceReconnect("asleep")).toBe(true);
     expect(shouldShowSurfaceReconnect("awake")).toBe(false);
     expect(surfaceNeedsConnection("terminal", false, false)).toBe(true);
+    expect(surfaceNeedsConnection("terminal", false, false, false, false)).toBe(
+      false,
+    );
     expect(surfaceNeedsConnection("terminal", true, false)).toBe(false);
     expect(surfaceNeedsConnection("terminal", false, true)).toBe(false);
     expect(surfaceNeedsConnection("terminal", false, false, true)).toBe(false);
@@ -430,7 +433,12 @@ describe("GUI boundary behavior", () => {
       '{opened.includes("ide") && panelTab === "ide" && (',
     );
     expect(source).toContain(
-      '<SurfaceView tab="ide" selected={selected} onError={onError} />',
+      `<SurfaceView
+                  tab="ide"
+                  selected={selected}
+                  onError={onError}
+                  visible
+                />`,
     );
     expect(source).not.toContain('<PlannedPane title="Desktop">');
     expect(source).not.toContain('<PlannedPane title="Editor">');
@@ -507,7 +515,13 @@ describe("GUI boundary behavior", () => {
     expect(source).toContain("new WebSocket(surfaceUrl)");
     expect(source).toContain("new RFB(vncHost.current, surfaceUrl");
     expect(source).toContain("intentionallyClosed = true");
-    expect(source).toContain("[selected.id, surfaceUrl, tab, sleeping]");
+    expect(source).toContain("visible={panelTab === item.id}");
+    expect(source).toContain(
+      "surfaceNeedsConnection(\n        tab,\n        Boolean(surfaceUrl),\n        sleeping,\n        surfaceFailed,\n        visible,",
+    );
+    expect(source).toContain(
+      'if (tab !== "browser" || !visible || sleeping) return;',
+    );
     expect(source).toContain('translate("surfaceDisconnected")');
     expect(source).toContain("!showSurfaceRetry");
     expect(source).toContain('command<string>("ide_url"');
@@ -567,7 +581,6 @@ describe("GUI boundary behavior", () => {
     expect(source).toContain("surfaceUnavailable");
     expect(source).toContain("retrySurface");
     expect(source).toContain("surfaceRetryToken");
-    expect(source).toContain("surfaceUnavailable");
     expect(source).toContain("if (!cancelled && !failed)");
     expect(source).toContain("!surfaceFailed");
     expect(source).toContain("preserveSurfaceTabWhileSleeping");

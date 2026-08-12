@@ -137,8 +137,10 @@ export function surfaceNeedsConnection(
   connected: boolean,
   sleeping: boolean,
   failed = false,
+  visible = true,
 ): boolean {
   return (
+    visible &&
     (tab === "terminal" || tab === "desktop" || tab === "browser") &&
     !connected &&
     !sleeping &&
@@ -152,15 +154,18 @@ export function shouldRetrySurfaceStart({
   sleeping,
   tab,
   failed = false,
+  visible = true,
 }: {
   invalidated: boolean;
   connected: boolean;
   sleeping: boolean;
   tab: SurfaceTab | "pr";
   failed?: boolean;
+  visible?: boolean;
 }): boolean {
   return (
-    invalidated && surfaceNeedsConnection(tab, connected, sleeping, failed)
+    invalidated &&
+    surfaceNeedsConnection(tab, connected, sleeping, failed, visible)
   );
 }
 
