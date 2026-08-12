@@ -6757,7 +6757,7 @@ function ManageSections({
               </p>
               <div className="form-grid mt-4">
                 <label className="field-label">
-                  Provider
+                  {translate("provider")}
                   <select
                     value={ingressProvider}
                     onChange={(event) =>
@@ -6785,7 +6785,7 @@ function ManageSections({
                   />
                 </label>
                 <label className="field-label">
-                  Poll interval
+                  {translate("pollInterval")}
                   <select
                     value={ingressInterval}
                     onChange={(event) => setIngressInterval(event.target.value)}
@@ -7081,7 +7081,7 @@ function ManageSections({
                       </div>
                       {connectorStatuses[openConnector]?.connected && (
                         <span className="status-success ml-auto">
-                          Connected
+                  {translate("connected")}
                         </span>
                       )}
                     </div>
@@ -7218,7 +7218,7 @@ function ManageSections({
               </p>
               <div className="form-grid mt-4">
                 <label className="field-label">
-                  Linear Personal API Key
+                  {translate("linearApiKeyLabel")}
                   <input
                     type="password"
                     value={linearPat}
@@ -7243,7 +7243,7 @@ function ManageSections({
                         .catch(onError)
                     }
                   >
-                    Save key
+                  {translate("saveKey")}
                   </Button>
                   <Button
                     className="bordered"
@@ -7264,7 +7264,7 @@ function ManageSections({
                         })
                     }
                   >
-                    Test connection
+                  {translate("testConnection")}
                   </Button>
                 </div>
               </div>
@@ -7272,7 +7272,7 @@ function ManageSections({
             </div>
             <div className="rounded-xl2 border border-line bg-panel p-5">
               <h3 className="text-[14px] font-semibold text-ink">
-                Issue tools
+                  {translate("issueTools")}
               </h3>
               <div className="flex gap-2 mt-3">
                 <input
@@ -7290,7 +7290,7 @@ function ManageSections({
                       .catch(onError)
                   }
                 >
-                  Read issue
+                    {translate("readIssue")}
                 </Button>
                 <Button
                   className="bordered"
@@ -7303,7 +7303,7 @@ function ManageSections({
                       .catch(onError)
                   }
                 >
-                  List mine
+                    {translate("listMine")}
                 </Button>
               </div>
               {linearIssue && (
@@ -7415,7 +7415,7 @@ function ManageSections({
                         />
                       </label>
                       <label className="field-label">
-                        Purpose
+                  {translate("purpose")}
                         <input
                           value={secretPurpose}
                           onChange={(event) =>
@@ -7424,7 +7424,7 @@ function ManageSections({
                         />
                       </label>
                       <label className="field-label">
-                        Value
+                  {translate("value")}
                         <input
                           type="password"
                           value={secretValue}
@@ -7457,7 +7457,7 @@ function ManageSections({
                           !secretValue
                         }
                       >
-                        Save secret
+                  {translate("saveSecret")}
                       </Button>
                     </div>
                   </div>
@@ -7510,7 +7510,7 @@ function ManageSections({
                   .catch(onError)
               }
             >
-              Read blueprint
+                  {translate("readBlueprint")}
             </Button>
             {blueprint && (
               <pre className="code-block">
@@ -7550,7 +7550,7 @@ function ManageSections({
                     .catch(onError)
                 }
               >
-                Run blueprint
+                  {translate("runBlueprint")}
               </Button>
             </div>
           </div>
@@ -7988,11 +7988,11 @@ function McpManage({
                               }).catch(onError)
                             }
                           >
-                            Authorize
+                              {translate("authorize")}
                           </Button>
                         )}
                         <Button onClick={() => loadServerCatalog(server)}>
-                          Resources / prompts
+                        {translate("resourcesPrompts")}
                         </Button>
                         <Button
                           onClick={() =>
@@ -8008,7 +8008,7 @@ function McpManage({
                               .catch(onError)
                           }
                         >
-                          Retry
+                            {translate("retry")}
                         </Button>
                       </div>
                     }
@@ -8073,7 +8073,7 @@ function McpManage({
                 <small>{mcpResourceSummary(resource)}</small>
                 <div className="inline-actions">
                   <Button onClick={() => previewResource(resource)}>
-                    Preview
+                        {translate("preview")}
                   </Button>
                   <Button
                     disabled={!selected}
@@ -8095,7 +8095,7 @@ function McpManage({
                         .catch(onError)
                     }
                   >
-                    Add to current context
+                        {translate("addCurrentContext")}
                   </Button>
                 </div>
               </div>
@@ -8149,7 +8149,7 @@ function McpManage({
                       .catch(onError)
                   }
                 >
-                  Load into composer
+                        {translate("loadComposer")}
                 </Button>
               </div>
             ))}
