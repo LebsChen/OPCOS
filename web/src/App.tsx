@@ -1371,7 +1371,7 @@ function ProjectConfigPanel({
       enabled &&
       template.modified &&
       !window.confirm(
-        `该项目配置「${template.name}」已本地修改。重新勾选将用模板当前内容覆盖本地修改，确定继续吗？`,
+        `${translate("locallyModified")}：${template.name}。${translate("confirmOverwriteTemplate")}`,
       )
     ) {
       return;
@@ -1379,7 +1379,7 @@ function ProjectConfigPanel({
     if (
       !enabled &&
       !window.confirm(
-        `将排除全局预设「${template.name}」在该项目中的生效，不会删除全局预设。确定继续吗？`,
+        `${translate("excludeGlobalPreset")}：${template.name}。`,
       )
     ) {
       return;
@@ -1400,16 +1400,18 @@ function ProjectConfigPanel({
     <section className="mt-8 rounded-xl border border-line bg-panel p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 className="text-lg font-semibold text-ink">项目配置</h2>
+          <h2 className="text-lg font-semibold text-ink">
+            {translate("projectConfig")}
+          </h2>
           <p className="mt-1 text-sm text-faint">
-            项目配置会继承到项目成员会话，全局配置仍可回退使用。
+            {translate("projectConfigDescription")}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
           {[
-            ["agents", "规则"],
-            ["experts", "专家"],
-            ["teams", "团队"],
+            ["agents", translate("rules")],
+            ["experts", translate("experts")],
+            ["teams", translate("teams")],
             ["command", "Command"],
             ["knowledge", "Knowledge"],
             ["playbook", "Playbook"],
@@ -1434,7 +1436,7 @@ function ProjectConfigPanel({
       <div className="mt-5 grid gap-3">
         <fieldset className="rounded-lg border border-line p-3">
           <legend className="px-1 text-sm font-medium">
-            全局预设（项目选择）
+            {translate("globalPresets")}
           </legend>
           <div className="grid gap-2">
             {configurationTemplates
@@ -1461,7 +1463,9 @@ function ProjectConfigPanel({
                   <label className="flex items-center gap-2 pt-1">
                     <input
                       type="checkbox"
-                      aria-label={`启用 ${template.name}`}
+                      aria-label={translate("enableTemplate", {
+                        name: template.name,
+                      })}
                       style={{ width: 16, height: 16 }}
                       checked={template.applied}
                       onChange={(event) =>
@@ -1478,9 +1482,13 @@ function ProjectConfigPanel({
                     </strong>
                     <small className="mt-1 block break-words text-faint">
                       {template.source} ·{" "}
-                      {template.overridden ? "项目已覆盖" : "继承自全局预设"}
-                      {template.modified ? " · 已本地修改" : ""}
-                      {template.overridden ? " · 可在下方编辑" : ""}
+                      {template.overridden
+                        ? translate("projectOverridden")
+                        : translate("inheritedGlobalPreset")}
+                      {template.modified
+                        ? ` · ${translate("locallyModified")}`
+                        : ""}
+                      {template.overridden ? ` · ${translate("editBelow")}` : ""}
                     </small>
                   </div>
                   <div className="flex shrink-0 gap-2">
@@ -1504,7 +1512,7 @@ function ProjectConfigPanel({
                           }
                         }}
                       >
-                        恢复继承
+                        {translate("restoreInheritance")}
                       </button>
                     )}
                     {!template.overridden && (
@@ -1521,7 +1529,7 @@ function ProjectConfigPanel({
                             .catch(onError);
                         }}
                       >
-                        创建项目覆盖
+                        {translate("createProjectOverride")}
                       </button>
                     )}
                   </div>
@@ -1541,7 +1549,11 @@ function ProjectConfigPanel({
                 blueprint: "blueprint",
               }[kind];
               return template.kind === selectedKind;
-            }) && <span className="text-xs text-faint">暂无可用配置模板</span>}
+            }) && (
+              <span className="text-xs text-faint">
+                {translate("noConfigTemplates")}
+              </span>
+            )}
           </div>
         </fieldset>
         {!["experts", "teams", "command"].includes(kind) &&
@@ -1567,7 +1579,7 @@ function ProjectConfigPanel({
                       setBody(asset.body);
                     }}
                   >
-                    编辑
+                    {translate("edit")}
                   </button>
                   <button
                     className="btn"
@@ -1577,7 +1589,7 @@ function ProjectConfigPanel({
                         .catch(onError)
                     }
                   >
-                    删除
+                    {translate("delete")}
                   </button>
                 </div>
               </div>
@@ -1585,32 +1597,34 @@ function ProjectConfigPanel({
         {!["experts", "teams", "command"].includes(kind) && (
           <div className="grid gap-3 rounded-lg border border-line p-4">
             <label className="field-label">
-              名称
+              {translate("name")}
               <input
                 value={title}
                 onChange={(event) => setTitle(event.target.value)}
-                placeholder="配置名称"
+                placeholder={translate("configureName")}
               />
             </label>
             <label className="field-label">
-              内容
+              {translate("body")}
               <textarea
                 value={body}
                 onChange={(event) => setBody(event.target.value)}
                 placeholder={
                   kind === "blueprint"
                     ? "clone:\n  - git fetch"
-                    : "项目级配置内容"
+                    : translate("projectConfigContent")
                 }
               />
             </label>
             <div>
               <button className="btn approval-primary" onClick={save}>
-                {editingId ? "保存更改" : "新增配置"}
+                {editingId
+                  ? translate("saveChanges")
+                  : translate("addConfig")}
               </button>
               {editingId && (
                 <button className="btn ml-2" onClick={reset}>
-                  取消编辑
+                  {translate("cancelEdit")}
                 </button>
               )}
             </div>
@@ -1620,16 +1634,18 @@ function ProjectConfigPanel({
       <div className="mt-6 border-t border-line pt-5">
         <div className="flex items-center justify-between">
           <div>
-            <h3 className="font-medium text-ink">项目 Secrets</h3>
+            <h3 className="font-medium text-ink">
+              {translate("projectSecrets")}
+            </h3>
             <p className="mt-1 text-xs text-faint">
-              项目 Secret 优先于全局同名 Secret，值不会显示。
+              {translate("projectSecretsDescription")}
             </p>
           </div>
           <button
             className="btn"
             onClick={() => setSecretFormOpen((value) => !value)}
           >
-            {secretFormOpen ? "取消" : "新增 Secret"}
+            {secretFormOpen ? translate("cancel") : translate("addSecret")}
           </button>
         </div>
         {secretFormOpen && (
@@ -1637,18 +1653,18 @@ function ProjectConfigPanel({
             <input
               value={secretName}
               onChange={(event) => setSecretName(event.target.value)}
-              placeholder="Secret 名称"
+              placeholder={translate("secretName")}
             />
             <input
               value={secretPurpose}
               onChange={(event) => setSecretPurpose(event.target.value)}
-              placeholder="用途"
+              placeholder={translate("purpose")}
             />
             <input
               type="password"
               value={secretValue}
               onChange={(event) => setSecretValue(event.target.value)}
-              placeholder="Secret 值"
+              placeholder={translate("secretValue")}
             />
             <button
               className="btn approval-primary"
@@ -1672,7 +1688,7 @@ function ProjectConfigPanel({
                   .catch(onError)
               }
             >
-              保存 Secret
+              {translate("saveSecret")}
             </button>
           </div>
         )}
@@ -1703,7 +1719,7 @@ function ProjectConfigPanel({
                       .catch(onError)
                   }
                 >
-                  删除
+                  {translate("delete")}
                 </button>
               )}
             </div>
@@ -1711,9 +1727,11 @@ function ProjectConfigPanel({
         </div>
       </div>
       <div className="mt-6 grid gap-3 border-t border-line pt-5">
-        <h3 className="font-medium text-ink">项目运行凭据</h3>
+        <h3 className="font-medium text-ink">
+          {translate("projectCredentials")}
+        </h3>
         <p className="text-xs text-faint">
-          凭据只显示输入状态，保存后按项目优先、全局回退读取。
+          {translate("credentialsInputOnly")}
         </p>
         <div className="grid gap-3 md:grid-cols-2">
           <div className="grid gap-2 rounded-lg border border-line p-3">
@@ -1742,7 +1760,7 @@ function ProjectConfigPanel({
                   .catch(onError)
               }
             >
-              保存 Provider key
+              {translate("saveProviderKey")}
             </button>
           </div>
           <div className="grid gap-2 rounded-lg border border-line p-3">
@@ -1771,7 +1789,7 @@ function ProjectConfigPanel({
                   .catch(onError)
               }
             >
-              保存 MCP credential
+              {translate("saveMcpCredential")}
             </button>
           </div>
           <div className="grid gap-2 rounded-lg border border-line p-3">
@@ -1800,7 +1818,7 @@ function ProjectConfigPanel({
                   .catch(onError)
               }
             >
-              保存 Connector token
+              {translate("saveConnectorToken")}
             </button>
           </div>
           <div className="grid gap-2 rounded-lg border border-line p-3">
