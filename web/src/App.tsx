@@ -7167,7 +7167,9 @@ function ManageSections({
                 )}
             </div>
             <div className="rounded-xl2 border border-line bg-panel p-5">
-              <h2 className="text-[15px] font-semibold text-ink">Linear</h2>
+              <h2 className="text-[15px] font-semibold text-ink">
+                {translate("linear")}
+              </h2>
               <p className="muted mt-1">
                 Direct GraphQL integration using a Personal API Key stored in
                 SecretStore. No OAuth callback or public listener is used.
@@ -7179,7 +7181,7 @@ function ManageSections({
                     type="password"
                     value={linearPat}
                     onChange={(event) => setLinearPat(event.target.value)}
-                    placeholder="lin_api_…"
+                    placeholder={translate("linearApiKey")}
                   />
                 </label>
                 <div className="flex gap-2 items-end">
@@ -7234,7 +7236,7 @@ function ManageSections({
                 <input
                   value={linearIssueId}
                   onChange={(event) => setLinearIssueId(event.target.value)}
-                  placeholder="Issue identifier, e.g. ENG-123"
+                  placeholder={translate("issueIdentifierExample")}
                 />
                 <Button
                   className="bordered"
@@ -7455,7 +7457,7 @@ function ManageSections({
         )}
         {tab === "blueprint" && (
           <div className="form-grid">
-            <h2>{translate("Remote blueprint")}</h2>
+            <h2>{translate("remoteBlueprint")}</h2>
             <Button
               onClick={() =>
                 selected &&
@@ -7476,7 +7478,7 @@ function ManageSections({
             <textarea
               value={blueprintCommand}
               onChange={(event) => setBlueprintCommand(event.target.value)}
-              placeholder="Run remote command"
+              placeholder={translate("runRemoteCommand")}
             />
             <div className="inline-actions">
               <Button
@@ -7789,8 +7791,14 @@ function McpManage({
     <>
       <section className="panel mb-4">
         <div className="flex items-center justify-between gap-2">
-          <h2>{editingServerId ? "Edit MCP server" : "Add MCP server"}</h2>
-          {editingServerId && <Button onClick={resetServerForm}>Cancel</Button>}
+          <h2>
+            {editingServerId
+              ? translate("editMcpServer")
+              : translate("addMcpServer")}
+          </h2>
+          {editingServerId && (
+            <Button onClick={resetServerForm}>{translate("cancel")}</Button>
+          )}
         </div>
         <div className="grid gap-2 md:grid-cols-2">
           <input
@@ -7806,9 +7814,9 @@ function McpManage({
               )
             }
           >
-            <option value="streamable-http">Streamable HTTP</option>
-            <option value="http-sse">HTTP + SSE</option>
-            <option value="stdio">stdio</option>
+            <option value="streamable-http">{translate("streamableHttp")}</option>
+            <option value="http-sse">{translate("httpSse")}</option>
+            <option value="stdio">{translate("stdio")}</option>
           </select>
           {serverTransport === "stdio" ? (
             <>
@@ -7820,13 +7828,13 @@ function McpManage({
               <textarea
                 value={serverArgs}
                 onChange={(event) => setServerArgs(event.target.value)}
-                placeholder="Arguments, one per line"
+                placeholder={translate("argumentsPerLine")}
                 rows={3}
               />
               <textarea
                 value={serverEnv}
                 onChange={(event) => setServerEnv(event.target.value)}
-                placeholder="Environment, KEY=VALUE per line"
+                placeholder={translate("environmentPerLine")}
                 rows={3}
               />
               <p className="text-xs text-slate-500 md:col-span-2">
