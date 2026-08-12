@@ -330,6 +330,7 @@ describe("i18n source coverage", () => {
         (match) => match[1],
       ),
     );
+    expect(backendFields.size).toBeGreaterThan(0);
     expect([...backendFields].filter((key) => !mappedFields.has(key))).toEqual(
       [],
     );
