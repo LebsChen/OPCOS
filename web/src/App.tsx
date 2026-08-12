@@ -4184,7 +4184,11 @@ function ManageSections({
       .catch(onError);
   }, [tab, settingsProjectId, selected, onError]);
   useEffect(() => {
-    void command<
+    void refreshProviderConfigurations();
+  }, []);
+
+  const refreshProviderConfigurations = async () => {
+    const configs = await command<
       Array<{
         provider: string;
         base_url?: string;
@@ -4192,19 +4196,16 @@ function ManageSections({
         model?: string;
         configured: boolean;
       }>
-    >("provider_configurations")
-      .then((configs) => {
-        setProviderConfigs(configs);
-        setProviderModels(
-          Object.fromEntries(
-            configs
-              .filter((config) => config.model)
-              .map((config) => [config.provider, config.model as string]),
-          ),
-        );
-      })
-      .catch(onError);
-  }, []);
+    >("provider_configurations");
+    setProviderConfigs(configs);
+    setProviderModels(
+      Object.fromEntries(
+        configs
+          .filter((config) => config.model)
+          .map((config) => [config.provider, config.model as string]),
+      ),
+    );
+  };
   useEffect(() => {
     if (!providers.length) return;
     void Promise.all(
@@ -5498,7 +5499,8 @@ function ManageSections({
                                 })
                               : undefined,
                           )
-                          .then(() => onRefresh());
+                          .then(() => onRefresh())
+                          .then(() => refreshProviderConfigurations());
                       })
                       .then(() => {
                         setCustomProviderKey("");
