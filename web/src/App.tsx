@@ -6743,11 +6743,10 @@ function ManageSections({
           <div className="space-y-5">
             <div className="rounded-xl2 border border-line bg-panel p-5">
               <h2 className="text-[15px] font-semibold text-ink">
-                External event sources
+                {translate("externalEventSources")}
               </h2>
               <p className="muted mt-1">
-                Sources are disabled when created. Polling never exposes a
-                public listener.
+                {translate("ingressDisabledNotice")}
               </p>
               <p className="muted mt-1">
                 GitHub repository events are best-effort polling: GitHub
@@ -6772,7 +6771,9 @@ function ManageSections({
                   </select>
                 </label>
                 <label className="field-label">
-                  {ingressProvider === "github" ? "Repository" : "Feed URL"}
+                  {ingressProvider === "github"
+                    ? translate("repository")
+                    : translate("feedUrl")}
                   <input
                     value={ingressTarget}
                     onChange={(event) => setIngressTarget(event.target.value)}
@@ -6829,7 +6830,9 @@ function ManageSections({
                         .catch(onError);
                     }}
                   >
-                    {editingIngressId ? "Save changes" : "Add source"}
+                    {editingIngressId
+                      ? translate("saveChanges")
+                      : translate("addSource")}
                   </Button>
                   {editingIngressId && (
                     <Button
@@ -6839,7 +6842,7 @@ function ManageSections({
                         setIngressTarget("");
                       }}
                     >
-                      Cancel
+                      {translate("cancel")}
                     </Button>
                   )}
                 </div>
@@ -6851,7 +6854,7 @@ function ManageSections({
             <div className="manage-list">
               {ingressSources.length === 0 && (
                 <div className="manage-card muted">
-                  No external event sources configured.
+                  {translate("noIngressSources")}
                 </div>
               )}
               {ingressSources.map((source) => {
@@ -6869,13 +6872,18 @@ function ManageSections({
                         {target}
                       </div>
                       <small>
-                        {source.enabled ? "Enabled" : "Disabled"} · last success{" "}
-                        {source.last_success_at || "never"} · failures{" "}
+                        {source.enabled
+                          ? translate("enabled")
+                          : translate("disabled")}{" "}
+                        · {translate("lastSuccess")}{" "}
+                        {source.last_success_at || translate("never")} ·{" "}
+                        {translate("failures")}{" "}
                         {source.consecutive_failures}
                       </small>
                       {circuitOpen && (
                         <div className="failure">
-                          Circuit open until {source.circuit_open_until}
+                          {translate("circuitOpenUntil")}{" "}
+                          {source.circuit_open_until}
                         </div>
                       )}
                       {source.last_error && (
@@ -6901,7 +6909,7 @@ function ManageSections({
                           setEditingIngressId(source.source_id);
                         }}
                       >
-                        Edit
+                        {translate("edit")}
                       </Button>
                       <Button
                         className="bordered"
@@ -6913,7 +6921,7 @@ function ManageSections({
                             .catch(onError)
                         }
                       >
-                        Poll now
+                        {translate("pollNow")}
                       </Button>
                       <Button
                         className={source.enabled ? "bordered" : "primary"}
@@ -6926,14 +6934,16 @@ function ManageSections({
                             .catch(onError)
                         }
                       >
-                        {source.enabled ? "Disable" : "Enable"}
+                        {source.enabled
+                          ? translate("disable")
+                          : translate("enable")}
                       </Button>
                       <Button
                         className="bordered"
                         onClick={() => {
                           if (
                             !window.confirm(
-                              "Delete this external event source?",
+                              translate("deleteIngressConfirm"),
                             )
                           )
                             return;
@@ -6944,7 +6954,7 @@ function ManageSections({
                             .catch(onError);
                         }}
                       >
-                        Delete
+                        {translate("delete")}
                       </Button>
                     </div>
                   </div>
@@ -6959,7 +6969,7 @@ function ManageSections({
               {!openConnector && (
                 <>
                   <h2 className="text-[15px] font-semibold text-ink">
-                    OpenWorker connector directory
+                    {translate("openWorkerDirectory")}
                   </h2>
                   <p className="muted mt-1">
                     Default connector catalog from OpenWorker. OPCOS only
@@ -7032,12 +7042,12 @@ function ManageSections({
                               }
                             >
                               {openConnector === connectorKind
-                                ? "Close"
-                                : "Configure"}
+                                ? translate("closeConnector")
+                                : translate("configure")}
                             </Button>
                           ) : !integrated ? (
                             <Button className="bordered" disabled>
-                              Unavailable
+                              {translate("unavailable")}
                             </Button>
                           ) : undefined
                         }
@@ -7054,7 +7064,7 @@ function ManageSections({
                         className="bordered"
                         onClick={() => setOpenConnector(null)}
                       >
-                        ‹ All connectors
+                        {translate("allConnectors")}
                       </Button>
                       <div>
                         <h3 className="text-[15px] font-semibold text-ink">
