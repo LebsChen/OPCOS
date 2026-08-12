@@ -1635,3 +1635,86 @@ directly (`new WebSocket(url)` / `new RFB(host, url)`). `start_surface`/`stop_su
   `CDP relay for an external client: ws://127.0.0.1:<port>` line is gone), and
   `grep -i token /tmp/opcos-*.log` must be empty. A fixture/stub access log containing
   `GET /pty-ws?...&token=...` is expected (that is the host side, not OPCOS UI/logs).
+
+## Frontend i18n verification (zh/en sweeps) — the `{label}` / camelCase leak pattern
+
+Language switching lives in **设置 → 通用 / Settings → General → 语言 / Language**; `setLocale()` writes
+`localStorage["opcos.locale"]` and notifies `subscribeLocale` listeners (`web/src/i18n.ts`). Locale
+survives a full app restart, so remember to reset it between runs or you will start a sweep in the
+wrong language.
+
+**Pick the right bundle first.** `OPCOS_DEV_URL` has no effect on a reused debug binary — the webview
+always connects to `http://localhost:1420`. With several worktrees around it is very easy to test the
+wrong branch. Always confirm before launching:
+
+```bash
+pid=$(ss -ltnp 2>/dev/null | grep ':1420' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+ls -l /proc/$pid/cwd            # must point at the worktree under test
+curl -s http://127.0.0.1:1420/src/i18n.ts | grep -c 'someKeyAddedByThisPR'
+```
+
+Grepping the *served* `src/i18n.ts` for a key the PR just added is the cheapest positive proof that the
+running UI is the branch you think it is.
+
+### The defect pattern that keeps recurring: dictionary keys leaking onto the screen
+
+Fixes usually replace display text with a dictionary key inside a static table, e.g.
+
+```tsx
+const tabs = [["blueprints", "blueprints"], ...];
+...
+{label}                 // BUG: renders the key
+{translate(label)}      // correct
+```
+
+Two consequences you must actively hunt for:
+
+1. **`translate(variable)` escapes the repo's own i18n unit test**, which only scans
+   `translate("literal")`. A green CI says nothing about these call sites. Pre-scan the diff with
+   `rg '\{(label|tab\.label|option\.label|category\.label)\}'` and treat every hit as a GUI target.
+2. **The visible symptom is a camelCase or all-lowercase English word** (`fullAccess`, `skills`,
+   `blueprints`, `sharePromptsInPrs`). This is far more dangerous than leftover English prose because
+   it reads like a normal English label and the eye skips it. **Sweep specifically for camelCase /
+   lowercase single words in the zh UI** — in zh, *any* lowercase English word on a control is almost
+   certainly a leaked key. Note that keys leak in **both** locales, so an en-only sweep will not find
+   them; and the fallback chain (`zh[key] → en[key] → key`) means a missing key silently degrades to
+   English before it degrades to the key itself.
+
+### Verifying "switch is instant": screenshot the frame, not the settled state
+
+Different components subscribe to locale independently (`SettingsView`, `Sidebar`, `AppContent`). A
+component that is *not* subscribed still updates a few seconds later via unrelated background polling,
+so **waiting before you screenshot will hide the bug**. Click the language option and take the
+screenshot in the *same* `computer` action batch with no `wait`, then assert that the global sidebar,
+the settings sub-nav and the body pane are all in one language in that single frame. Test both
+directions (zh→en and en→zh) and from more than one settings section.
+
+### Sweep checklist and scoping rules
+
+- Cover: 19 settings sections, sidebar (incl. the grouping `≡` menu and collapsed state), Composer
+  (collapsed permission chip **and** the expanded menu — the chip and the menu items are separate
+  render paths), the `+` menu, Transcript notices/banners, right-rail panel tabs, project configuration
+  tabs, and archive/delete confirm dialogs (good place to check `{name}` interpolation).
+- Genuine protocol/technical identifiers stay English by agreement: MCP, ACP, IDE, Token, CDP, VNC,
+  stdio, Outposts, Blueprint. Ordinary product words (Knowledge, Playbook, Environment, Skill) do not.
+  If a dictionary deliberately keeps an English zh value, check the project's `zhEnglishKeyAllowlist`
+  before filing it — it may be an intentional decision rather than a bug.
+- Chinese strings that persist in the **en** UI (`本机`, `内置 · v1`, `Rust/TypeScript 项目准则`,
+  `通用工程工作准则`) come from the Rust backend and seeded DB rows, not from `web/`. Report them as
+  out-of-scope for a frontend-only i18n PR.
+- Templated strings: confirm real values are substituted and no bare `{count}` / `{name}` / `{host}` /
+  `{destination}` / `{title}` / `{operation}` appears. When a template's parameter can be missing,
+  check that the whole line is suppressed rather than rendering an empty sentence or a bare
+  placeholder. Also watch for **double rendering** (`Switched to model Switched to model gpt-5.5`),
+  which happens when the parameter falls back to a field (`data.message`) that already holds the full
+  sentence.
+- Session status labels (`sessionStatus.ts`) are a good instant-switch probe because the label must
+  change in place with no reload. Triggering `running` / `idle` / `finished` needs a provider whose
+  model ids match the app's built-in list; on the usual gateway they return `model_not_found`, so
+  budget for marking those `untested` and cover the `error` label instead.
+
+### Devin secrets needed
+
+Nothing beyond the usual GUI bring-up. To cover `running` / `idle` / `finished` status labels you need
+a provider (`LLM_Baseurl` / `LLM_KEY`) that actually serves a model id present in the app's built-in
+model list; otherwise those states are not reachable.
