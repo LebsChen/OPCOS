@@ -271,6 +271,15 @@ const messages: Record<Locale, Record<string, string>> = {
     loadRemoteChanges: "Load the remote status and changes from the bound host.",
     gitWorkflowPullRequests: "Git workflow and pull requests",
     runOperation: "Run {operation}",
+    gitWorkflow: "Git workflow",
+    createGithubPr: "Create GitHub PR",
+    createPr: "Create PR",
+    githubSecretNotice:
+      "The configured GitHub secret is read only by Rust; it is never displayed.",
+    processPrComments: "Process GitHub PR comments",
+    fetchAndProcessComments: "Fetch and process comments",
+    botCommentNotice:
+      "Bot comments and comments that do not meet the agent mention policy are skipped; credentials are used only by Rust.",
     projectConfig: "Project configuration",
     projectConfigDescription:
       "Project configuration is inherited by project member sessions; global configuration remains available as a fallback.",
@@ -572,6 +581,15 @@ const messages: Record<Locale, Record<string, string>> = {
     loadRemoteChanges: "从绑定主机加载远程状态和变更。",
     gitWorkflowPullRequests: "Git 工作流与 Pull request",
     runOperation: "运行 {operation}",
+    gitWorkflow: "Git 工作流",
+    createGithubPr: "创建 GitHub PR",
+    createPr: "创建 PR",
+    githubSecretNotice:
+      "已配置的 GitHub Secret 仅由 Rust 读取，界面不会显示。",
+    processPrComments: "处理 GitHub PR 评论",
+    fetchAndProcessComments: "拉取并处理评论",
+    botCommentNotice:
+      "Bot 评论和未满足 Agent mention 策略的评论会被跳过；凭据只在 Rust 后端使用。",
     projectConfig: "项目配置",
     projectConfigDescription:
       "项目配置会继承到项目成员会话，全局配置仍可回退使用。",

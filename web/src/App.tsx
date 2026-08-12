@@ -3205,7 +3205,7 @@ function GitActions({
   const [lifecycleResult, setLifecycleResult] = useState<unknown>(null);
   return (
     <div className="git-actions">
-      <h3>{translate("Git workflow")}</h3>
+      <h3>{translate("gitWorkflow")}</h3>
       <SelectMenu
         value={operation}
         onChange={setOperation}
@@ -3244,7 +3244,7 @@ function GitActions({
         </pre>
       ) : null}
       <details>
-        <summary>{translate("Create GitHub PR")}</summary>
+        <summary>{translate("createGithubPr")}</summary>
         <input
           value={repo}
           onChange={(event) => setRepo(event.target.value)}
@@ -3268,17 +3268,16 @@ function GitActions({
             }).catch(onError)
           }
         >
-          Create PR
+          {translate("createPr")}
         </Button>
         <p className="muted small">
-          The configured GitHub secret is read only by Rust; it is never
-          displayed.
+          {translate("githubSecretNotice")}
         </p>
       </details>
       <CiMonitorPanel selected={selected} onError={onError} />
       <RunnerPanel selected={selected} onError={onError} />
       <details>
-        <summary>处理 GitHub PR 评论</summary>
+        <summary>{translate("processPrComments")}</summary>
         <input
           value={commentPrUrl}
           onChange={(event) => setCommentPrUrl(event.target.value)}
@@ -3295,11 +3294,10 @@ function GitActions({
               .catch(onError)
           }
         >
-          拉取并处理评论
+          {translate("fetchAndProcessComments")}
         </Button>
         <p className="muted small">
-          Bot 评论和未满足 agent mention 策略的评论会被跳过；凭据只在 Rust
-          后端使用。
+          {translate("botCommentNotice")}
         </p>
       </details>
     </div>
