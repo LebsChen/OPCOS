@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { messages } from "./i18n";
+import { backendValueKeys, messages } from "./i18n";
 
 const sourceRoot = fileURLToPath(new URL(".", import.meta.url));
 const allowlist = [
@@ -75,6 +75,7 @@ const zhEnglishKeyAllowlist = new Set([
   "secretsLabel",
   "worktree",
   "worktreeLabel",
+  "panelAgents",
   "artifactCount",
   "artifactsLabel",
   "tokens",
@@ -169,6 +170,11 @@ describe("i18n source coverage", () => {
     expect(appSource).not.toMatch(
       /tool\.enabled === true \? "Enabled" : "Disabled"/,
     );
+    expect(appSource).not.toMatch(
+      /label:\s*"(Changes|Progress|Tasks|Insights|Artifacts|Agents|Terminal|Desktop)"/,
+    );
+    expect(appSource).not.toMatch(/String\(server\.url \|\| "configured"\)/);
+    expect(appSource).not.toMatch(/` · Tasks: \$\{/);
   });
 
   it("maps backend status and enum values before rendering", () => {
@@ -186,6 +192,10 @@ describe("i18n source coverage", () => {
       /translateBackendValue\(\s*server\.status\s*\|\|\s*"configured"\s*,?\s*\)/,
     );
     expect(appSource).toMatch(/translateBackendValue\(workflow\.status\)/);
+    expect(appSource).toMatch(
+      /translateBackendValue\(projectAgentRosterHost\(session\)\)/,
+    );
+    expect(appSource).toMatch(/insightFieldLabel\(key\)/);
   });
 
   it("covers every seeded workflow stage in the dictionaries", () => {
@@ -199,8 +209,25 @@ describe("i18n source coverage", () => {
       ),
     );
     expect(stages.size).toBeGreaterThan(0);
-    expect([...stages].filter((stage) => !(stage in messages.en))).toEqual([]);
-    expect([...stages].filter((stage) => !(stage in messages.zh))).toEqual([]);
+    const missingMappings = [...stages].filter(
+      (stage) => !(stage.toLowerCase() in backendValueKeys),
+    );
+    expect(missingMappings).toEqual([]);
+    const missingEnglish = [...stages].filter((stage) => {
+      const key = backendValueKeys[stage.toLowerCase()];
+      return !key || !(key in messages.en);
+    });
+    const missingChinese = [...stages].filter((stage) => {
+      const key = backendValueKeys[stage.toLowerCase()];
+      return !key || !(key in messages.zh);
+    });
+    expect(missingEnglish).toEqual([]);
+    expect(missingChinese).toEqual([]);
+    expect(
+      Object.values(backendValueKeys).filter(
+        (key) => !(key in messages.en) || !(key in messages.zh),
+      ),
+    ).toEqual([]);
   });
 
   it("does not leave bare product copy in JSX text or visible attributes", () => {

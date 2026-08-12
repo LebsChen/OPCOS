@@ -7974,7 +7974,7 @@ function McpManage({
                     }}
                     description={
                       <>
-                        {`${String(server.transport || "remote")} · ${String(server.url || "configured")}`}
+                        {`${server.transport === "stdio" ? translate("stdio") : String(server.transport || "remote")} · ${server.url ? String(server.url) : translateBackendValue("configured")}`}
                         {server.last_error
                           ? ` · ${String(server.last_error)}`
                           : ""}
@@ -9982,6 +9982,17 @@ function StandalonePane({ route }: { route: PaneRoute }) {
   );
 }
 
+const insightFieldKeys: Record<string, string> = {
+  message_count: "messageCount",
+  tool_calls: "toolCalls",
+  duration_ms: "duration",
+};
+
+function insightFieldLabel(key: string): string {
+  const translationKey = insightFieldKeys[key];
+  return translationKey ? translate(translationKey) : key;
+}
+
 function StandaloneInsights({
   selected,
   onError,
@@ -10007,7 +10018,7 @@ function StandaloneInsights({
         .map(([key, value]) => (
           <Field
             key={key}
-            k={key}
+            k={insightFieldLabel(key)}
             v={typeof value === "string" ? value : JSON.stringify(value)}
           />
         ))}
@@ -10784,7 +10795,7 @@ function AgentRosterPane({
             · {translate("statusLabelInline")}{" "}
             {translateBackendValue(workflow.status)}
             {Array.isArray(workflow.tasks) &&
-              ` · Tasks: ${workflow.tasks.length}`}
+              ` · ${translate("tasksCount", { count: workflow.tasks.length })}`}
           </div>
         )}
         {rows.length === 0 ? (
@@ -10807,7 +10818,9 @@ function AgentRosterPane({
                     </div>
                     <div>
                       <dt>{translate("hostLabel")}</dt>
-                      <dd>{projectAgentRosterHost(session)}</dd>
+                      <dd>
+                        {translateBackendValue(projectAgentRosterHost(session))}
+                      </dd>
                     </div>
                     <div>
                       <dt>{translate("branchLabel")}</dt>
@@ -10998,13 +11011,13 @@ function SessionRightPanel({
   }> = [
     { id: "info", label: "Info", icon: "info" },
     { id: "shell", label: "Shell", icon: "terminal" },
-    { id: "changes", label: "Changes", icon: "diff" },
-    { id: "progress", label: "Progress", icon: "progress" },
-    { id: "tasks", label: "Tasks", icon: "tasks" },
-    { id: "agents", label: "Agents", icon: "agents" },
-    { id: "artifacts", label: translate("artifactsLabel"), icon: "file" },
+    { id: "changes", label: translate("changes"), icon: "diff" },
+    { id: "progress", label: translate("progress"), icon: "progress" },
+    { id: "tasks", label: translate("panelTasks"), icon: "tasks" },
+    { id: "agents", label: translate("panelAgents"), icon: "agents" },
+    { id: "artifacts", label: translate("panelArtifacts"), icon: "file" },
     { id: "pr", label: "PR", icon: "branch" },
-    { id: "insights", label: "Insights", icon: "sparkle" },
+    { id: "insights", label: translate("insights"), icon: "sparkle" },
   ];
   if (selected.host_id !== "local") {
     informationTabs.splice(3, 0, {
@@ -11031,7 +11044,7 @@ function SessionRightPanel({
       : [
           {
             id: "desktop" as const,
-            label: "Desktop",
+            label: translate("panelDesktop"),
             icon: "monitor" as const,
           },
         ]),
@@ -11048,7 +11061,7 @@ function SessionRightPanel({
       : [
           {
             id: "terminal" as const,
-            label: "Terminal",
+            label: translate("panelTerminal"),
             icon: "terminal" as const,
           },
         ]),
@@ -11209,7 +11222,9 @@ function SessionRightPanel({
                         .filter(([key]) => key !== "session_id")
                         .map(([key, value]) => (
                           <div key={key}>
-                            <dt className="text-muted">{key}</dt>
+                            <dt className="text-muted">
+                              {insightFieldLabel(key)}
+                            </dt>
                             <dd>
                               {typeof value === "string"
                                 ? value
