@@ -507,6 +507,9 @@ describe("GUI boundary behavior", () => {
     expect(source).toContain("new WebSocket(surfaceUrl)");
     expect(source).toContain("new RFB(vncHost.current, surfaceUrl");
     expect(source).toContain("intentionallyClosed = true");
+    expect(source).toContain("[selected.id, surfaceUrl, tab, sleeping]");
+    expect(source).toContain('translate("surfaceDisconnected")');
+    expect(source).toContain("!showSurfaceRetry");
     expect(source).toContain('command<string>("ide_url"');
     expect(source).toContain("Remote IDE workspace is not configured");
     expect(source).not.toContain(
@@ -566,6 +569,7 @@ describe("GUI boundary behavior", () => {
     expect(source).toContain("surfaceRetryToken");
     expect(source).toContain("surfaceUnavailable");
     expect(source).toContain("if (!cancelled && !failed)");
+    expect(source).toContain("!surfaceFailed");
     expect(source).toContain("preserveSurfaceTabWhileSleeping");
     expect(source).toContain("touchSessionActivity");
   });

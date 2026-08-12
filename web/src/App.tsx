@@ -2760,7 +2760,7 @@ function SurfaceView({
       surfaceUrlRef.current = "";
       setSurfaceUrl("");
       if (!surfaceFailedRef.current)
-        markSurfaceFailed(translate("surfaceUnavailable"));
+        markSurfaceFailed(translate("surfaceDisconnected"));
     };
     socket.onerror = reportFailure;
     socket.onclose = reportFailure;
@@ -2797,7 +2797,7 @@ function SurfaceView({
       socket.close();
       terminal.dispose();
     };
-  }, [selected.id, surfaceUrl, sleeping]);
+  }, [selected.id, surfaceUrl, tab, sleeping]);
   useEffect(() => {
     if (tab !== "desktop" || !surfaceUrl || !vncHost.current) return;
     const rfb = new RFB(vncHost.current, surfaceUrl, {
@@ -2871,6 +2871,11 @@ function SurfaceView({
     clearSurfaceFailure();
     setSurfaceRetryToken((token) => token + 1);
   };
+  const showSurfaceRetry = shouldShowSurfaceRetry({
+    connected: Boolean(surfaceUrl),
+    sleeping,
+    failed: surfaceFailed,
+  });
   if (tab === "terminal" || tab === "desktop" || tab === "browser")
     return (
       <div className="surface-panel">
@@ -2885,16 +2890,12 @@ function SurfaceView({
             Connecting to the bound remote host…
           </div>
         )}
-        {surfaceError && !sleeping && (
+        {surfaceError && !sleeping && !showSurfaceRetry && (
           <div className="surface-status error">{surfaceError}</div>
         )}
-        {shouldShowSurfaceRetry({
-          connected: Boolean(surfaceUrl),
-          sleeping,
-          failed: surfaceFailed,
-        }) && (
+        {showSurfaceRetry && (
           <div className="surface-status warning">
-            <p>{translate("surfaceUnavailable")}</p>
+            <p>{surfaceError || translate("surfaceUnavailable")}</p>
             <Button onClick={retrySurface}>{translate("retrySurface")}</Button>
           </div>
         )}
@@ -2913,12 +2914,12 @@ function SurfaceView({
                 src={`data:${browserFrame.mime};base64,${browserFrame.image}`}
                 alt="Remote browser page"
               />
-            ) : (
+            ) : !surfaceFailed ? (
               <div className="empty-surface">
                 <Icon name="image" size={32} />
                 <p>Waiting for a remote browser page target…</p>
               </div>
-            )}
+            ) : null}
             <p className="surface-status muted">Remote browser preview (CDP)</p>
           </div>
         )}
