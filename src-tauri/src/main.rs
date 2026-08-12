@@ -21,6 +21,7 @@ use opcos_engine::{
         run_computer_use_loop,
     },
     event_bus::{EventEffect, dispatch_event},
+    external_context_content_block,
     github::{GitHubInstance, GitHubRepoRef},
     login_state::{
         LoginStateBackupEvidence, LoginValidationExpectation, LoginValidationStatus,
@@ -15439,9 +15440,7 @@ async fn submit_engine_turn_with_coordination_ingest(
     recorded: bool,
 ) -> Result<(), EngineError> {
     if recorded {
-        engine
-            .submit_recorded_text_with_attachments(attachments)
-            .await?;
+        engine.submit_recorded_text(&attachments).await?;
     } else {
         engine
             .submit_text_with_attachments(text, attachments)
@@ -15601,18 +15600,7 @@ fn fail_submit_turn(
 
 fn accepted_user_message_content(text: &str, attachments: &[ExternalContextAttachment]) -> Value {
     let mut content = vec![json!({"type":"text","text":text})];
-    content.extend(attachments.iter().map(|attachment| {
-        json!({
-            "type": "text",
-            "text": format!(
-                "[MCP resource]\nsource: {}\nuri: {}\nmime: {}\n\n{}",
-                attachment.source,
-                attachment.uri.as_deref().unwrap_or("unknown"),
-                attachment.mime_type.as_deref().unwrap_or("unknown"),
-                attachment.content,
-            ),
-        })
-    }));
+    content.extend(attachments.iter().map(external_context_content_block));
     json!({"role":"user","content":content})
 }
 
@@ -16162,6 +16150,18 @@ pub(crate) async fn submit_turn_inner_with_context(
         &request.session_id,
         "turn_setup_waking_session",
     );
+    wake_session_inner(state, &request.session_id)
+        .await
+        .map_err(|error| {
+            fail_submit_turn_with_status(
+                &app,
+                state,
+                &request.session_id,
+                "harness_error",
+                "harness_error",
+                structured_ui_message("turn_setup_failed", json!({"detail": error})),
+            )
+        })?;
     wake_session_for_turn(&state.store, &request.session_id).map_err(|error| {
         fail_submit_turn_with_status(
             &app,
