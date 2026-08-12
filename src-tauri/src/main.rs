@@ -68,6 +68,7 @@ use std::io::{Cursor, Read, Write};
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::process::Command as ProcessCommand;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -648,6 +649,8 @@ struct DesktopState {
     trigger_http_port: u16,
     trigger_watcher_reload: Mutex<Option<std_mpsc::Sender<()>>>,
     trigger_watcher_stop: Mutex<Option<std_mpsc::Sender<()>>>,
+    surfaces: AsyncMutex<HashMap<(String, String), SurfaceLease>>,
+    ide_proxies: AsyncMutex<HashMap<String, IdeLease>>,
     coordination: Arc<AsyncMutex<HashMap<String, CoordinationRuntime>>>,
     index_root: PathBuf,
     artifact_root: PathBuf,
@@ -668,6 +671,95 @@ struct DesktopState {
 }
 
 const CAPABILITY_RECHECK_INTERVAL: ChronoDuration = ChronoDuration::minutes(2);
+const MAX_IDLE_DISCONNECTS_PER_TICK: usize = 8;
+
+struct SurfaceLease {
+    session_id: String,
+    lease_id: u64,
+}
+
+struct IdeLease {
+    session_id: String,
+    lease_id: u64,
+}
+
+static NEXT_RUNTIME_LEASE_ID: AtomicU64 = AtomicU64::new(1);
+
+async fn register_surface_lease(
+    leases: &AsyncMutex<HashMap<(String, String), SurfaceLease>>,
+    session_id: &str,
+    surface: &str,
+) -> u64 {
+    let lease_id = NEXT_RUNTIME_LEASE_ID.fetch_add(1, Ordering::Relaxed);
+    leases.lock().await.insert(
+        (session_id.to_owned(), surface.to_owned()),
+        SurfaceLease {
+            session_id: session_id.to_owned(),
+            lease_id,
+        },
+    );
+    lease_id
+}
+
+async fn release_surface_lease(
+    leases: &AsyncMutex<HashMap<(String, String), SurfaceLease>>,
+    session_id: &str,
+    surface: &str,
+    lease_id: u64,
+) {
+    let key = (session_id.to_owned(), surface.to_owned());
+    let mut leases = leases.lock().await;
+    if leases
+        .get(&key)
+        .is_some_and(|lease| lease.lease_id == lease_id)
+    {
+        leases.remove(&key);
+    }
+}
+
+async fn register_ide_lease(
+    leases: &AsyncMutex<HashMap<String, IdeLease>>,
+    session_id: &str,
+) -> u64 {
+    let lease_id = NEXT_RUNTIME_LEASE_ID.fetch_add(1, Ordering::Relaxed);
+    leases.lock().await.insert(
+        session_id.to_owned(),
+        IdeLease {
+            session_id: session_id.to_owned(),
+            lease_id,
+        },
+    );
+    lease_id
+}
+
+async fn release_ide_lease(
+    leases: &AsyncMutex<HashMap<String, IdeLease>>,
+    session_id: &str,
+    lease_id: u64,
+) {
+    let mut leases = leases.lock().await;
+    if leases
+        .get(session_id)
+        .is_some_and(|lease| lease.lease_id == lease_id)
+    {
+        leases.remove(session_id);
+    }
+}
+
+#[derive(Debug)]
+struct IdleTeardownError {
+    phase: &'static str,
+    detail: String,
+}
+
+impl IdleTeardownError {
+    fn new(phase: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            phase,
+            detail: detail.into(),
+        }
+    }
+}
 
 fn capability_recheck_due(observed_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
     observed_at.is_none_or(|observed_at| {
@@ -800,6 +892,61 @@ async fn wake_session_inner(state: &DesktopState, session_id: &str) -> Result<()
     Ok(())
 }
 
+async fn wake_session_runtime_inner(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<(), String> {
+    let was_asleep = session_for(state, session_id)?.sleep_state == "asleep";
+    wake_session_inner(state, session_id).await?;
+    if !was_asleep {
+        return Ok(());
+    }
+    if state.engines.lock().await.contains_key(session_id) {
+        state
+            .store
+            .mark_session_awake_idle(session_id, Utc::now())
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    if let Err(error) =
+        engine_for_with_context(app, state, session_id, ToolOrigin::User, None, None).await
+    {
+        release_session_runtime(state, session_id).await;
+        restore_sleeping_after_wake_failure(&state.store, session_id, &error)?;
+        emit(
+            app,
+            "notice",
+            Some(session_id),
+            json!({
+                "kind": "error",
+                "text": structured_ui_message(
+                    "wake_runtime_failed",
+                    json!({"detail": error}),
+                ),
+            }),
+        );
+        return Err(error);
+    }
+    state
+        .store
+        .mark_session_awake_idle(session_id, Utc::now())
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+fn restore_sleeping_after_wake_failure(
+    store: &SqliteStore,
+    session_id: &str,
+    error: &str,
+) -> Result<(), String> {
+    store
+        .mark_session_sleeping(session_id, Utc::now())
+        .map_err(|restore_error| {
+            format!("{error}; failed to restore sleeping state: {restore_error}")
+        })
+}
+
 async fn sleep_session_inner(
     app: &tauri::AppHandle,
     state: &DesktopState,
@@ -819,11 +966,30 @@ async fn sleep_session_inner(
     if !session_can_idle_sleep(&session, &pending, has_active_turn) {
         return Ok(());
     }
-    release_session_runtime(state, session_id).await;
+    if let Err(error) = teardown_idle_session_runtime(state, session_id).await {
+        let _ = state.store.append_audit(
+            session_id,
+            "idle_teardown_failed",
+            &json!({"phase": error.phase, "detail": error.detail}),
+        );
+        emit(
+            app,
+            "notice",
+            Some(session_id),
+            json!({
+                "kind": "warning",
+                "text": structured_ui_message(
+                    "idle_teardown_retrying",
+                    json!({"detail": error.detail}),
+                )
+            }),
+        );
+        return Err(format!("{}: {}", error.phase, error.detail));
+    }
     let now = Utc::now();
     state
         .store
-        .set_session_sleep_state(session_id, "asleep", now)
+        .mark_session_sleeping(session_id, now)
         .map_err(|error| error.to_string())?;
     audit(state, session_id, "session_sleep", json!({}));
     emit(
@@ -832,6 +998,59 @@ async fn sleep_session_inner(
         Some(session_id),
         json!({"session_id": session_id}),
     );
+    Ok(())
+}
+
+async fn teardown_idle_session_runtime(
+    state: &DesktopState,
+    session_id: &str,
+) -> Result<(), IdleTeardownError> {
+    let live_surface = state
+        .surfaces
+        .lock()
+        .await
+        .values()
+        .any(|runtime| runtime.session_id == session_id);
+    let live_ide = state
+        .ide_proxies
+        .lock()
+        .await
+        .values()
+        .any(|runtime| runtime.session_id == session_id);
+    idle_teardown_guard(live_surface, live_ide)?;
+
+    state
+        .surfaces
+        .lock()
+        .await
+        .retain(|_, lease| lease.session_id != session_id);
+    state
+        .ide_proxies
+        .lock()
+        .await
+        .retain(|_, lease| lease.session_id != session_id);
+
+    state.engines.lock().await.remove(session_id);
+    state.engine_capabilities.lock().await.remove(session_id);
+    state.engine_hosts.lock().await.remove(session_id);
+    state.acp_event_sessions.lock().await.remove(session_id);
+    state.acp_engines.lock().await.remove(session_id);
+    state
+        .acp_streams
+        .lock()
+        .map_err(|_| IdleTeardownError::new("acp_streams", "ACP stream state unavailable"))?
+        .remove(session_id);
+    release_mcp_leases(state, session_id).await;
+    Ok(())
+}
+
+fn idle_teardown_guard(live_surface: bool, live_ide: bool) -> Result<(), IdleTeardownError> {
+    if live_surface || live_ide {
+        return Err(IdleTeardownError::new(
+            "surface_guard",
+            "session has a live surface or IDE runtime",
+        ));
+    }
     Ok(())
 }
 
@@ -861,7 +1080,7 @@ async fn idle_sleep_loop(app: tauri::AppHandle, mut shutdown: tokio::sync::watch
                         continue;
                     }
                 };
-                for session in candidates {
+                for session in candidates.into_iter().take(MAX_IDLE_DISCONNECTS_PER_TICK) {
                     if let Err(error) = sleep_session_inner(&app, &state, &session.session_id).await {
                         eprintln!("session idle sleep failed for {}: {error}", session.session_id);
                     }
@@ -13937,6 +14156,7 @@ fn delete_host(state: State<'_, DesktopState>, host_id: String) -> Result<(), St
 struct SurfaceConnection {
     url: String,
     vnc_password: Option<String>,
+    lease_id: u64,
 }
 
 #[tauri::command]
@@ -13987,10 +14207,23 @@ async fn surface_url(
     } else {
         None
     };
+    let lease_id = register_surface_lease(&state.surfaces, &session_id, &surface).await;
     Ok(SurfaceConnection {
         url: url.to_string(),
         vnc_password,
+        lease_id,
     })
+}
+
+#[tauri::command]
+async fn release_surface_runtime(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    surface: String,
+    lease_id: u64,
+) -> Result<(), String> {
+    release_surface_lease(&state.surfaces, &session_id, &surface, lease_id).await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -14022,7 +14255,7 @@ async fn ide_url(
     state: State<'_, DesktopState>,
     session_id: String,
     folder_uri: String,
-) -> Result<String, String> {
+) -> Result<IdeConnection, String> {
     wake_session_inner(&state, &session_id).await?;
     state
         .store
@@ -14058,7 +14291,27 @@ async fn ide_url(
             .set_cookie(cookie)
             .map_err(|error| format!("Could not set remote IDE cookie: {error}"))?;
     }
-    Ok(url.to_string())
+    let lease_id = register_ide_lease(&state.ide_proxies, &session_id).await;
+    Ok(IdeConnection {
+        url: url.to_string(),
+        lease_id,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct IdeConnection {
+    url: String,
+    lease_id: u64,
+}
+
+#[tauri::command]
+async fn release_ide_runtime(
+    state: State<'_, DesktopState>,
+    session_id: String,
+    lease_id: u64,
+) -> Result<(), String> {
+    release_ide_lease(&state.ide_proxies, &session_id, lease_id).await;
+    Ok(())
 }
 
 #[tauri::command(rename = "create_session")]
@@ -15427,8 +15680,12 @@ async fn touch_session(state: State<'_, DesktopState>, session_id: String) -> Re
 }
 
 #[tauri::command]
-async fn wake_session(state: State<'_, DesktopState>, session_id: String) -> Result<(), String> {
-    wake_session_inner(&state, &session_id).await
+async fn wake_session(
+    app: tauri::AppHandle,
+    state: State<'_, DesktopState>,
+    session_id: String,
+) -> Result<(), String> {
+    wake_session_runtime_inner(&app, &state, &session_id).await
 }
 
 async fn submit_engine_turn_with_coordination_ingest(
@@ -30068,6 +30325,8 @@ fn main() {
                 trigger_http_port,
                 trigger_watcher_reload: Mutex::new(None),
                 trigger_watcher_stop: Mutex::new(None),
+                surfaces: AsyncMutex::new(HashMap::new()),
+                ide_proxies: AsyncMutex::new(HashMap::new()),
                 mcp: Arc::clone(&mcp),
                 mcp_projects: AsyncMutex::new(HashMap::new()),
                 mcp_notification_app: app.handle().clone(),
@@ -30257,6 +30516,8 @@ fn main() {
             submit_turn,
             touch_session,
             wake_session,
+            release_surface_runtime,
+            release_ide_runtime,
             list_artifacts,
             read_artifact,
             repo_index_status,
@@ -31401,6 +31662,122 @@ mod m7_tests {
         assert!(!session_can_idle_sleep(&session, &[], false));
         session.archived = false;
         assert!(session_can_idle_sleep(&session, &[], false));
+    }
+
+    #[tokio::test]
+    async fn surface_leases_replace_and_release_by_session_and_kind() {
+        let leases = AsyncMutex::new(HashMap::new());
+        let first_id = register_surface_lease(&leases, "session-a", "pty").await;
+        let second_id = register_surface_lease(&leases, "session-a", "pty").await;
+        assert_eq!(leases.lock().await.len(), 1);
+        release_surface_lease(&leases, "session-a", "pty", first_id).await;
+        assert_eq!(leases.lock().await.len(), 1);
+        release_surface_lease(&leases, "session-a", "pty", second_id).await;
+        assert!(leases.lock().await.is_empty());
+        assert!(
+            !leases
+                .lock()
+                .await
+                .values()
+                .any(|lease| lease.session_id == "session-a")
+        );
+        let store = SqliteStore::open_in_memory().unwrap();
+        wake_test_session(&store, "session-a", "builtin");
+        let session = store.load_session("session-a").unwrap().unwrap();
+        assert!(session_can_idle_sleep(&session, &[], false));
+    }
+
+    #[tokio::test]
+    async fn surface_leases_for_other_sessions_remain_independent() {
+        let leases = AsyncMutex::new(HashMap::new());
+        let session_a = register_surface_lease(&leases, "session-a", "vnc").await;
+        let session_b = register_surface_lease(&leases, "session-b", "vnc").await;
+        release_surface_lease(&leases, "session-a", "vnc", session_a).await;
+        let leases = leases.lock().await;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(
+            leases.values().next().map(|lease| lease.lease_id),
+            Some(session_b)
+        );
+    }
+
+    #[test]
+    fn wake_runtime_failure_restores_sleeping_state_without_error() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        wake_test_session(&store, "wake-failure", "builtin");
+        store
+            .mark_session_sleeping("wake-failure", Utc::now())
+            .unwrap();
+        let before = store.load_session("wake-failure").unwrap().unwrap();
+        assert_eq!(before.run_state, "sleeping");
+        assert_eq!(before.stop_reason, "idle_timeout");
+
+        restore_sleeping_after_wake_failure(&store, "wake-failure", "host unavailable").unwrap();
+
+        let after = store.load_session("wake-failure").unwrap().unwrap();
+        assert_eq!(after.run_state, "sleeping");
+        assert_eq!(after.stop_reason, "idle_timeout");
+        assert_eq!(after.sleep_state, "asleep");
+        assert_eq!(after.terminal_cause, None);
+    }
+
+    #[test]
+    fn idle_teardown_failure_preserves_session_status() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = SessionRecord {
+            session_id: "teardown-failure".into(),
+            workspace: "/workspace".into(),
+            model: "test".into(),
+            mode: "Auto".into(),
+            harness: "builtin".into(),
+            title: "Teardown failure".into(),
+            extra_roots: vec![],
+            grants: json!({}),
+            pinned: false,
+            archived: false,
+            origin: None,
+            origin_label: None,
+            compaction: json!({}),
+            host_id: "local".into(),
+            provider: None,
+            external_session_id: None,
+            run_state: "idle".into(),
+            stop_reason: "finished".into(),
+            terminal_cause: Some("completed".into()),
+            provider_finish_reason: Some("stop".into()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_active_at: Utc::now(),
+            sleep_state: "awake".into(),
+            slept_at: None,
+            project_id: None,
+            agent_id: None,
+        };
+        store.save_session(&session).unwrap();
+        let before = store.load_session(&session.session_id).unwrap().unwrap();
+        let error = idle_teardown_guard(true, false).unwrap_err();
+        assert_eq!(error.phase, "surface_guard");
+        let after = store.load_session(&session.session_id).unwrap().unwrap();
+        assert_eq!(
+            (
+                &before.run_state,
+                &before.stop_reason,
+                &before.terminal_cause,
+                &before.provider_finish_reason,
+                &before.sleep_state,
+                &before.slept_at,
+                before.archived,
+            ),
+            (
+                &after.run_state,
+                &after.stop_reason,
+                &after.terminal_cause,
+                &after.provider_finish_reason,
+                &after.sleep_state,
+                &after.slept_at,
+                after.archived,
+            )
+        );
     }
 
     #[tokio::test]

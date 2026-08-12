@@ -2593,12 +2593,22 @@ function SurfaceView({
   onError: (error: unknown) => void;
   visible?: boolean;
 }) {
+  const surfaceKindForTab = (value: SurfaceTab | "pr"): string | null =>
+    value === "terminal"
+      ? "pty"
+      : value === "desktop"
+        ? "vnc"
+        : value === "browser"
+          ? "cdp"
+          : null;
   const terminalHost = useRef<HTMLDivElement>(null);
   const vncHost = useRef<HTMLDivElement>(null);
   const [surfaceUrl, setSurfaceUrl] = useState("");
   const surfaceUrlRef = useRef("");
   const surfaceGenerationRef = useRef(0);
   const [vncPassword, setVncPassword] = useState<string | null>(null);
+  const surfaceLeaseIdRef = useRef<number | null>(null);
+  const surfaceLeaseKindRef = useRef<string | null>(null);
   const [surfaceError, setSurfaceError] = useState("");
   const [surfaceFailed, setSurfaceFailed] = useState(false);
   const surfaceFailedRef = useRef(false);
@@ -2609,6 +2619,7 @@ function SurfaceView({
     target_url: string;
   } | null>(null);
   const [ideUrl, setIdeUrl] = useState("");
+  const ideLeaseIdRef = useRef<number | null>(null);
   const [review, setReview] = useState<Record<string, unknown> | null>(null);
   const [diff, setDiff] = useState<Record<string, unknown> | null>(null);
   const [worklog, setWorklog] = useState<Record<string, unknown> | null>(null);
@@ -2662,6 +2673,7 @@ function SurfaceView({
       const connection = await command<{
         url: string;
         vnc_password: string | null;
+        lease_id: number;
       }>("surface_url", {
         sessionId: selected.id,
         hostId: selected.host_id,
@@ -2673,11 +2685,18 @@ function SurfaceView({
       });
       if (generation !== surfaceGenerationRef.current) {
         invalidated = true;
+        void command("release_surface_runtime", {
+          sessionId: selected.id,
+          surface,
+          leaseId: connection.lease_id,
+        });
         surfaceUrlRef.current = "";
         setSurfaceUrl("");
         return;
       }
       surfaceUrlRef.current = connection.url;
+      surfaceLeaseIdRef.current = connection.lease_id;
+      surfaceLeaseKindRef.current = surface;
       setSurfaceUrl(connection.url);
       setVncPassword(connection.vnc_password);
     } catch (error) {
@@ -2717,8 +2736,55 @@ function SurfaceView({
     return () => {
       surfaceGenerationRef.current += 1;
       surfaceUrlRef.current = "";
+      if (surfaceLeaseIdRef.current !== null) {
+        void command("release_surface_runtime", {
+          sessionId: selected.id,
+          surface: surfaceLeaseKindRef.current ?? surfaceKindForTab(tab),
+          leaseId: surfaceLeaseIdRef.current,
+        });
+        surfaceLeaseIdRef.current = null;
+        surfaceLeaseKindRef.current = null;
+      }
+      if (ideLeaseIdRef.current !== null) {
+        void command("release_ide_runtime", {
+          sessionId: selected.id,
+          leaseId: ideLeaseIdRef.current,
+        });
+        ideLeaseIdRef.current = null;
+      }
     };
   }, [selected.id, tab]);
+  useEffect(() => {
+    const leaseId = surfaceLeaseIdRef.current;
+    const surface = surfaceLeaseKindRef.current ?? surfaceKindForTab(tab);
+    return () => {
+      if (leaseId !== null && surface !== null) {
+        void command("release_surface_runtime", {
+          sessionId: selected.id,
+          surface,
+          leaseId,
+        });
+        if (surfaceLeaseIdRef.current === leaseId) {
+          surfaceLeaseIdRef.current = null;
+          surfaceLeaseKindRef.current = null;
+        }
+      }
+    };
+  }, [surfaceUrl, selected.id, tab]);
+  useEffect(() => {
+    const leaseId = ideLeaseIdRef.current;
+    return () => {
+      if (leaseId !== null) {
+        void command("release_ide_runtime", {
+          sessionId: selected.id,
+          leaseId,
+        });
+        if (ideLeaseIdRef.current === leaseId) {
+          ideLeaseIdRef.current = null;
+        }
+      }
+    };
+  }, [ideUrl, selected.id, tab]);
   useEffect(() => {
     surfaceUrlRef.current = "";
     setSurfaceUrl("");
@@ -2757,11 +2823,14 @@ function SurfaceView({
         return;
       }
       setBusy(true);
-      void command<string>("ide_url", {
+      void command<{ url: string; lease_id: number }>("ide_url", {
         sessionId: selected.id,
         folderUri: selected.workspace,
       })
-        .then(setIdeUrl)
+        .then((connection) => {
+          ideLeaseIdRef.current = connection.lease_id;
+          setIdeUrl(connection.url);
+        })
         .catch((error) => {
           setIdeError(errorMessage(error));
           onError(error);
