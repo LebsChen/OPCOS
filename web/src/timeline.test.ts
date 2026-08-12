@@ -32,10 +32,12 @@ describe("single event-log timeline", () => {
     try {
       const codes = [
         "turn_interrupted",
-        "turn_finished",
         "approval_request_sent_to_inbox",
         "approval_tool_action_requires",
         "approval_required_before_tool_continue",
+        "question_requires_answer_before_tool_continue",
+        "question_delivered_to_inbox",
+        "plan_confirmation_delivered_to_inbox",
         "coordination_worker_approval_required",
         'model_switch {"model":"custom-model"}',
         'provider_request_failed {"detail":"upstream overloaded"}',
@@ -64,6 +66,24 @@ describe("single event-log timeline", () => {
     } finally {
       setLocale(previousLocale);
     }
+  });
+
+  it("passes free-text notices through without key lookup", () => {
+    const messages = ["open", "command", "error"];
+    const nodes = buildTimeline(
+      messages.map((message, index) => ({
+        type: "error",
+        event_id: `free-text-${index}`,
+        created_at_ms: index + 1,
+        working_event: {
+          event_type: "error",
+          payload: { message },
+        },
+      })) as TimelineEvent[],
+    );
+    expect(
+      nodes.filter((node) => node.kind === "notice").map((node) => node.text),
+    ).toEqual(messages);
   });
 
   it("keeps provider notice and toast localized in the zh locale", () => {

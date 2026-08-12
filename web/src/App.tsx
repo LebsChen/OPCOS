@@ -12059,9 +12059,7 @@ function AppContent() {
     const message = errorMessage(reason);
     if (
       message.includes(translate("approvalRequiredBeforeToolContinue")) ||
-      message.includes(
-        "Question requires an answer before this tool can continue",
-      )
+      message.includes(translate("questionRequiresAnswerBeforeToolContinue"))
     )
       return;
     if (!runtime && /invoke|tauri/i.test(message)) return;

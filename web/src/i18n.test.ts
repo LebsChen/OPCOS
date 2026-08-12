@@ -67,10 +67,12 @@ describe("structured backend UI messages", () => {
         "provider_waiting_cleared",
         "turn_interrupted",
         'model_switch {"model":"custom-model"}',
-        "turn_finished",
         "approval_request_sent_to_inbox",
         "approval_tool_action_requires",
         "approval_required_before_tool_continue",
+        "question_requires_answer_before_tool_continue",
+        "question_delivered_to_inbox",
+        "plan_confirmation_delivered_to_inbox",
         "coordination_worker_approval_required",
       ];
       for (const value of messages) {
@@ -91,6 +93,9 @@ describe("structured backend UI messages", () => {
       expect(
         translateBackendError('future_backend_code {"detail":"raw"}'),
       ).toBe('future_backend_code {"detail":"raw"}');
+      for (const text of ["open", "command", "error"]) {
+        expect(translateBackendError(text)).toBe(text);
+      }
     } finally {
       setLocale(previousLocale);
     }

@@ -6979,7 +6979,7 @@ fn emit_pending_approval_for(
         json!({
             "kind": if is_question { "question_pending" } else { "approval_pending" },
             "text": if is_question {
-                "Question requires an answer before this tool can continue".to_owned()
+                structured_ui_message("question_requires_answer_before_tool_continue", json!({}))
             } else {
                 structured_ui_message("approval_required_before_tool_continue", json!({}))
             }
@@ -16137,9 +16137,9 @@ pub(crate) async fn submit_turn_inner_with_context(
                     json!({
                         "kind": pending_kind,
                         "text": if pending_kind == "question" {
-                            "Question delivered to Inbox".to_owned()
+                            structured_ui_message("question_delivered_to_inbox", json!({}))
                         } else if pending_kind == "plan" {
-                            "Plan confirmation delivered to Inbox".to_owned()
+                            structured_ui_message("plan_confirmation_delivered_to_inbox", json!({}))
                         } else {
                             structured_ui_message("approval_delivered_to_inbox", json!({}))
                         }
@@ -16188,7 +16188,7 @@ pub(crate) async fn submit_turn_inner_with_context(
                 }
             }
             let message = if pending_kind == "question" {
-                "Question requires an answer before this tool can continue".to_owned()
+                structured_ui_message("question_requires_answer_before_tool_continue", json!({}))
             } else {
                 structured_ui_message("approval_required_before_tool_continue", json!({}))
             };

@@ -1052,6 +1052,11 @@ export const messages: Record<Locale, Record<string, string>> = {
     approvalToolActionRequires: "Tool action requires approval",
     approvalRequiredBeforeToolContinue:
       "Approval required before this tool can continue",
+    questionRequiresAnswerBeforeToolContinue:
+      "Question requires an answer before this tool can continue",
+    questionDeliveredToInbox: "Question delivered to the Inbox",
+    planConfirmationDeliveredToInbox:
+      "Plan confirmation delivered to the Inbox",
     coordinationWorkerApprovalRequired:
       "A dispatched Worker needs approval; open the Inbox to continue.",
     providerKeyNotConfigured:
@@ -2186,6 +2191,9 @@ export const messages: Record<Locale, Record<string, string>> = {
     approvalDeliveredToInbox: "需要审批；已发送到收件箱",
     approvalToolActionRequires: "工具操作需要审批",
     approvalRequiredBeforeToolContinue: "继续此工具前需要审批",
+    questionRequiresAnswerBeforeToolContinue: "继续此工具前需要回答问题",
+    questionDeliveredToInbox: "问题已发送到收件箱",
+    planConfirmationDeliveredToInbox: "计划确认已发送到收件箱",
     coordinationWorkerApprovalRequired:
       "已调度的工作单元需要审批；请打开收件箱继续。",
     providerKeyNotConfigured: "未配置提供商密钥；请先打开提供商设置。",
@@ -2401,22 +2409,26 @@ const backendErrorKeys: Record<string, string> = {
   provider_waiting: "providerWaiting",
   provider_waiting_cleared: "providerWaitingCleared",
   turn_interrupted: "turnInterrupted",
-  turn_finished: "turnFinished",
   model_switch: "switchedToModel",
   approval_request_sent_to_inbox: "approvalRequestSentToInbox",
   approval_delivered_to_inbox: "approvalDeliveredToInbox",
   approval_tool_action_requires: "approvalToolActionRequires",
   approval_required_before_tool_continue: "approvalRequiredBeforeToolContinue",
+  question_requires_answer_before_tool_continue:
+    "questionRequiresAnswerBeforeToolContinue",
+  question_delivered_to_inbox: "questionDeliveredToInbox",
+  plan_confirmation_delivered_to_inbox: "planConfirmationDeliveredToInbox",
   coordination_worker_approval_required: "coordinationWorkerApprovalRequired",
 };
 
 export function translateBackendError(value: unknown): string {
   const text = String(value ?? "").trim();
+  const legacyKey = backendErrorKeys[text.toLowerCase()];
   const match = /^([a-z][a-z0-9_]*)(?:\s+(\{.*\}))?$/i.exec(text);
-  if (!match) return translate(backendErrorKeys[text.toLowerCase()] || text);
+  if (!match) return legacyKey ? translate(legacyKey) : text;
   const code = match[1].toLowerCase();
   const key = backendErrorKeys[code];
-  if (!key) return translate(backendErrorKeys[text.toLowerCase()] || text);
+  if (!key) return legacyKey ? translate(legacyKey) : text;
   let params: Record<string, string | number> = {};
   if (match[2]) {
     try {
