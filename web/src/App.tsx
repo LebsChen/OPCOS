@@ -79,6 +79,11 @@ import { SelectMenu as OpenWorkerSelectMenu } from "./components/SelectMenu";
 import { SettingsView, type SettingsSection } from "./components/SettingsView";
 import { Icon } from "./components/Icon";
 import { CollectionPage } from "./components/CollectionPage";
+import {
+  parseUnifiedDiff,
+  type ParsedDiffHunk,
+  type ParsedDiffLine,
+} from "./changes";
 import { IntegrationCard } from "./components/IntegrationCard";
 import {
   getLocale,
@@ -10560,11 +10565,54 @@ function IterationStatsPane({ events }: { events: TimelineEvent[] }) {
   );
 }
 
-type FileChange = {
+type GitFileChange = {
   path: string;
-  edit_count: number;
-  edits: Array<Record<string, unknown>>;
+  changeType: string;
+  additions: number;
+  deletions: number;
 };
+
+type ChangeTreeNode = {
+  name: string;
+  path: string;
+  file?: GitFileChange;
+  children: ChangeTreeNode[];
+};
+
+function changeTree(files: GitFileChange[]): ChangeTreeNode {
+  const root: ChangeTreeNode = { name: "", path: "", children: [] };
+  for (const file of files) {
+    let node = root;
+    const parts = file.path.split("/");
+    parts.forEach((part, index) => {
+      const path = parts.slice(0, index + 1).join("/");
+      let child = node.children.find((item) => item.name === part);
+      if (!child) {
+        child = { name: part, path, children: [] };
+        node.children.push(child);
+      }
+      if (index === parts.length - 1) child.file = file;
+      node = child;
+    });
+  }
+  const sort = (node: ChangeTreeNode) => {
+    node.children.sort((a, b) => {
+      if (Boolean(a.file) !== Boolean(b.file)) return a.file ? 1 : -1;
+      return a.name.localeCompare(b.name);
+    });
+    node.children.forEach(sort);
+  };
+  sort(root);
+  return root;
+}
+
+function diffLineClass(type: ParsedDiffLine["type"]): string {
+  return type === "add"
+    ? "changes-diff-line changes-diff-add"
+    : type === "del"
+      ? "changes-diff-line changes-diff-del"
+      : "changes-diff-line";
+}
 
 function LayoutSplitter({
   label,
@@ -10636,33 +10684,195 @@ function LayoutSplitter({
 }
 
 function ChangesPane({ selected }: { selected: Session }) {
-  const [items, setItems] = useState<FileChange[]>([]);
-  const [gitDiff, setGitDiff] = useState<Record<string, unknown> | null>(null);
+  const [files, setFiles] = useState<GitFileChange[]>([]);
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [diffText, setDiffText] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [expandedContext, setExpandedContext] = useState<Set<string>>(
+    new Set(),
+  );
+  const [loading, setLoading] = useState(false);
+  const [diffLoading, setDiffLoading] = useState(false);
   const [error, setError] = useState("");
-  const [open, setOpen] = useState<string | null>(null);
+  const [diffError, setDiffError] = useState("");
   const refresh = () => {
+    if (!selected.workspace) {
+      setFiles([]);
+      return;
+    }
+    setLoading(true);
     setError("");
-    void Promise.all([
-      command<FileChange[]>("session_file_changes", { sessionId: selected.id }),
-      selected.workspace
-        ? command<Record<string, unknown>>("review_snapshot", {
-            sessionId: selected.id,
-            cwd: selected.workspace,
-            base: "HEAD",
-          })
-        : Promise.resolve(null),
-    ])
-      .then(([changes, snapshot]) => {
-        setItems(changes);
-        setGitDiff(snapshot);
+    void command<Record<string, unknown>>("review_snapshot", {
+      sessionId: selected.id,
+      cwd: selected.workspace,
+      base: "HEAD",
+    })
+      .then((snapshot) => {
+        const changes = snapshot.changes;
+        const nextFiles =
+          changes && typeof changes === "object" && !Array.isArray(changes)
+            ? (changes as { files?: unknown }).files
+            : undefined;
+        const normalized = Array.isArray(nextFiles)
+          ? nextFiles.filter(
+              (file): file is GitFileChange =>
+                Boolean(file) &&
+                typeof file === "object" &&
+                typeof (file as GitFileChange).path === "string",
+            )
+          : [];
+        setFiles(normalized);
+        setSelectedPath((current) =>
+          current && normalized.some((file) => file.path === current)
+            ? current
+            : normalized[0]?.path || null,
+        );
       })
-      .catch((reason) => setError(errorMessage(reason)));
+      .catch((reason) => setError(errorMessage(reason)))
+      .finally(() => setLoading(false));
   };
   useEffect(() => {
     refresh();
   }, [selected.id, selected.workspace]);
-  const changes = (gitDiff?.changes as Record<string, unknown> | undefined)
-    ?.files;
+
+  useEffect(() => {
+    setDiffText(null);
+    setDiffError("");
+    if (!selected.workspace || !selectedPath) return;
+    setDiffLoading(true);
+    void command<Record<string, unknown>>("review_file_diff", {
+      sessionId: selected.id,
+      cwd: selected.workspace,
+      path: selectedPath,
+      base: "HEAD",
+      context: 100,
+    })
+      .then((value) =>
+        setDiffText(typeof value.diff === "string" ? value.diff : ""),
+      )
+      .catch((reason) => setDiffError(errorMessage(reason)))
+      .finally(() => setDiffLoading(false));
+  }, [selected.id, selected.workspace, selectedPath]);
+
+  const tree = changeTree(files);
+  const totals = files.reduce(
+    (sum, file) => ({
+      additions: sum.additions + (Number(file.additions) || 0),
+      deletions: sum.deletions + (Number(file.deletions) || 0),
+    }),
+    { additions: 0, deletions: 0 },
+  );
+  const selectedFile = files.find((file) => file.path === selectedPath);
+  const maxDiffLines = 4000;
+  const rawDiffLines = diffText?.split("\n") || [];
+  const diffWasTruncated = rawDiffLines.length > maxDiffLines;
+  const parsed = parseUnifiedDiff(
+    rawDiffLines.slice(0, maxDiffLines).join("\n"),
+  );
+  const renderLine = (line: ParsedDiffLine, index: number) => (
+    <div className={diffLineClass(line.type)} key={`${index}-${line.content}`}>
+      <span className="changes-diff-number">{line.oldLine ?? ""}</span>
+      <span className="changes-diff-number">{line.newLine ?? ""}</span>
+      <code>{line.type === "add" ? "+" : line.type === "del" ? "-" : " "}</code>
+      <code className="changes-diff-content">{line.content}</code>
+    </div>
+  );
+  const renderHunk = (hunk: ParsedDiffHunk, hunkIndex: number) => {
+    const key = `${selectedPath}:${hunkIndex}`;
+    const expanded = expandedContext.has(key);
+    const lines: ReactNode[] = [];
+    let index = 0;
+    while (index < hunk.lines.length) {
+      if (hunk.lines[index].type !== "context" || expanded) {
+        lines.push(renderLine(hunk.lines[index], index));
+        index += 1;
+        continue;
+      }
+      const start = index;
+      while (index < hunk.lines.length && hunk.lines[index].type === "context")
+        index += 1;
+      const count = index - start;
+      if (count <= 8) {
+        for (let lineIndex = start; lineIndex < index; lineIndex += 1)
+          lines.push(renderLine(hunk.lines[lineIndex], lineIndex));
+      } else {
+        for (let lineIndex = start; lineIndex < start + 3; lineIndex += 1)
+          lines.push(renderLine(hunk.lines[lineIndex], lineIndex));
+        lines.push(
+          <button
+            className="changes-context-toggle"
+            key={`${key}-context-${start}`}
+            onClick={() =>
+              setExpandedContext((current) => {
+                const next = new Set(current);
+                next.add(key);
+                return next;
+              })
+            }
+          >
+            {translate("expandContext", { count: count - 6 })}
+          </button>,
+        );
+        for (let lineIndex = index - 3; lineIndex < index; lineIndex += 1)
+          lines.push(renderLine(hunk.lines[lineIndex], lineIndex));
+      }
+    }
+    return (
+      <div className="changes-diff-hunk" key={key}>
+        <div className="changes-diff-header">{hunk.header}</div>
+        {lines}
+      </div>
+    );
+  };
+  const renderTree = (node: ChangeTreeNode, depth = 0): ReactNode =>
+    node.children.map((child) => {
+      const isOpen = !collapsed.has(child.path);
+      if (child.file) {
+        return (
+          <button
+            className={`changes-file-row${
+              selectedPath === child.file.path ? " selected" : ""
+            }`}
+            style={{ paddingLeft: `${10 + depth * 14}px` }}
+            key={child.path}
+            onClick={() => setSelectedPath(child.file!.path)}
+          >
+            <span className="changes-file-name" title={child.file.path}>
+              {child.name}
+            </span>
+            <span className="changes-file-meta">
+              <span className={`changes-badge ${child.file.changeType}`}>
+                {translate(child.file.changeType)}
+              </span>
+              <span className="diff-add">+{child.file.additions}</span>
+              <span className="diff-del">−{child.file.deletions}</span>
+            </span>
+          </button>
+        );
+      }
+      return (
+        <div key={child.path}>
+          <button
+            className="changes-directory-row"
+            style={{ paddingLeft: `${10 + depth * 14}px` }}
+            onClick={() =>
+              setCollapsed((current) => {
+                const next = new Set(current);
+                if (next.has(child.path)) next.delete(child.path);
+                else next.add(child.path);
+                return next;
+              })
+            }
+            title={translate(isOpen ? "collapseDirectory" : "expandDirectory")}
+          >
+            <span>{isOpen ? "▾" : "▸"}</span>
+            <strong>{child.name}</strong>
+          </button>
+          {isOpen && renderTree(child, depth + 1)}
+        </div>
+      );
+    });
+
   return (
     <section className="rail-section">
       <div className="rail-section-head">
@@ -10676,40 +10886,53 @@ function ChangesPane({ selected }: { selected: Session }) {
         </button>
       </div>
       <div className="rail-section-body">
-        {error && <div className="rail-error">{error}</div>}
-        {items.length === 0 ? (
-          <div className="rail-muted">{translate("noFileEdits")}</div>
-        ) : (
-          <div className="rail-event-list">
-            {items.map((item) => (
-              <div className="rail-event-card" key={item.path}>
-                <button
-                  className="rail-event-head"
-                  onClick={() => setOpen(open === item.path ? null : item.path)}
-                >
-                  <code>{item.path}</code>
-                  <span className="rail-muted">
-                    {item.edit_count} {translate("editsLabel")}
-                  </span>
-                </button>
-                {open === item.path &&
-                  item.edits.map((edit, index) => (
-                    <pre className="rail-event-output" key={index}>
-                      {JSON.stringify(edit, null, 2)}
-                    </pre>
-                  ))}
-              </div>
-            ))}
+        {loading ? (
+          <div className="rail-muted">{translate("changesLoading")}</div>
+        ) : error ? (
+          <div className="rail-error">
+            {translate("changesError")} {error}
           </div>
-        )}
-        {Array.isArray(changes) && changes.length > 0 && (
-          <details className="rail-git-diff">
-            <summary>{translate("currentGitDiff")}</summary>
-            <pre>{JSON.stringify(changes, null, 2)}</pre>
-          </details>
-        )}
-        {!gitDiff && selected.workspace && (
-          <div className="rail-muted">{translate("gitDiffUnavailable")}</div>
+        ) : files.length === 0 ? (
+          <div className="rail-muted">{translate("noGitChanges")}</div>
+        ) : (
+          <div className="changes-layout">
+            <div className="changes-tree">
+              <div className="changes-summary">
+                {translate("filesChangedSummary", {
+                  count: files.length,
+                  additions: totals.additions,
+                  deletions: totals.deletions,
+                })}
+              </div>
+              {renderTree(tree)}
+            </div>
+            <div className="changes-diff">
+              {!selectedFile ? (
+                <div className="rail-muted">
+                  {translate("selectChangedFile")}
+                </div>
+              ) : diffLoading ? (
+                <div className="rail-muted">{translate("diffLoading")}</div>
+              ) : diffError ? (
+                <div className="rail-error">
+                  {translate("diffError")} {diffError}
+                </div>
+              ) : parsed.isBinary ? (
+                <div className="rail-muted">{translate("binaryFile")}</div>
+              ) : parsed.hunks.length === 0 ? (
+                <div className="rail-muted">{translate("noDiffHunks")}</div>
+              ) : (
+                <>
+                  {parsed.hunks.map(renderHunk)}
+                  {diffWasTruncated && (
+                    <div className="changes-diff-truncated">
+                      {translate("diffTruncated", { count: maxDiffLines })}
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </div>
         )}
       </div>
     </section>

@@ -434,7 +434,13 @@ pub trait RvmClient: Send + Sync {
     async fn write(&self, path: &str, content: &str) -> Result<Value, RvmError>;
     async fn ls(&self, path: Option<&str>) -> Result<DirectoryListing, RvmError>;
     async fn git_changes(&self, cwd: &str, base: &str) -> Result<GitChanges, RvmError>;
-    async fn git_file_diff(&self, cwd: &str, path: &str, base: &str) -> Result<Value, RvmError>;
+    async fn git_file_diff(
+        &self,
+        cwd: &str,
+        path: &str,
+        base: &str,
+        context: Option<u32>,
+    ) -> Result<Value, RvmError>;
     async fn git_status(&self, cwd: &str) -> Result<GitStatus, RvmError>;
     async fn git_diff(&self, cwd: &str, reference: Option<&str>) -> Result<GitDiff, RvmError>;
     async fn git_log(&self, cwd: &str, count: u32) -> Result<GitLog, RvmError>;
@@ -1072,12 +1078,20 @@ impl RvmClient for HttpRvmClient {
             .await
     }
 
-    async fn git_file_diff(&self, cwd: &str, path: &str, base: &str) -> Result<Value, RvmError> {
+    async fn git_file_diff(
+        &self,
+        cwd: &str,
+        path: &str,
+        base: &str,
+        context: Option<u32>,
+    ) -> Result<Value, RvmError> {
         #[derive(Serialize)]
         struct Body<'a> {
             cwd: &'a str,
             path: &'a str,
             base: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            context: Option<u32>,
         }
         let cwd = self.remote_path(cwd)?;
         let path = self.repository_path(path)?;
@@ -1087,6 +1101,7 @@ impl RvmClient for HttpRvmClient {
                 cwd: &cwd,
                 path: &path,
                 base,
+                context,
             },
         )
         .await
@@ -2112,7 +2127,13 @@ mod tests {
         async fn git_changes(&self, _: &str, _: &str) -> Result<GitChanges, RvmError> {
             unreachable!()
         }
-        async fn git_file_diff(&self, _: &str, _: &str, _: &str) -> Result<Value, RvmError> {
+        async fn git_file_diff(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Option<u32>,
+        ) -> Result<Value, RvmError> {
             unreachable!()
         }
         async fn git_status(&self, _: &str) -> Result<GitStatus, RvmError> {
