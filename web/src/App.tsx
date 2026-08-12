@@ -3219,7 +3219,7 @@ function GitActions({
       <input
         value={value}
         onChange={(event) => setValue(event.target.value)}
-        placeholder={translate("slug, files, or commit message")}
+        placeholder={translate("slugFilesCommit")}
       />
       <Button
         onClick={() =>
@@ -3250,12 +3250,12 @@ function GitActions({
         <input
           value={repo}
           onChange={(event) => setRepo(event.target.value)}
-          placeholder={translate("owner/repository")}
+          placeholder={translate("ownerRepository")}
         />
         <input
           value={pr}
           onChange={(event) => setPr(event.target.value)}
-          placeholder={translate("PR title")}
+          placeholder={translate("prTitle")}
         />
         <Button
           onClick={() =>
@@ -5563,13 +5563,13 @@ function ManageSections({
                   <input
                     value={hostName}
                     onChange={(event) => setHostName(event.target.value)}
-                    placeholder={translate("Host name")}
+                    placeholder={translate("hostName")}
                     required
                   />
                   <input
                     value={hostUrl}
                     onChange={(event) => setHostUrl(event.target.value)}
-                    placeholder={translate("Remote URL")}
+                    placeholder={translate("remoteUrl")}
                     type="url"
                     required
                   />
@@ -5579,7 +5579,7 @@ function ManageSections({
                     placeholder={
                       editingHostId
                         ? "留空保持原 token"
-                        : translate("Bearer token")
+                        : translate("bearerToken")
                     }
                     type="password"
                     required={!editingHostId}
@@ -6610,7 +6610,7 @@ function ManageSections({
                     <input
                       value={assetTitle}
                       onChange={(event) => setAssetTitle(event.target.value)}
-                      placeholder={translate("Asset title")}
+                      placeholder={translate("assetTitle")}
                     />
                   </label>
                   <label className="field-label">
@@ -6618,7 +6618,7 @@ function ManageSections({
                     <textarea
                       value={assetBody}
                       onChange={(event) => setAssetBody(event.target.value)}
-                      placeholder={translate("Asset content")}
+                      placeholder={translate("assetContent")}
                     />
                   </label>
                   {(assetTabKind === "knowledge" ||
@@ -6630,7 +6630,7 @@ function ManageSections({
                         onChange={(event) =>
                           setAssetTrigger(event.target.value)
                         }
-                        placeholder={translate("Optional trigger")}
+                        placeholder={translate("optionalTrigger")}
                       />
                     </label>
                   )}
@@ -6653,7 +6653,7 @@ function ManageSections({
                     <input
                       value={assetScope}
                       onChange={(event) => setAssetScope(event.target.value)}
-                      placeholder={translate("Workspace path (absolute)")}
+                    placeholder={translate("workspacePathAbsolute")}
                       disabled={
                         assetScopeKind === "global" ||
                         assetTabKind === "instructions"
@@ -9652,13 +9652,13 @@ function Activity({
                       ))
                     ) : (
                       <p className="empty-state">
-                        {translate("No coordination tasks yet.")}
+                        {translate("noTasks")}
                       </p>
                     )}
                   </section>
                   <section className="hidden">
                     <div className="inline-actions mb-3">
-                      <input placeholder={translate("Search messages")} />
+                      <input placeholder={translate("searchMessages")} />
                       <Button
                         className="primary"
                         onClick={() => setMessageFormOpen(true)}
@@ -9669,7 +9669,7 @@ function Activity({
                     {messageFormOpen && (
                       <>
                         <label className="field-label">
-                          {translate("Message envelope")}
+                          {translate("messageEnvelope")}
                         </label>
                         <textarea
                           value={message}
@@ -9845,14 +9845,14 @@ function StandalonePane({ route }: { route: PaneRoute }) {
         )}
         {selected && route.tab === "info" && (
           <div className="info">
-            <Field k={translate("Session ID")} v={selected.id} />
-        <Field k={translate("Status")} v={translate("ready")} />
-            <Field k={translate("Host")} v={selected.host_name} />
+            <Field k={translate("sessionId")} v={selected.id} />
+            <Field k={translate("status")} v={translate("ready")} />
+            <Field k={translate("host")} v={selected.host_name} />
             <Field
-              k={translate("Workspace")}
-              v={selected.workspace || translate("Not set")}
+              k={translate("workspace")}
+              v={selected.workspace || translate("notSet")}
             />
-            <Field k={translate("Model")} v={selected.model} />
+            <Field k={translate("model")} v={selected.model} />
             <div className="field">
               <label>{translate("provider")}</label>
               <select
@@ -11015,17 +11015,17 @@ function SessionRightPanel({
                 style={{ display: panelTab === "info" ? "block" : "none" }}
               >
                 <div className="info">
-                  <Field k={translate("Session ID")} v={selected.id} />
+                  <Field k={translate("sessionId")} v={selected.id} />
                   <Field
-                    k={translate("Status")}
+                    k={translate("status")}
                     v={running ? "Running" : "Ready"}
                   />
-                  <Field k={translate("Host")} v={selected.host_name} />
+                  <Field k={translate("host")} v={selected.host_name} />
                   <Field
-                    k={translate("Workspace")}
-                    v={selected.workspace || translate("Not set")}
+                    k={translate("workspace")}
+                    v={selected.workspace || translate("notSet")}
                   />
-                  <Field k={translate("Model")} v={selected.model} />
+                  <Field k={translate("model")} v={selected.model} />
                   <div className="field">
                     <label>{translate("provider")}</label>
                     <select
@@ -12843,7 +12843,7 @@ function AppContent() {
                   )}
                   <button
                     className="topbar-icon-btn"
-                    title={translate("Toggle session panel")}
+                    title={translate("toggleSessionPanel")}
                     onClick={() => setDrawerCollapsed((value) => !value)}
                   >
                     <Icon name="sidebarRight" size={16} />
