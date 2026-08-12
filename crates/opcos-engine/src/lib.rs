@@ -2569,6 +2569,54 @@ has failed {} times and the last error code was {}",
         result
     }
 
+    pub async fn submit_recorded_text(
+        &self,
+        context_attachments: &[ExternalContextAttachment],
+    ) -> Result<AssistantTurn, EngineError> {
+        self.begin_turn()?;
+        self.clear_steering_queue();
+        self.interrupted.store(false, Ordering::SeqCst);
+        self.policy_denied.store(false, Ordering::SeqCst);
+        self.set_session_status("running", "none");
+        let result = async {
+            self.run_loop(self.provider_messages_with_attachments(context_attachments)?)
+                .await
+        }
+        .await;
+        self.finish_turn(
+            &result,
+            result
+                .as_ref()
+                .ok()
+                .and_then(|turn| turn.finish_reason.as_deref()),
+        );
+        result
+    }
+
+    fn provider_messages_with_attachments(
+        &self,
+        attachments: &[ExternalContextAttachment],
+    ) -> Result<Vec<Value>, EngineError> {
+        let mut messages = self.provider_messages()?;
+        if attachments.is_empty() {
+            return Ok(messages);
+        }
+        if let Some(message) = messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        {
+            let content = message
+                .get_mut("content")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| {
+                    EngineError::Store("recorded user message content is invalid".into())
+                })?;
+            content.extend(attachments.iter().map(external_context_content_block));
+        }
+        Ok(messages)
+    }
+
     pub async fn submit_steering(
         &self,
         text: impl Into<String>,
@@ -6011,7 +6059,7 @@ has failed {} times and the last error code was {}",
     }
 }
 
-fn external_context_content_block(attachment: &ExternalContextAttachment) -> Value {
+pub fn external_context_content_block(attachment: &ExternalContextAttachment) -> Value {
     let header = format!(
         "[MCP resource]\nsource: {}\nuri: {}\nmime: {}\n\n",
         attachment.source,
@@ -9104,6 +9152,37 @@ mod tests {
         );
         let turn = engine.submit_text("hello").await.unwrap();
         assert_eq!(turn.text.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn recorded_user_turn_runs_without_appending_a_duplicate_message() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let recorder = SessionRecorder::new(store.clone(), "s");
+        recorder
+            .append_message(
+                "user",
+                json!({"role":"user","content":[{"type":"text","text":"hello"}]}),
+            )
+            .unwrap();
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let turn = engine.submit_recorded_text(&[]).await.unwrap();
+        assert_eq!(turn.text.as_deref(), Some("done"));
+        let messages = store.load_messages("s").unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == "user")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -13358,6 +13437,61 @@ mod tests {
         fn capabilities(&self, _: &str) -> Caps {
             Caps::default()
         }
+    }
+
+    #[tokio::test]
+    async fn recorded_user_turn_sends_persisted_attachment_only_once() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let attachment = ExternalContextAttachment {
+            source: "mcp:server".into(),
+            uri: Some("resource://docs".into()),
+            mime_type: Some("text/plain".into()),
+            content: "body".into(),
+        };
+        let recorder = SessionRecorder::new(store.clone(), "recorded-attachment");
+        recorder
+            .append_message(
+                "user",
+                json!({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "hello"},
+                        external_context_content_block(&attachment),
+                    ],
+                }),
+            )
+            .unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = TurnEngine::new(
+            CaptureProvider {
+                requests: requests.clone(),
+            },
+            store,
+            Arc::new(FakeTools),
+            "recorded-attachment",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+
+        engine.submit_recorded_text(&[]).await.unwrap();
+
+        let requests = requests.lock().expect("request mutex poisoned");
+        let user_message = requests[0]
+            .iter()
+            .find(|message| message["role"] == "user")
+            .unwrap();
+        let attachment_count = user_message["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|block| {
+                block["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("resource://docs"))
+            })
+            .count();
+        assert_eq!(attachment_count, 1);
     }
 
     #[tokio::test]

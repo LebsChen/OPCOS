@@ -1036,6 +1036,13 @@ export const messages: Record<Locale, Record<string, string>> = {
     interruptedByUser: "Interrupted by user",
     interruptedByCrash: "Interrupted (application exited)",
     hostUnavailable: "Host unavailable",
+    hostUnavailableDetail: "Host unavailable{detail}",
+    turnSetupStarted: "Preparing the session",
+    turnSetupWakingSession: "Waking the session",
+    turnSetupCheckingHost: "Checking the remote host",
+    turnSetupLoadingRuntime: "Loading the session runtime",
+    turnSetupLoadingContext: "Loading session context",
+    turnSetupFailed: "Session setup failed{detail}",
     providerError: "Model service error",
     providerRequestFailed: "Provider request failed{status}",
     providerWaiting: "Waiting for provider {phase} ({elapsed}s)",
@@ -2194,6 +2201,13 @@ export const messages: Record<Locale, Record<string, string>> = {
     interruptedByUser: "用户中断",
     interruptedByCrash: "已中断（应用退出）",
     hostUnavailable: "主机不可用",
+    hostUnavailableDetail: "主机不可用{detail}",
+    turnSetupStarted: "正在准备会话",
+    turnSetupWakingSession: "正在唤醒会话",
+    turnSetupCheckingHost: "正在检查远程主机",
+    turnSetupLoadingRuntime: "正在加载会话运行时",
+    turnSetupLoadingContext: "正在加载会话上下文",
+    turnSetupFailed: "会话准备失败{detail}",
     providerError: "模型服务错误",
     providerRequestFailed: "提供商请求失败{status}",
     providerWaiting: "等待提供商{phase}（{elapsed} 秒）",
@@ -2443,6 +2457,13 @@ const backendErrorKeys: Record<string, string> = {
   "provider model discovery is unsupported":
     "providerModelDiscoveryUnsupported",
   provider_request_failed: "providerRequestFailed",
+  host_unavailable: "hostUnavailableDetail",
+  turn_setup_started: "turnSetupStarted",
+  turn_setup_waking_session: "turnSetupWakingSession",
+  turn_setup_checking_host: "turnSetupCheckingHost",
+  turn_setup_loading_runtime: "turnSetupLoadingRuntime",
+  turn_setup_loading_context: "turnSetupLoadingContext",
+  turn_setup_failed: "turnSetupFailed",
   provider_waiting: "providerWaiting",
   provider_waiting_cleared: "providerWaitingCleared",
   turn_interrupted: "turnInterrupted",
@@ -2490,6 +2511,9 @@ export function translateBackendError(value: unknown): string {
   }
   if (code === "provider_request_failed") {
     params.status = params.detail ? `: ${params.detail}` : "";
+  }
+  if (code === "host_unavailable" || code === "turn_setup_failed") {
+    params.detail = params.detail ? `: ${params.detail}` : "";
   }
   return translate(key, params);
 }
