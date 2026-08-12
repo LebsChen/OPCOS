@@ -79,7 +79,13 @@ import { SettingsView, type SettingsSection } from "./components/SettingsView";
 import { Icon } from "./components/Icon";
 import { CollectionPage } from "./components/CollectionPage";
 import { IntegrationCard } from "./components/IntegrationCard";
-import { getLocale, setLocale, subscribeLocale, translate } from "./i18n";
+import {
+  getLocale,
+  setLocale,
+  subscribeLocale,
+  translate,
+  translateBackendValue,
+} from "./i18n";
 import type { Attachment } from "./types";
 import "./openworker-tailwind.css";
 import "./openworker-styles.css";
@@ -2163,9 +2169,11 @@ function ProjectBoard({
               >
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-xs rounded-full bg-faint/20 px-2 py-1 text-muted">
-                    {agent.role}
+                    {translateBackendValue(agent.role)}
                   </span>
-                  <span className="text-xs text-faint">{agent.state}</span>
+                  <span className="text-xs text-faint">
+                    {translateBackendValue(agent.state)}
+                  </span>
                 </div>
                 <h2 className="mt-4 font-medium text-ink">{agent.name}</h2>
                 <p
@@ -2371,7 +2379,7 @@ function ProjectCoordinationPanel({
                   const stage =
                     snapshot?.workflow?.workflow?.[snapshot.stage_index]?.stage;
                   return stage
-                    ? translate(String(stage))
+                    ? translateBackendValue(stage)
                     : translate("notStarted");
                 })()}
           </p>
@@ -2470,7 +2478,8 @@ function ProjectCoordinationPanel({
                 <span>
                   <strong>{task.title}</strong>
                   <span className="ml-2 text-faint">
-                    {task.phase} · {task.assignee || translate("unassigned")}
+                    {translateBackendValue(task.phase)} ·{" "}
+                    {task.assignee || translate("unassigned")}
                   </span>
                 </span>
                 <div className="flex gap-2">
@@ -3447,11 +3456,10 @@ function CiMonitorPanel({
               <article key={record.queue_id ?? JSON.stringify(item)}>
                 <strong>{record.queue_id ?? translate("ciRepairLoop")}</strong>
                 <div>
-                  {translate("status")}:{" "}
-                  {record.status ?? translate("unknownValue")}
+                  {translate("status")}: {translateBackendValue(record.status)}
                 </div>
                 <div>
-                  {translate("phase")}: {state.phase ?? translate("queued")}
+                  {translate("phase")}: {translateBackendValue(state.phase)}
                 </div>
                 <div>
                   {translate("attempts")}: {state.repair_attempts ?? 0} /{" "}
@@ -5510,7 +5518,7 @@ function ManageSections({
                       icon={host.name.slice(0, 1).toUpperCase()}
                       title={host.name}
                       badge={{
-                        label: hostStatusLabel(host),
+                        label: translateBackendValue(hostStatusLabel(host)),
                         tone: host.online === true ? "success" : "neutral",
                       }}
                       description={
@@ -7357,7 +7365,7 @@ function ManageSections({
               indexStatus ? (
                 <div className="manage-row px-4">
                   <span>
-                    <strong>{indexStatus.status}</strong>
+                    <strong>{translateBackendValue(indexStatus.status)}</strong>
                     <small>
                       {indexStatus.file_count} {translate("files")} ·{" "}
                       {indexStatus.symbol_count} {translate("symbols")}
@@ -7956,10 +7964,9 @@ function McpManage({
                     icon={String(server.name).slice(0, 1).toUpperCase()}
                     title={String(server.name)}
                     badge={{
-                      label:
-                        String(server.status || "configured") === "disabled"
-                          ? translate("disabled")
-                          : String(server.status || "configured"),
+                      label: translateBackendValue(
+                        server.status || "configured",
+                      ),
                       tone:
                         String(server.status || "").toLowerCase() === "error"
                           ? "neutral"
@@ -8759,7 +8766,7 @@ function Activity({
                               {String(action.platform)}
                             </strong>
                             <small>
-                              {String(action.status)} ·{" "}
+                              {translateBackendValue(action.status)} ·{" "}
                               {String(action.account_id)} ·{" "}
                               {String(action.idempotency_key)}
                             </small>
@@ -8787,7 +8794,8 @@ function Activity({
                         >
                           <span>
                             <strong>
-                              {String(item.task_type)} · {String(item.status)}
+                              {translateBackendValue(item.task_type)} ·{" "}
+                              {translateBackendValue(item.status)}
                             </strong>
                             <small>
                               {translate("attempts")} {String(item.attempts)}/
@@ -8945,7 +8953,7 @@ function Activity({
                                 {String(item.description)}
                               </span>
                               <span className="text-muted">
-                                {String(item.status)}
+                                {translateBackendValue(item.status)}
                               </span>
                             </div>
                           );
@@ -9244,7 +9252,7 @@ function Activity({
                             <span>
                               <strong>
                                 {String(goal.description)} ·{" "}
-                                {String(goal.status)}
+                                {translateBackendValue(goal.status)}
                               </strong>
                               <small>
                                 {String(goal.autonomy_level)} ·{" "}
@@ -9292,13 +9300,15 @@ function Activity({
                           >
                             <span>
                               <strong>
-                                {String(round.status)} ·{" "}
+                                {translateBackendValue(round.status)} ·{" "}
                                 {translate("goalLabel")} {String(round.goal_id)}
                               </strong>
                               <small>
                                 {translate("produced")}{" "}
                                 {String(round.produced_count)} ·{" "}
-                                {String(round.reason ?? "completed")}
+                                {translateBackendValue(
+                                  round.reason ?? "completed",
+                                )}
                               </small>
                             </span>
                           </div>
@@ -9424,7 +9434,7 @@ function Activity({
                                 <span>
                                   <strong>{String(role.id)}</strong>
                                   <small>
-                                    {String(role.state)} ·{" "}
+                                    {translateBackendValue(role.state)} ·{" "}
                                     {translate("sessionLabel")}{" "}
                                     {String(role.session_id)}
                                   </small>
@@ -9462,7 +9472,9 @@ function Activity({
                                   <strong>
                                     {String(task.title || task.id)}
                                   </strong>
-                                  <small>{String(task.phase)}</small>
+                                  <small>
+                                    {translateBackendValue(task.phase)}
+                                  </small>
                                 </span>
                                 <span className="inline-actions">
                                   <Button
@@ -9673,7 +9685,7 @@ function Activity({
                           key={String(task.id || task.title)}
                         >
                           <strong>{String(task.title || task.id)}</strong>
-                          <span>{String(task.phase)}</span>
+                          <span>{translateBackendValue(task.phase)}</span>
                           <div className="inline-actions">
                             <Button
                               className="bordered"
@@ -10770,7 +10782,7 @@ function AgentRosterPane({
               ? workflow.stage_index + 1
               : translate("stageUnknown")}{" "}
             · {translate("statusLabelInline")}{" "}
-            {workflow.status?.trim() || translate("unknownValue")}
+            {translateBackendValue(workflow.status)}
             {Array.isArray(workflow.tasks) &&
               ` · Tasks: ${workflow.tasks.length}`}
           </div>
@@ -10785,13 +10797,13 @@ function AgentRosterPane({
                   <div className="rail-event-head">
                     <strong>{projectAgentRosterValue(agent.name)}</strong>
                     <span className="rail-muted">
-                      {projectAgentRosterValue(agent.state)}
+                      {translateBackendValue(agent.state)}
                     </span>
                   </div>
                   <dl className="agent-roster-details">
                     <div>
                       <dt>{translate("roleLabel")}</dt>
-                      <dd>{projectAgentRosterValue(agent.role)}</dd>
+                      <dd>{translateBackendValue(agent.role)}</dd>
                     </div>
                     <div>
                       <dt>{translate("hostLabel")}</dt>
@@ -10817,11 +10829,11 @@ function AgentRosterPane({
                     </div>
                     <div>
                       <dt>{translate("runStateLabel")}</dt>
-                      <dd>{projectAgentRosterValue(session?.run_state)}</dd>
+                      <dd>{translateBackendValue(session?.run_state)}</dd>
                     </div>
                     <div>
                       <dt>{translate("stopReasonLabel")}</dt>
-                      <dd>{projectAgentRosterValue(session?.stop_reason)}</dd>
+                      <dd>{translateBackendValue(session?.stop_reason)}</dd>
                     </div>
                   </dl>
                   <div className="inline-actions">
@@ -12948,7 +12960,7 @@ function AppContent() {
                   <span className="title-sub" data-testid="session-subtitle">
                     {[
                       selected.host_name,
-                      selected.workspace || "workspace not set",
+                      selected.workspace || translate("workspaceNotSet"),
                       selected.model,
                       sessionStatusLabel(
                         selected.run_state,

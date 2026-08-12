@@ -171,6 +171,38 @@ describe("i18n source coverage", () => {
     );
   });
 
+  it("maps backend status and enum values before rendering", () => {
+    const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
+    expect(appSource).not.toMatch(/translate\(String\(/);
+    expect(appSource).not.toMatch(/\{indexStatus\.status\}/);
+    expect(appSource).not.toMatch(
+      /String\(server\.status\s*\|\|\s*"configured"\)/,
+    );
+    expect(appSource).not.toMatch(
+      /\{workflow\.status\?\.trim\(\)\s*\|\|\s*translate\("unknownValue"\)\}/,
+    );
+    expect(appSource).toMatch(/translateBackendValue\(indexStatus\.status\)/);
+    expect(appSource).toMatch(
+      /translateBackendValue\(\s*server\.status\s*\|\|\s*"configured"\s*,?\s*\)/,
+    );
+    expect(appSource).toMatch(/translateBackendValue\(workflow\.status\)/);
+  });
+
+  it("covers every seeded workflow stage in the dictionaries", () => {
+    const seedSource = readFileSync(
+      `${sourceRoot}../../src-tauri/src/main.rs`,
+      "utf8",
+    );
+    const stages = new Set(
+      [...seedSource.matchAll(/"stage"\s*:\s*"([^"]+)"/g)].map(
+        (match) => match[1],
+      ),
+    );
+    expect(stages.size).toBeGreaterThan(0);
+    expect([...stages].filter((stage) => !(stage in messages.en))).toEqual([]);
+    expect([...stages].filter((stage) => !(stage in messages.zh))).toEqual([]);
+  });
+
   it("does not leave bare product copy in JSX text or visible attributes", () => {
     const violations: string[] = [];
     for (const file of sourceFiles().filter((name) => name.endsWith(".tsx"))) {
