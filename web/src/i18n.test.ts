@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { backendValueKeys, messages } from "./i18n";
+import { backendValueKeys, messages, translateBackendValue } from "./i18n";
 
 const sourceRoot = fileURLToPath(new URL(".", import.meta.url));
 const allowlist = [
@@ -71,6 +71,7 @@ const zhEnglishKeyAllowlist = new Set([
   "token",
   "providerId",
   "mcpServerId",
+  "mcpTemplate",
   "accountId",
   "secretsLabel",
   "worktreeLabel",
@@ -455,19 +456,60 @@ describe("i18n source coverage", () => {
   });
 
   it("keeps backend enum mappings exhaustive and preserves unknown tokens", () => {
+    const backendSource = readFileSync(
+      `${sourceRoot}../../src-tauri/src/main.rs`,
+      "utf8",
+    );
     const requiredValues = [
+      "running",
+      "idle",
+      "error",
       "finished",
       "harness_error",
       "internal_error",
       "interrupted_by_user",
       "waiting_for_approval",
+      "provider_error",
+      "open",
       "none",
       "agent-template",
+      "command",
       "command-template",
       "team-template",
+      "rules",
+      "skill",
+      "mcp",
+      "connector",
+      "acp-agent",
     ];
     for (const value of requiredValues) {
       expect(backendValueKeys[value]).toBeTruthy();
+    }
+    for (const kind of [
+      "agent-template",
+      "team-template",
+      "rules",
+      "skill",
+      "mcp",
+      "connector",
+      "acp-agent",
+      "command",
+    ]) {
+      expect(translateBackendValue(kind)).not.toBe(kind);
+    }
+    expect(backendSource).toContain('"provider_error"');
+    expect(backendSource).toMatch(/status.*?"open"/s);
+    for (const kind of [
+      "agent-template",
+      "team-template",
+      "rules",
+      "skill",
+      "mcp",
+      "connector",
+      "acp-agent",
+      "command",
+    ]) {
+      expect(backendSource).toContain(`"${kind}"`);
     }
     const i18nSource = readFileSync(`${sourceRoot}i18n.ts`, "utf8");
     expect(i18nSource).toContain("return key ? translate(key) : text;");
@@ -488,6 +530,33 @@ describe("i18n source coverage", () => {
     const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
     expect(appSource).toMatch(
       /key === "duration_ms"[\s\S]*return `\$\{value\} ms`/,
+    );
+  });
+
+  it("localizes transcript summaries and role state options", () => {
+    const transcriptSource = readFileSync(`${sourceRoot}transcript.ts`, "utf8");
+    const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
+    expect(transcriptSource).toContain(
+      'translate("providerRequestFailed", { status: statusText })',
+    );
+    expect(transcriptSource).not.toMatch(/summary:\s*`Provider request failed/);
+    expect(appSource).toMatch(
+      /options=\{\["active", "sleep", "paused"\]\.map\(\(value\) => \(\{\s*value,\s*label: translateBackendValue\(value\)/s,
+    );
+    expect(appSource).not.toMatch(/label:\s*value,/);
+  });
+
+  it("version-seeds changed built-in command bodies instead of mixing languages", () => {
+    const backendSource = readFileSync(
+      `${sourceRoot}../../src-tauri/src/main.rs`,
+      "utf8",
+    );
+    expect(backendSource).toContain("builtin seed update");
+    expect(backendSource).toMatch(
+      /SELECT current_version_id FROM config_object WHERE id=\?2/,
+    );
+    expect(backendSource).toContain(
+      "content_hash(&body),\n                    now,\n                    metadata",
     );
   });
 

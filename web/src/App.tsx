@@ -9444,7 +9444,7 @@ function Activity({
                       onChange={setRoleState}
                       options={["active", "sleep", "paused"].map((value) => ({
                         value,
-                        label: value,
+                        label: translateBackendValue(value),
                       }))}
                     />
                     <Button

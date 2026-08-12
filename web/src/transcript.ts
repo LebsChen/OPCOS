@@ -1,3 +1,5 @@
+import { translate } from "./i18n";
+
 export type ErrorPresentation = {
   summary: string;
   toast: string;
@@ -33,7 +35,7 @@ export function providerErrorPresentation(text: string): ErrorPresentation {
   }
   const statusText = status ? ` — HTTP ${status}` : "";
   return {
-    summary: `Provider request failed${statusText}`,
+    summary: translate("providerRequestFailed", { status: statusText }),
     toast: friendlyErrorText(message),
     detail: text,
   };
