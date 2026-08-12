@@ -4,20 +4,44 @@
 
 ## 1.1 OPCOS 现状：`opcos-store`
 
-`SqliteStore::migrate` 当前创建 10 张表（`crates/opcos-store/src/lib.rs:461-539`）。
+`SqliteStore::migrate` 当前通过一组幂等的 `CREATE TABLE IF NOT EXISTS` 与兼容性
+迁移建立 43 张表（`crates/opcos-store/src/lib.rs` 的 migration 实现）。表数量会
+随迁移演进，因此下面按当前重要关系分组记录；字段以 migration 中的实际定义为准。
 
-| 表                  | 字段                                                                                                                                                                                          | 用途                                                                         |
-| ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
-| `schema_migrations` | `version`, `applied_at`                                                                                                                                                                       | 记录迁移版本。                                                               |
-| `sessions`          | `session_id`, `workspace`, `model`, `mode`, `title`, `extra_roots`, `grants`, `pinned`, `archived`, `origin`, `origin_label`, `compaction`, `host_id`, `provider`, `created_at`, `updated_at` | 会话元数据、工作区、模型、provider、模式、额外 root、授权、归档和绑定 host。 |
-| `messages`          | `session_id`, `sequence`, `role`, `content`, `display_only`                                                                                                                                   | 按 session 和 sequence 保存消息。                                            |
-| `notices`           | `session_id`, `sequence`, `kind`, `content`                                                                                                                                                   | 保存结构化 notice。                                                          |
-| `tool_calls`        | `session_id`, `message_sequence`, `call_id`, `name`, `arguments`, `result`                                                                                                                    | 保存模型提出的工具调用及结果。                                               |
-| `grants`            | `session_id`, `grant_key`, `grant_value`                                                                                                                                                      | 保存 session 级授权/standing grant。                                         |
-| `audit_events`      | `session_id`, `sequence`, `kind`, `payload`                                                                                                                                                   | 保存按 session 排序的审计事件。                                              |
-| `compaction_state`  | `session_id`, `state`                                                                                                                                                                         | 保存 session 压缩状态。                                                      |
-| `pending`           | `session_id`, `call_id`, `tool`, `arguments`, `state`                                                                                                                                         | 保存等待审批或其它挂起的工具调用。                                           |
-| `usage_events`      | `session_id`, `input_tokens`, `output_tokens`, `duration_ms`, `recorded_at`                                                                                                                   | 保存 token 用量和耗时。                                                      |
+当前 `sessions` 行至少包含：
+
+```text
+session_id, workspace, model, mode, harness, title, extra_roots, grants,
+pinned, archived, origin, origin_label, compaction, host_id, provider,
+external_session_id, run_state, stop_reason, terminal_cause,
+provider_finish_reason, created_at, updated_at, last_active_at, sleep_state,
+slept_at, project_id, agent_id
+```
+
+核心表与用途如下：
+
+| 表 | 用途 |
+| --- | --- |
+| `schema_migrations` | 记录迁移版本及应用时间。 |
+| `sessions` / `projects` / `project_agents` | 保存会话、项目及项目 agent 的绑定、模型、harness、运行状态和生命周期字段。 |
+| `messages` / `notices` / `tool_calls` / `pending` | 保存 transcript、结构化 notice、工具调用结果以及等待审批/提问等 durable pending 项。 |
+| `grants` / `local_gate_records` / `audit_events` / `session_events` | 保存 session 授权、本地门禁、审计记录和有序工作事件。 |
+| `compaction_state` / `usage_events` | 保存压缩状态及 token/耗时观察数据。 |
+| `session_preferences` / `session_activity` | 保存会话偏好；`session_activity` 独立记录最近活动时间，供 idle candidate 查询。 |
+| `action_ledger` / `work_queue` | 保存外部动作幂等状态，以及带 lease、重试和 dead-letter 的 durable queue。 |
+| `account_host_bindings` / `login_profiles` / `login_state_backups` | 保存账号与 host 绑定、登录 profile 元数据及登录状态备份。 |
+| `model_discovery_cache` / `learned_model_limits` | 缓存 provider 模型发现结果和按 provider/base URL/model 学到的限制。 |
+| `learned_skills` / `learned_skill_provenance` / `automatic_memories` | 保存学习项、来源和自动记忆及其版本/冲突关系。 |
+| `autonomous_goals` / `planning_rounds` / `plans` / `plan_steps` / `plan_revisions` | 保存自治目标、规划轮次及可追踪计划的步骤和修订。 |
+| `events` / `event_cursors` / `event_rules` / `event_dispatches` | 保存事件总线、消费游标、规则和规则分发记录。 |
+| `external_ingress_sources` / `work_queue_progress` / `ci_monitors` / `ci_monitor_states` | 保存外部入口、队列进度和 CI monitor 状态。 |
+| `autonomous_runner_profiles` / `runner_settings` / `repair_loop_grants` / `github_instances` | 保存 runner 配置、runner 设置、修复循环授权和 GitHub 实例信息。 |
+
+`session_activity` 的主键是 `session_id`，并通过 `ON DELETE CASCADE` 关联
+`sessions`。store 用 upsert/max 语义刷新 `last_activity_at`；迁移会用
+`COALESCE(NULLIF(sessions.last_active_at,''), sessions.created_at)` 回填已有
+会话。idle 扫描只选择未归档、`run_state='idle'`、保持 awake 且活动时间早于阈值的
+会话，详见 [03-lifecycle.md](03-lifecycle.md)。
 
 `messages`、`notices`、`tool_calls`、`pending` 与 `audit_events` 都采用 session 维度的复合主键或序列键；原始字符串和 JSON 文本保留在 store 中，避免只存 UI 文案。
 
