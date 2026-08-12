@@ -9767,7 +9767,7 @@ function Activity({
                       ))
                     ) : (
                       <p className="empty-state">
-                        No coordination messages yet.
+                        {translate("noCoordinationMessages")}
                       </p>
                     )}
                   </section>
@@ -10512,7 +10512,7 @@ function ChangesPane({ selected }: { selected: Session }) {
         )}
         {!gitDiff && selected.workspace && (
           <div className="rail-muted">
-            Git diff unavailable for this host/workspace.
+            {translate("gitDiffUnavailable")}
           </div>
         )}
       </div>
@@ -11105,7 +11105,7 @@ function SessionRightPanel({
                           }).catch(onError)
                         }
                       >
-                        Interrupt
+                        {translate("interrupt")}
                       </button>
                     </div>
                   )}
@@ -11120,7 +11120,7 @@ function SessionRightPanel({
               >
                 <div className="p-4">
                   <h2 className="text-[15px] font-semibold text-ink">
-                    Insights
+                    {translate("insights")}
                   </h2>
                   {insights ? (
                     <dl className="mt-4 space-y-3 text-[13px]">
@@ -11436,7 +11436,7 @@ function InboxPane({
                           });
                         }}
                       >
-                        Answer
+                        {translate("answer")}
                       </button>
                     </>
                   ) : (
@@ -11445,13 +11445,13 @@ function InboxPane({
                         className="btn approval-primary"
                         onClick={() => onResolve(item, "allow")}
                       >
-                        Allow
+                        {translate("allow")}
                       </button>
                       <button
                         className="btn quiet-deny"
                         onClick={() => onResolve(item, "deny")}
                       >
-                        Deny
+                        {translate("deny")}
                       </button>
                     </>
                   )}
@@ -13012,7 +13012,7 @@ function AppContent() {
                         type="button"
                         onClick={() => setPendingQuestionCollapsed(false)}
                       >
-                        Answer
+                        {translate("answer")}
                       </button>
                     </div>
                   )}
