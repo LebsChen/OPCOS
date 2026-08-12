@@ -19,6 +19,8 @@ function friendlyErrorText(text: string): string {
 }
 
 export function providerErrorPresentation(text: string): ErrorPresentation {
+  const translatedProviderError =
+    /^(Provider request failed|提供商请求失败)(?::|：)/.test(text.trim());
   let status: number | undefined;
   let message = text;
   try {
@@ -36,7 +38,7 @@ export function providerErrorPresentation(text: string): ErrorPresentation {
   const statusText = status ? ` — HTTP ${status}` : "";
   return {
     summary: translate("providerRequestFailed", { status: statusText }),
-    toast: friendlyErrorText(message),
+    toast: translatedProviderError ? text : friendlyErrorText(message),
     detail: text,
   };
 }

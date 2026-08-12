@@ -13073,7 +13073,10 @@ async fn engine_for_with_context(
 }
 
 fn engine_error_message(error: EngineError) -> String {
-    error.to_string()
+    match error {
+        EngineError::Provider(provider) => format!("provider_request_failed: {provider}"),
+        error => error.to_string(),
+    }
 }
 
 #[tauri::command]

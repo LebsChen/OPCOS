@@ -610,6 +610,25 @@ describe("i18n source coverage", () => {
     expect(appSource).not.toMatch(/label:\s*value,/);
   });
 
+  it("wraps provider Display errors in a UI boundary code", () => {
+    const engineSource = readFileSync(
+      `${sourceRoot}../../crates/opcos-engine/src/lib.rs`,
+      "utf8",
+    );
+    const tauriSource = readFileSync(
+      `${sourceRoot}../../src-tauri/src/main.rs`,
+      "utf8",
+    );
+    // ProviderError Display remains diagnostic; every UI boundary must wrap it
+    // before toast or transcript rendering so the detail stays raw but the
+    // visible prefix is translated.
+    expect(engineSource).toContain('#[error("provider: {0}")]');
+    expect(tauriSource).toContain(
+      'EngineError::Provider(provider) => format!("provider_request_failed: {provider}")',
+    );
+    expect(tauriSource).toContain("fn engine_error_message");
+  });
+
   it("version-seeds changed built-in command bodies instead of mixing languages", () => {
     const backendSource = readFileSync(
       `${sourceRoot}../../src-tauri/src/main.rs`,
