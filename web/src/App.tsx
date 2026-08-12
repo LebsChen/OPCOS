@@ -2944,7 +2944,7 @@ function SurfaceView({
         )}
         {busy && (
           <div className="surface-status muted">
-            Connecting to the bound remote host…
+            {translate("connectingRemoteHost")}
           </div>
         )}
         {surfaceError && !sleeping && !showSurfaceRetry && (
@@ -2963,21 +2963,23 @@ function SurfaceView({
         {tab === "browser" && (
           <div className="browser-preview">
             <div className="surface-status muted">
-              Read-only remote browser preview
+              {translate("remoteBrowserPreview")}
             </div>
             {browserFrame ? (
               <img
                 className="browser-preview-image"
                 src={`data:${browserFrame.mime};base64,${browserFrame.image}`}
-                alt="Remote browser page"
+                alt={translate("remoteBrowserPage")}
               />
             ) : !surfaceFailed ? (
               <div className="empty-surface">
                 <Icon name="image" size={32} />
-                <p>Waiting for a remote browser page target…</p>
+                <p>{translate("waitingBrowserTarget")}</p>
               </div>
             ) : null}
-            <p className="surface-status muted">Remote browser preview (CDP)</p>
+            <p className="surface-status muted">
+              {translate("remoteBrowserCdp")}
+            </p>
           </div>
         )}
       </div>
@@ -2987,12 +2989,12 @@ function SurfaceView({
       <div className="surface-panel">
         {busy && (
           <div className="surface-status muted">
-            Connecting to the bound remote host…
+            {translate("connectingRemoteHost")}
           </div>
         )}
         {ideUrl && !ideError ? (
           <iframe
-            title={translate("Remote Web IDE")}
+            title={translate("remoteWebIde")}
             src={ideUrl}
             className="ide-frame"
           />
@@ -3000,12 +3002,12 @@ function SurfaceView({
           <div className="empty-surface ide-error">
             <Icon name="code" size={32} />
             <p>{ideError}</p>
-            <p className="muted">No local fallback is used.</p>
+            <p className="muted">{translate("noLocalFallback")}</p>
           </div>
         ) : (
           <div className="empty-surface">
             <Icon name="code" size={32} />
-            <p>{translate("Start the remote IDE for this bound session.")}</p>
+            <p>{translate("startRemoteIde")}</p>
           </div>
         )}
       </div>
@@ -3062,8 +3064,7 @@ function ReviewView({
     return (
       <div className="surface-panel">
         <div className="warning">
-          This session has no workspace configured. Review is unavailable until
-          the session is recreated with a remote workspace.
+          {translate("noWorkspaceReview")}
         </div>
       </div>
     );
@@ -3071,7 +3072,7 @@ function ReviewView({
   return (
     <div className="surface-panel review-panel">
       <div className="surface-toolbar">
-        <span>{translate("Remote review")}</span>
+        <span>{translate("remoteReview")}</span>
         <div>
           <input value={cwd} onChange={(event) => setCwd(event.target.value)} />
           <input
@@ -3089,14 +3090,14 @@ function ReviewView({
                 .catch(onError)
             }
           >
-            Refresh
+            {translate("refresh")}
           </Button>
         </div>
       </div>
       {review ? (
         <div className="review-grid">
           <div>
-            <h3>{translate("Changed files")}</h3>
+            <h3>{translate("changedFiles")}</h3>
             {changes.map((change) => {
               const file =
                 typeof change === "object" &&
@@ -3160,9 +3161,7 @@ function ReviewView({
       ) : (
         <div className="empty-surface">
           <p>
-            {translate(
-              "Load the remote status and changes from the bound host.",
-            )}
+            {translate("loadRemoteChanges")}
           </p>
         </div>
       )}
@@ -3181,7 +3180,7 @@ function PRView({
   return (
     <div className="surface-panel">
       <div className="surface-toolbar">
-        <span>Git workflow and pull requests</span>
+        <span>{translate("gitWorkflowPullRequests")}</span>
         <input value={cwd} onChange={(event) => setCwd(event.target.value)} />
       </div>
       <GitActions selected={selected} cwd={cwd} onError={onError} />
@@ -3237,7 +3236,7 @@ function GitActions({
             .catch(onError)
         }
       >
-        Run {operation}
+        {translate("runOperation", { operation })}
       </Button>
       {lifecycleResult ? (
         <pre className="code-block">
