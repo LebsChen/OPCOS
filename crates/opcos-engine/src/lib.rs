@@ -1977,6 +1977,7 @@ has failed {} times and the last error code was {}",
         record.count += 1;
         record.last_error_code = error_code;
     }
+    #[cfg(test)]
     async fn execute_tool_with_hooks(&self, call: &ToolCall) -> Value {
         self.execute_tool_with_hooks_for_sequence(0, call).await
     }
@@ -2003,7 +2004,9 @@ has failed {} times and the last error code was {}",
         } else if matches!(call.name.as_str(), "send_user_message" | "report_blocker") {
             self.execute_user_communication(call).await
         } else {
-            let result = self.execute_tool_streaming(call).await;
+            let result = self
+                .execute_tool_streaming_for_sequence(assistant_sequence, call)
+                .await;
             self.remember_tool_result(call, &result).await;
             result
         };
@@ -2046,12 +2049,6 @@ has failed {} times and the last error code was {}",
     ) -> Value {
         if self.interrupted.load(Ordering::SeqCst) {
             return classify_tool_error(call, "tool call interrupted");
-        }
-        if let Err(error) = self
-            .recorder
-            .mark_tool_call_dispatch_attempted(assistant_sequence, &call.id)
-        {
-            return classify_tool_error(call, error.to_string());
         }
         tokio::select! {
             result = self.execute_tool_with_hooks_for_sequence(assistant_sequence, call) => result,
@@ -2417,7 +2414,17 @@ has failed {} times and the last error code was {}",
         })
     }
 
-    fn execute_proposed_plan(&self, call: &ToolCall) -> Value {
+    fn execute_proposed_plan_for_sequence(
+        &self,
+        assistant_sequence: i64,
+        call: &ToolCall,
+    ) -> Value {
+        if let Err(error) = self
+            .recorder
+            .mark_tool_call_dispatch_attempted(assistant_sequence, &call.id)
+        {
+            return classify_tool_error(call, error.to_string());
+        }
         let object = call.arguments.as_object();
         let title = object
             .and_then(|value| value.get("title"))
@@ -2760,14 +2767,14 @@ has failed {} times and the last error code was {}",
             } else {
                 tool_risk(&call.name)
             };
-            if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead) {
-                safe_to_retry.push(call.clone());
-            } else if dispatch_attempted {
+            if dispatch_attempted {
                 blocked.push((
                     call.clone(),
                     "execution_state_unknown",
                     "The tool dispatch was attempted, but no durable result exists; execution may have completed.",
                 ));
+            } else if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead) {
+                safe_to_retry.push(call.clone());
             } else {
                 blocked.push((
                     call.clone(),
@@ -4158,6 +4165,7 @@ has failed {} times and the last error code was {}",
 
     async fn execute_tool_once(
         &self,
+        assistant_sequence: i64,
         call: &ToolCall,
         context: &ToolDispatchContext,
     ) -> Result<ToolDispatchResult, EngineError> {
@@ -4441,10 +4449,20 @@ has failed {} times and the last error code was {}",
                 }
                 if call.name == "tool_script" {
                     return Ok(ToolDispatchResult::Completed(
-                        self.execute_tool_script(call).await,
+                        self.execute_tool_script_for_sequence(assistant_sequence, call)
+                            .await,
                     ));
                 }
                 let previous = if matches!(call.name.as_str(), "write_file" | "edit_file") {
+                    if let Err(error) = self
+                        .recorder
+                        .mark_tool_call_dispatch_attempted(assistant_sequence, &call.id)
+                    {
+                        return Ok(ToolDispatchResult::PreflightError(classify_tool_error(
+                            call,
+                            error.to_string(),
+                        )));
+                    }
                     self.executor
                         .execute(
                             "read_file",
@@ -4457,9 +4475,10 @@ has failed {} times and the last error code was {}",
                     None
                 };
                 let result = if call.name == "propose_plan" {
-                    self.execute_proposed_plan(call)
+                    self.execute_proposed_plan_for_sequence(assistant_sequence, call)
                 } else {
-                    self.execute_tool_interruptible(call).await
+                    self.execute_tool_interruptible_for_sequence(assistant_sequence, call)
+                        .await
                 };
                 if matches!(call.name.as_str(), "write_file" | "edit_file")
                     && result.get("error").is_none()
@@ -4507,13 +4526,23 @@ has failed {} times and the last error code was {}",
 
     fn execute_tool_once_boxed<'a>(
         &'a self,
+        assistant_sequence: i64,
         call: &'a ToolCall,
         context: &'a ToolDispatchContext,
     ) -> Pin<Box<dyn Future<Output = Result<ToolDispatchResult, EngineError>> + Send + 'a>> {
-        Box::pin(self.execute_tool_once(call, context))
+        Box::pin(self.execute_tool_once(assistant_sequence, call, context))
     }
 
+    #[cfg(test)]
     async fn execute_tool_script(&self, call: &ToolCall) -> Value {
+        self.execute_tool_script_for_sequence(0, call).await
+    }
+
+    async fn execute_tool_script_for_sequence(
+        &self,
+        assistant_sequence: i64,
+        call: &ToolCall,
+    ) -> Value {
         let limits = match tool_script_limits(&call.arguments) {
             Ok(limits) => limits,
             Err(error) => {
@@ -4529,6 +4558,7 @@ has failed {} times and the last error code was {}",
             }
         };
         self.execute_tool_script_with_limits(
+            assistant_sequence,
             call,
             limits.max_calls,
             limits.max_stdout_bytes,
@@ -4539,6 +4569,7 @@ has failed {} times and the last error code was {}",
 
     async fn execute_tool_script_with_limits(
         &self,
+        assistant_sequence: i64,
         call: &ToolCall,
         max_calls: usize,
         max_stdout_bytes: usize,
@@ -4662,12 +4693,32 @@ has failed {} times and the last error code was {}",
                                 "arguments": audit_arguments,
                             }),
                         );
+                        let child_record = opcos_store::ToolCallRecord {
+                            session_id: self.session_id.clone(),
+                            message_sequence: assistant_sequence,
+                            call_id: child_call.id.clone(),
+                            name: child_call.name.clone(),
+                            arguments: child_call.arguments.clone(),
+                            result: None,
+                        };
+                        if let Err(error) = self.store.append_tool_call(&child_record) {
+                            stopped_reason = "dispatch_error";
+                            ScriptResponse::Abort(json!({
+                                "error": error.to_string(),
+                                "tool": child_call.name,
+                            }))
+                        } else {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         let result = tokio::time::timeout(
                             remaining,
                             async {
                                 let _active = self.track_tool_calls(std::slice::from_ref(&child_call));
-                                self.execute_tool_once_boxed(&child_call, &context).await
+                                self.execute_tool_once_boxed(
+                                    assistant_sequence,
+                                    &child_call,
+                                    &context,
+                                )
+                                .await
                             },
                         )
                         .await;
@@ -4709,6 +4760,12 @@ has failed {} times and the last error code was {}",
                             Ok(Ok(ToolDispatchResult::Completed(mut value)))
                             | Ok(Ok(ToolDispatchResult::PreflightError(mut value))) => {
                                 self.secret_scrubber.scrub(&mut value);
+                                let _ = self.store.complete_tool_call(
+                                    &self.session_id,
+                                    assistant_sequence,
+                                    &child_call.id,
+                                    &value,
+                                );
                                 let _ = self.working_event(
                                     "tool_script_call_completed",
                                     "script",
@@ -4733,8 +4790,24 @@ has failed {} times and the last error code was {}",
                                 );
                                 ScriptResponse::Result(value)
                             }
-                            Ok(Ok(ToolDispatchResult::ScriptAbort(value))) => {
+                            Ok(Ok(ToolDispatchResult::ScriptAbort(mut value))) => {
                                 stopped_reason = "approval_required";
+                                let _ = self.store.complete_tool_call(
+                                    &self.session_id,
+                                    assistant_sequence,
+                                    &child_call.id,
+                                    &value,
+                                );
+                                if let Some(object) = value.as_object_mut() {
+                                    object.insert(
+                                        "recovery".into(),
+                                        json!({
+                                            "classification": "side_effecting_unresolved",
+                                            "dispatch_attempted": false,
+                                            "result_persisted": false,
+                                        }),
+                                    );
+                                }
                                 ScriptResponse::Abort(value)
                             }
                             Ok(Ok(ToolDispatchResult::DeferredReadonly))
@@ -4743,8 +4816,14 @@ has failed {} times and the last error code was {}",
                                 ScriptResponse::Abort(json!({
                                     "error": "tool dispatch returned an unsupported script state",
                                     "tool": child_call.name,
+                                    "recovery": {
+                                        "classification": "side_effecting_unresolved",
+                                        "dispatch_attempted": false,
+                                        "result_persisted": false,
+                                    },
                                 }))
                             }
+                        }
                         }
                     };
                     let abort_response = matches!(&response, ScriptResponse::Abort(_));
@@ -4843,7 +4922,10 @@ has failed {} times and the last error code was {}",
                 results[index] = Some(classify_tool_error(call, "tool call interrupted"));
                 continue;
             }
-            match self.execute_tool_once(call, &context).await? {
+            match self
+                .execute_tool_once(assistant_sequence, call, &context)
+                .await?
+            {
                 ToolDispatchResult::Completed(result)
                 | ToolDispatchResult::PreflightError(result) => {
                     results[index] = Some(result);
@@ -4950,8 +5032,22 @@ has failed {} times and the last error code was {}",
 
     #[cfg(test)]
     async fn execute_tool_streaming(&self, call: &ToolCall) -> Value {
+        self.execute_tool_streaming_for_sequence(0, call).await
+    }
+
+    async fn execute_tool_streaming_for_sequence(
+        &self,
+        assistant_sequence: i64,
+        call: &ToolCall,
+    ) -> Value {
         if let Some(result) = self.execute_recording_tool(call).await {
             return result;
+        }
+        if let Err(error) = self
+            .recorder
+            .mark_tool_call_dispatch_attempted(assistant_sequence, &call.id)
+        {
+            return classify_tool_error(call, error.to_string());
         }
         let emitted = Arc::new(AtomicUsize::new(0));
         let truncated = Arc::new(AtomicBool::new(false));
@@ -7934,6 +8030,7 @@ mod tests {
         );
         let calls = engine
             .execute_tool_script_with_limits(
+                0,
                 &ToolCall {
                     id: "script-calls".into(),
                     name: "tool_script".into(),
@@ -7950,6 +8047,7 @@ mod tests {
         let text = "x".repeat(1000);
         let stdout = engine
             .execute_tool_script_with_limits(
+                0,
                 &ToolCall {
                     id: "script-stdout".into(),
                     name: "tool_script".into(),
@@ -7978,6 +8076,7 @@ mod tests {
         );
         let deadline = deadline_engine
             .execute_tool_script_with_limits(
+                0,
                 &ToolCall {
                     id: "script-deadline".into(),
                     name: "tool_script".into(),
@@ -7996,6 +8095,37 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == "tool_script_call_abandoned")
         );
+    }
+
+    #[tokio::test]
+    async fn script_abort_records_conservative_recovery_classification() {
+        let engine = TurnEngine::new(
+            FakeProvider,
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(FakeTools),
+            "script-abort-recovery",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        let result = engine
+            .execute_tool_script_for_sequence(
+                1,
+                &ToolCall {
+                    id: "script-abort".into(),
+                    name: "tool_script".into(),
+                    arguments: json!({
+                        "script": r#"tool_call("write_file", #{path: "x", content: "changed"});"#
+                    }),
+                },
+            )
+            .await;
+        assert_eq!(result["stopped_reason"], "approval_required");
+        assert_eq!(
+            result["recovery"]["classification"],
+            "side_effecting_unresolved"
+        );
+        assert_eq!(result["recovery"]["dispatch_attempted"], false);
     }
 
     #[tokio::test]
@@ -12368,8 +12498,13 @@ mod tests {
                     external_session_id: None,
                     run_state: "idle".into(),
                     stop_reason: "none".into(),
+                    terminal_cause: None,
+                    provider_finish_reason: None,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
+                    last_active_at: Utc::now(),
+                    sleep_state: "awake".into(),
+                    slept_at: None,
                     project_id: None,
                     agent_id: None,
                 })
@@ -12493,8 +12628,13 @@ mod tests {
                 external_session_id: None,
                 run_state: "idle".into(),
                 stop_reason: "none".into(),
+                terminal_cause: None,
+                provider_finish_reason: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                last_active_at: Utc::now(),
+                sleep_state: "awake".into(),
+                slept_at: None,
                 project_id: None,
                 agent_id: None,
             })
@@ -12565,7 +12705,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatched_read_recovery_is_still_retryable() {
+    async fn dispatched_read_recovery_reports_unknown_without_replaying() {
         let store = Arc::new(SqliteStore::open_in_memory().unwrap());
         store
             .append_message(&StoredMessage {
@@ -12606,16 +12746,114 @@ mod tests {
 
         engine.resume_pending_turn().await.unwrap().unwrap();
 
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
         let messages = store.load_messages("dispatched-read-recovery").unwrap();
-        assert!(messages.iter().any(|message| {
-            message.role == "tool"
-                && message
-                    .content
-                    .pointer("/content/0/tool_use_id")
-                    .and_then(Value::as_str)
-                    == Some("read")
-        }));
+        let result = messages
+            .iter()
+            .find(|message| message.role == "tool")
+            .and_then(|message| message.content.pointer("/content/0/content/0/text"))
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(result.contains("execution_state_unknown"));
+        assert!(result.contains("execution may have completed"));
+    }
+
+    #[tokio::test]
+    async fn approved_dispatch_crash_is_not_replayed_during_recovery() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .save_session(&SessionRecord {
+                session_id: "approved-crash".into(),
+                workspace: "/workspace".into(),
+                model: "fake".into(),
+                mode: "Interactive".into(),
+                harness: "builtin".into(),
+                title: "approved-crash".into(),
+                extra_roots: vec![],
+                grants: json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: json!({}),
+                host_id: "local".into(),
+                provider: None,
+                external_session_id: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                terminal_cause: None,
+                provider_finish_reason: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                last_active_at: Utc::now(),
+                sleep_state: "awake".into(),
+                slept_at: None,
+                project_id: None,
+                agent_id: None,
+            })
+            .unwrap();
+        store
+            .append_message(&StoredMessage {
+                session_id: "approved-crash".into(),
+                sequence: 1,
+                role: "assistant".into(),
+                content: json!({"role":"assistant","tool_calls":[
+                    {"id":"approved-write","name":"write_file","arguments":{"path":"x","content":"changed"}}
+                ]}),
+                display_only: false,
+            })
+            .unwrap();
+        store
+            .save_pending(&PendingRecord {
+                session_id: "approved-crash".into(),
+                call_id: "approved-write".into(),
+                tool: "write_file".into(),
+                arguments: json!({"path":"x","content":"changed"}),
+                state: "pending".into(),
+            })
+            .unwrap();
+        store
+            .take_pending("approved-crash", "approved-write")
+            .unwrap()
+            .unwrap();
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "approved-crash".into(),
+                message_sequence: 1,
+                call_id: "approved-write".into(),
+                name: "write_file".into(),
+                arguments: json!({"path":"x","content":"changed"}),
+                result: None,
+            })
+            .unwrap();
+        store
+            .mark_tool_call_dispatch_attempted("approved-crash", 1, "approved-write")
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(CountingTools {
+                calls: calls.clone(),
+            }),
+            "approved-crash",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+
+        engine.resume_pending_turn().await.unwrap().unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let messages = store.load_messages("approved-crash").unwrap();
+        let result = messages
+            .iter()
+            .find(|message| message.role == "tool")
+            .and_then(|message| message.content.pointer("/content/0/content/0/text"))
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(result.contains("execution_state_unknown"));
+        assert!(result.contains("execution may have completed"));
     }
 
     #[tokio::test]
