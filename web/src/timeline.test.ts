@@ -241,6 +241,28 @@ describe("single event-log timeline", () => {
     expect(nodes.filter((node) => node.kind === "tail_status")).toHaveLength(1);
   });
 
+  it("translates structured setup activity labels", () => {
+    const nodes = buildTimeline([
+      {
+        type: "one_line_thoughts",
+        event_id: "setup",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "one_line_thoughts",
+          payload: { short: "turn_setup_loading_runtime" },
+        },
+      },
+    ] as TimelineEvent[]);
+    expect(nodes[0]).toEqual(
+      expect.objectContaining({
+        kind: "work",
+        rows: [
+          expect.objectContaining({ label: "Loading the session runtime" }),
+        ],
+      }),
+    );
+  });
+
   it("updates and clears a persisted provider wait row when streaming resumes", () => {
     const nodes = buildTimeline([
       {

@@ -2569,6 +2569,30 @@ has failed {} times and the last error code was {}",
         result
     }
 
+    pub async fn submit_recorded_text_with_attachments(
+        &self,
+        attachments: Vec<ExternalContextAttachment>,
+    ) -> Result<AssistantTurn, EngineError> {
+        self.begin_turn()?;
+        self.clear_steering_queue();
+        self.interrupted.store(false, Ordering::SeqCst);
+        self.policy_denied.store(false, Ordering::SeqCst);
+        self.set_session_status("running", "none");
+        let result = async {
+            self.run_loop(self.provider_messages_with_attachments(&attachments)?)
+                .await
+        }
+        .await;
+        self.finish_turn(
+            &result,
+            result
+                .as_ref()
+                .ok()
+                .and_then(|turn| turn.finish_reason.as_deref()),
+        );
+        result
+    }
+
     pub async fn submit_steering(
         &self,
         text: impl Into<String>,
@@ -5459,6 +5483,30 @@ has failed {} times and the last error code was {}",
             system_sections.push(instructions.clone());
         }
         messages.insert(0, system_message(&system_sections));
+        Ok(messages)
+    }
+
+    fn provider_messages_with_attachments(
+        &self,
+        attachments: &[ExternalContextAttachment],
+    ) -> Result<Vec<Value>, EngineError> {
+        let mut messages = self.provider_messages()?;
+        if attachments.is_empty() {
+            return Ok(messages);
+        }
+        if let Some(message) = messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        {
+            let content = message
+                .get_mut("content")
+                .and_then(Value::as_array_mut)
+                .ok_or_else(|| {
+                    EngineError::Store("recorded user message content is invalid".into())
+                })?;
+            content.extend(attachments.iter().map(external_context_content_block));
+        }
         Ok(messages)
     }
 
@@ -9104,6 +9152,40 @@ mod tests {
         );
         let turn = engine.submit_text("hello").await.unwrap();
         assert_eq!(turn.text.as_deref(), Some("done"));
+    }
+
+    #[tokio::test]
+    async fn recorded_user_turn_runs_without_appending_a_duplicate_message() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        let recorder = SessionRecorder::new(store.clone(), "s");
+        recorder
+            .append_message(
+                "user",
+                json!({"role":"user","content":[{"type":"text","text":"hello"}]}),
+            )
+            .unwrap();
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(FakeTools),
+            "s",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        let turn = engine
+            .submit_recorded_text_with_attachments(Vec::new())
+            .await
+            .unwrap();
+        assert_eq!(turn.text.as_deref(), Some("done"));
+        let messages = store.load_messages("s").unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|message| message.role == "user")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

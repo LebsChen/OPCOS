@@ -541,7 +541,7 @@ export function buildTimeline(
       const short = String(data.short ?? data.summary ?? "").trim();
       if (short) {
         activeWork.rows.push({
-          label: short,
+          label: translateBackendError(short),
           activityLabel: true,
           isMajorAction: true,
         });

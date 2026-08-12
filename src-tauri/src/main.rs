@@ -15417,7 +15417,6 @@ async fn submit_turn(
     state: State<'_, DesktopState>,
     request: SubmitRequest,
 ) -> Result<(), String> {
-    wake_session_inner(&state, &request.session_id).await?;
     submit_turn_inner(app, &state, request).await
 }
 
@@ -15437,10 +15436,17 @@ async fn submit_engine_turn_with_coordination_ingest(
     session_id: &str,
     text: String,
     attachments: Vec<ExternalContextAttachment>,
+    recorded: bool,
 ) -> Result<(), EngineError> {
-    engine
-        .submit_text_with_attachments(text, attachments)
-        .await?;
+    if recorded {
+        engine
+            .submit_recorded_text_with_attachments(attachments)
+            .await?;
+    } else {
+        engine
+            .submit_text_with_attachments(text, attachments)
+            .await?;
+    }
     let _ = coordination_ingest_session_inner(state, session_id, false).await;
     Ok(())
 }
@@ -15541,6 +15547,36 @@ fn record_submit_failure(store: &SqliteStore, session_id: &str) -> Result<(), St
     Ok(())
 }
 
+fn fail_submit_turn_with_status(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+    stop_reason: &str,
+    terminal_cause: &str,
+    message: String,
+) -> String {
+    let _ = state.store.update_session_status_with_details(
+        session_id,
+        "error",
+        stop_reason,
+        Some(terminal_cause),
+        None,
+    );
+    emit(
+        app,
+        "notice",
+        Some(session_id),
+        json!({"kind":"error","text":message}),
+    );
+    emit(
+        app,
+        "turn_done",
+        Some(session_id),
+        session_status_payload(state, session_id),
+    );
+    message
+}
+
 fn fail_submit_turn(
     app: &tauri::AppHandle,
     state: &DesktopState,
@@ -15561,6 +15597,101 @@ fn fail_submit_turn(
         session_status_payload(state, session_id),
     );
     error
+}
+
+fn accepted_user_message_content(text: &str, attachments: &[ExternalContextAttachment]) -> Value {
+    let mut content = vec![json!({"type":"text","text":text})];
+    content.extend(attachments.iter().map(|attachment| {
+        json!({
+            "type": "text",
+            "text": format!(
+                "[MCP resource]\nsource: {}\nuri: {}\nmime: {}\n\n{}",
+                attachment.source,
+                attachment.uri.as_deref().unwrap_or("unknown"),
+                attachment.mime_type.as_deref().unwrap_or("unknown"),
+                attachment.content,
+            ),
+        })
+    }));
+    json!({"role":"user","content":content})
+}
+
+fn accepted_user_message_event(text: &str, attachments: &[ExternalContextAttachment]) -> Value {
+    let summaries = attachments
+        .iter()
+        .map(|attachment| {
+            json!({
+                "kind":"text",
+                "name": format!(
+                    "MCP resource: {}",
+                    attachment.uri.as_deref().unwrap_or(&attachment.source)
+                ),
+                "mime": attachment.mime_type,
+                "bytes": attachment.content.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut payload = json!({"message":text});
+    if let Some(object) = payload.as_object_mut()
+        && !summaries.is_empty()
+    {
+        object.insert("attachments".into(), Value::Array(summaries));
+    }
+    acp_session_event(
+        "user_message",
+        acp_working_event("user_message", "message", "incoming", payload),
+    )
+}
+
+fn persist_accepted_user_turn(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+    text: &str,
+    attachments: &[ExternalContextAttachment],
+) -> Result<(), String> {
+    let recorder = SessionRecorder::new(Arc::clone(&state.store), session_id);
+    let event = persist_accepted_user_turn_record(&recorder, text, attachments)?;
+    emit(app, "stream", Some(session_id), event);
+    Ok(())
+}
+
+fn persist_accepted_user_turn_record(
+    recorder: &SessionRecorder<SqliteStore>,
+    text: &str,
+    attachments: &[ExternalContextAttachment],
+) -> Result<Value, String> {
+    let event = accepted_user_message_event(text, attachments);
+    recorder
+        .append_message("user", accepted_user_message_content(text, attachments))
+        .map_err(|error| error.to_string())?;
+    recorder
+        .append_session_event(&event)
+        .map_err(|error| error.to_string())?;
+    Ok(event)
+}
+
+fn emit_setup_status(
+    app: &tauri::AppHandle,
+    state: &DesktopState,
+    session_id: &str,
+    code: &str,
+) -> Result<(), String> {
+    let event = acp_session_event(
+        "one_line_thoughts",
+        acp_working_event(
+            "one_line_thoughts",
+            "thought",
+            "outgoing",
+            json!({"short": structured_ui_message(code, json!({}))}),
+        ),
+    );
+    state
+        .store
+        .append_session_event(session_id, &event)
+        .map_err(|error| error.to_string())?;
+    emit(app, "stream", Some(session_id), event);
+    Ok(())
 }
 
 async fn submit_turn_inner(
@@ -16015,45 +16146,95 @@ pub(crate) async fn submit_turn_inner_with_context(
         )
         .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?
     };
-    wake_session_for_turn(&state.store, &request.session_id)
-        .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?;
+    let accepted_attachments = request.attachments.clone();
+    persist_accepted_user_turn(
+        &app,
+        state,
+        &request.session_id,
+        &request.text,
+        &accepted_attachments,
+    )
+    .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?;
+    let _ = emit_setup_status(&app, state, &request.session_id, "turn_setup_started");
+    let _ = emit_setup_status(
+        &app,
+        state,
+        &request.session_id,
+        "turn_setup_waking_session",
+    );
+    wake_session_for_turn(&state.store, &request.session_id).map_err(|error| {
+        fail_submit_turn_with_status(
+            &app,
+            state,
+            &request.session_id,
+            "harness_error",
+            "harness_error",
+            structured_ui_message("turn_setup_failed", json!({"detail": error})),
+        )
+    })?;
     if session.harness == "acp" {
-        return submit_acp_turn_inner(app.clone(), state, request)
+        let _ = emit_setup_status(
+            &app,
+            state,
+            &request.session_id,
+            "turn_setup_loading_runtime",
+        );
+        return submit_acp_turn_inner(app.clone(), state, request, true)
             .await
             .map_err(|error| fail_submit_turn(&app, state, &session.session_id, error));
     }
-    let host_id = session_host_id(state, &request.session_id)
-        .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?;
+    let host_id = session_host_id(state, &request.session_id).map_err(|error| {
+        fail_submit_turn_with_status(
+            &app,
+            state,
+            &request.session_id,
+            "harness_error",
+            "harness_error",
+            structured_ui_message("turn_setup_failed", json!({"detail": error})),
+        )
+    })?;
     if host_id != "local" {
-        let client = client_for(state, &host_id)
-            .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?;
-        if let Err(error) = client.health().await {
-            let _ = state.store.update_session_status_with_details(
+        let client = client_for(state, &host_id).map_err(|error| {
+            fail_submit_turn_with_status(
+                &app,
+                state,
                 &request.session_id,
-                "error",
+                "harness_error",
+                "harness_error",
+                structured_ui_message("turn_setup_failed", json!({"detail": error})),
+            )
+        })?;
+        let _ = emit_setup_status(&app, state, &request.session_id, "turn_setup_checking_host");
+        if let Err(error) = client.health().await {
+            return Err(fail_submit_turn_with_status(
+                &app,
+                state,
+                &request.session_id,
                 "host_unavailable",
-                Some("host_unavailable"),
-                None,
-            );
-            emit(
-                &app,
-                "notice",
-                Some(&request.session_id),
-                json!({"kind":"error","text":"Remote host unavailable"}),
-            );
-            emit(
-                &app,
-                "turn_done",
-                Some(&request.session_id),
-                session_status_payload(state, &request.session_id),
-            );
-            return Err(format!("remote host unavailable: {error}"));
+                "host_unavailable",
+                structured_ui_message("host_unavailable", json!({"detail": error.to_string()})),
+            ));
         }
     }
     let sequence_before = state
         .store
         .max_message_notice_sequence(&request.session_id)
-        .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error.to_string()))?;
+        .map_err(|error| {
+            fail_submit_turn_with_status(
+                &app,
+                state,
+                &request.session_id,
+                "harness_error",
+                "harness_error",
+                structured_ui_message("turn_setup_failed", json!({"detail": error.to_string()})),
+            )
+        })?;
+    let _ = emit_setup_status(
+        &app,
+        state,
+        &request.session_id,
+        "turn_setup_loading_runtime",
+    );
     let engine = engine_for_with_context(
         &app,
         state,
@@ -16063,11 +16244,29 @@ pub(crate) async fn submit_turn_inner_with_context(
         Some(&request.text),
     )
     .await
-    .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?;
+    .map_err(|error| {
+        fail_submit_turn_with_status(
+            &app,
+            state,
+            &request.session_id,
+            "harness_error",
+            "harness_error",
+            structured_ui_message("turn_setup_failed", json!({"detail": error})),
+        )
+    })?;
     let plan_before_turn = state
         .store
         .load_plan(&request.session_id)
-        .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error.to_string()))?;
+        .map_err(|error| {
+            fail_submit_turn_with_status(
+                &app,
+                state,
+                &request.session_id,
+                "harness_error",
+                "harness_error",
+                structured_ui_message("turn_setup_failed", json!({"detail": error.to_string()})),
+            )
+        })?;
     if let Err(error) = auto_route_project_plan(&app, state, &request.session_id).await {
         audit(
             state,
@@ -16076,24 +16275,31 @@ pub(crate) async fn submit_turn_inner_with_context(
             json!({"error": error}),
         );
     }
-    let mut attachments = request.attachments;
-    attachments.extend(
-        session_context_attachments(state, &request.session_id)
-            .await
-            .map_err(|error| fail_submit_turn(&app, state, &request.session_id, error))?,
-    );
-    emit(
+    let _ = emit_setup_status(
         &app,
-        "message",
-        Some(&request.session_id),
-        json!({"role":"user","text":request.text}),
+        state,
+        &request.session_id,
+        "turn_setup_loading_context",
     );
+    let attachments = session_context_attachments(state, &request.session_id)
+        .await
+        .map_err(|error| {
+            fail_submit_turn_with_status(
+                &app,
+                state,
+                &request.session_id,
+                "harness_error",
+                "harness_error",
+                structured_ui_message("turn_setup_failed", json!({"detail": error})),
+            )
+        })?;
     match submit_engine_turn_with_coordination_ingest(
         &engine,
         state,
         &request.session_id,
         request.text,
         attachments,
+        true,
     )
     .await
     {
@@ -16455,23 +16661,25 @@ impl AcpDesktopLifecycle {
         self.sink.emit("stream", event);
     }
 
-    fn start(&self, text: &str) -> Result<(), String> {
+    fn start(&self, text: &str, user_turn_recorded: bool) -> Result<(), String> {
         self.recorder
             .update_status("running", "none")
             .map_err(|error| error.to_string())?;
-        persist_acp_user_turn(&self.recorder, text)?;
-        self.sink.emit(
-            "stream",
-            acp_session_event(
-                "user_message",
-                acp_working_event(
+        if !user_turn_recorded {
+            persist_acp_user_turn(&self.recorder, text)?;
+            self.sink.emit(
+                "stream",
+                acp_session_event(
                     "user_message",
-                    "message",
-                    "incoming",
-                    json!({"message": text}),
+                    acp_working_event(
+                        "user_message",
+                        "message",
+                        "incoming",
+                        json!({"message": text}),
+                    ),
                 ),
-            ),
-        );
+            );
+        }
         Ok(())
     }
 
@@ -16676,6 +16884,7 @@ async fn submit_acp_turn_inner(
     app: tauri::AppHandle,
     state: &DesktopState,
     request: SubmitRequest,
+    user_turn_recorded: bool,
 ) -> Result<(), String> {
     let harness = match acp_for(state, &request.session_id).await {
         Ok(harness) => harness,
@@ -16702,7 +16911,7 @@ async fn submit_acp_turn_inner(
             session_id: request.session_id.clone(),
         }),
     });
-    lifecycle.start(&request.text)?;
+    lifecycle.start(&request.text, user_turn_recorded)?;
     let start_events = {
         let mut sessions = state.acp_event_sessions.lock().await;
         sessions.insert(request.session_id.clone())
@@ -25316,6 +25525,7 @@ async fn auto_route_project_plan(
                     worker_session,
                     message,
                     Vec::new(),
+                    false,
                 )
                 .await
                 {
@@ -34128,6 +34338,48 @@ agents:
         store
     }
 
+    #[test]
+    fn accepted_user_turn_is_persisted_before_setup_failure() {
+        let store = acp_test_store();
+        let recorder = SessionRecorder::new(store.clone(), "acp-lifecycle");
+        let event = persist_accepted_user_turn_record(
+            &recorder,
+            "hello",
+            &[ExternalContextAttachment {
+                source: "mcp:test".into(),
+                uri: Some("resource://test".into()),
+                mime_type: Some("text/plain".into()),
+                content: "context".into(),
+            }],
+        )
+        .unwrap();
+        store
+            .update_session_status_with_details(
+                "acp-lifecycle",
+                "error",
+                "harness_error",
+                Some("harness_error"),
+                None,
+            )
+            .unwrap();
+        let session = store.load_session("acp-lifecycle").unwrap().unwrap();
+        assert_eq!(session.run_state, "error");
+        assert_eq!(session.stop_reason, "harness_error");
+        assert_eq!(session.terminal_cause.as_deref(), Some("harness_error"));
+        assert_eq!(store.load_messages("acp-lifecycle").unwrap().len(), 1);
+        assert_eq!(
+            store
+                .load_session_events("acp-lifecycle")
+                .unwrap()
+                .iter()
+                .filter(|event| event.event["type"] == "user_message")
+                .count(),
+            1
+        );
+        assert_eq!(event["type"], "user_message");
+        assert_eq!(event["working_event"]["payload"]["message"], "hello");
+    }
+
     #[tokio::test]
     async fn acp_desktop_lifecycle_persists_and_emits_terminal_turn() {
         let store = acp_test_store();
@@ -34143,7 +34395,7 @@ agents:
             session_id: "acp-lifecycle".into(),
             sink: sink.clone(),
         });
-        lifecycle.start("hello").unwrap();
+        lifecycle.start("hello", false).unwrap();
         assert_eq!(
             store
                 .load_session("acp-lifecycle")
@@ -34241,7 +34493,7 @@ agents:
             session_id: "acp-lifecycle".into(),
             sink,
         });
-        lifecycle.start("hello").unwrap();
+        lifecycle.start("hello", false).unwrap();
         store
             .update_session_status("acp-lifecycle", "interrupted", "interrupted_by_user")
             .unwrap();
@@ -34278,7 +34530,7 @@ agents:
             session_id: "acp-lifecycle".into(),
             sink: sink.clone(),
         });
-        lifecycle.start("hello").unwrap();
+        lifecycle.start("hello", false).unwrap();
         let (sender, receiver) = tokio::sync::mpsc::channel(1);
         let task = tokio::spawn(lifecycle.consume(receiver));
         sender

@@ -74,6 +74,13 @@ describe("structured backend UI messages", () => {
         "question_delivered_to_inbox",
         "plan_confirmation_delivered_to_inbox",
         "coordination_worker_approval_required",
+        "turn_setup_started",
+        "turn_setup_waking_session",
+        "turn_setup_checking_host",
+        "turn_setup_loading_runtime",
+        "turn_setup_loading_context",
+        'turn_setup_failed {"detail":"runtime unavailable"}',
+        'host_unavailable {"detail":"connection refused"}',
       ];
       for (const value of messages) {
         const translated = translateBackendError(value);
@@ -90,6 +97,16 @@ describe("structured backend UI messages", () => {
           'provider_waiting {"elapsed":"25","phase":"response"}',
         ),
       ).toContain("25 秒");
+      expect(
+        translateBackendError(
+          'turn_setup_failed {"detail":"runtime unavailable"}',
+        ),
+      ).toContain("会话准备失败");
+      expect(
+        translateBackendError(
+          'host_unavailable {"detail":"connection refused"}',
+        ),
+      ).toContain("主机不可用");
       expect(
         translateBackendError('future_backend_code {"detail":"raw"}'),
       ).toBe('future_backend_code {"detail":"raw"}');
