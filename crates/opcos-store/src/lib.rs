@@ -25,7 +25,7 @@ pub enum SessionActivity {
     NotActivity,
 }
 
-pub fn classify_session_event_type(event_type: &str) -> Result<SessionActivity, StoreError> {
+fn classify_session_event_type_explicit(event_type: &str) -> Option<SessionActivity> {
     match event_type {
         "user_message"
         | "assistant_delta"
@@ -33,13 +33,8 @@ pub fn classify_session_event_type(event_type: &str) -> Result<SessionActivity, 
         | "tool_call_delta"
         | "tool_result"
         | "approval_pending"
-        | "approval_requested"
         | "approval_resolved"
-        | "approval_allowed"
-        | "approval_denied"
         | "ask_user_pending"
-        | "question_requested"
-        | "question_pending"
         | "user_question_answered"
         | "devin_message"
         | "devin_thoughts"
@@ -73,7 +68,7 @@ pub fn classify_session_event_type(event_type: &str) -> Result<SessionActivity, 
         | "plan_update"
         | "tool_call_update"
         | "error"
-        | "coordination_report" => Ok(SessionActivity::Activity),
+        | "coordination_report" => Some(SessionActivity::Activity),
         "model_switch"
         | "compaction_summary_invalid"
         | "compacted"
@@ -85,14 +80,20 @@ pub fn classify_session_event_type(event_type: &str) -> Result<SessionActivity, 
         | "read_file_completed"
         | "write_file_completed"
         | "propose_plan_completed"
-        | "provider_silent" => Ok(SessionActivity::Activity),
-        "status_update" | "turn" | "turn_finished" | "stream_reset" | "session_snapshot" => {
-            Ok(SessionActivity::NotActivity)
-        }
-        _ => Err(StoreError::Validation(format!(
-            "unclassified session event type: {event_type}"
-        ))),
+        | "provider_silent" => Some(SessionActivity::Activity),
+        "status_update"
+        | "turn"
+        | "turn_finished"
+        | "stream_reset"
+        | "session_snapshot"
+        | "acp_mode_update"
+        | "acp_config_option_update" => Some(SessionActivity::NotActivity),
+        _ => None,
     }
+}
+
+pub fn classify_session_event_type(event_type: &str) -> SessionActivity {
+    classify_session_event_type_explicit(event_type).unwrap_or(SessionActivity::NotActivity)
 }
 
 #[derive(Debug, Error)]
@@ -2520,7 +2521,7 @@ impl SqliteStore {
             .get("type")
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| StoreError::Validation("session event type is required".into()))?;
-        let activity = classify_session_event_type(event_type)?;
+        let activity = classify_session_event_type(event_type);
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let sequence: i64 = connection.query_row(
             "SELECT COALESCE(MAX(sequence), 0) + 1 FROM session_events WHERE session_id=?1",
@@ -7365,14 +7366,94 @@ mod tests {
     #[test]
     fn session_event_activity_classification_is_explicit() {
         assert_eq!(
-            classify_session_event_type("user_message").unwrap(),
+            classify_session_event_type("user_message"),
             SessionActivity::Activity
         );
         assert_eq!(
-            classify_session_event_type("turn_finished").unwrap(),
+            classify_session_event_type("turn_finished"),
             SessionActivity::NotActivity
         );
-        assert!(classify_session_event_type("new_event_without_classification").is_err());
+        assert_eq!(
+            classify_session_event_type("new_event_without_classification"),
+            SessionActivity::NotActivity
+        );
+        assert!(classify_session_event_type_explicit("new_event_without_classification").is_none());
+    }
+
+    fn quoted_call_literals(source: &str, marker: &str) -> Vec<String> {
+        let mut values = Vec::new();
+        let mut offset = 0;
+        while let Some(relative) = source[offset..].find(marker) {
+            let start = offset + relative + marker.len();
+            let rest = source[start..].trim_start();
+            if let Some(rest) = rest.strip_prefix('"')
+                && let Some(end) = rest.find('"')
+            {
+                values.push(rest[..end].to_owned());
+            }
+            offset = start;
+        }
+        values
+    }
+
+    #[test]
+    fn production_session_event_types_are_explicitly_classified() {
+        let sources = [
+            "../../crates/opcos-engine/src/lib.rs",
+            "../../crates/opcos-engine/src/acp.rs",
+            "../../src-tauri/src/main.rs",
+        ];
+        let markers = [
+            "working_event(",
+            "record_working_event(",
+            "notice(",
+            "acp_session_event(",
+            "acp_working_event(",
+            "acp_stream_event(",
+            "emit_event(",
+        ];
+        let mut event_types = BTreeMap::new();
+        for relative_path in sources {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(relative_path);
+            let source = fs::read_to_string(&path).unwrap_or_else(|error| {
+                panic!("failed to read {}: {error}", path.display());
+            });
+            for marker in markers {
+                for event_type in quoted_call_literals(&source, marker) {
+                    event_types.insert(event_type, path.clone());
+                }
+            }
+            let lines = source.lines().collect::<Vec<_>>();
+            for (index, line) in lines.iter().enumerate() {
+                let Some(type_start) = line.find("\"type\"") else {
+                    continue;
+                };
+                let Some(colon) = line[type_start + 6..].find(':') else {
+                    continue;
+                };
+                let value = line[type_start + 6 + colon + 1..].trim_start();
+                let Some(value) = value.strip_prefix('"') else {
+                    continue;
+                };
+                let Some(value_end) = value.find('"') else {
+                    continue;
+                };
+                let context_start = index.saturating_sub(8);
+                if lines[context_start..=index]
+                    .iter()
+                    .any(|context| context.contains("append_session_event("))
+                {
+                    event_types.insert(value[..value_end].to_owned(), path.clone());
+                }
+            }
+        }
+        for (event_type, path) in event_types {
+            assert!(
+                classify_session_event_type_explicit(&event_type).is_some(),
+                "{event_type:?} from {} is missing explicit activity classification",
+                path.display()
+            );
+        }
     }
 
     #[test]
@@ -7417,6 +7498,43 @@ mod tests {
                 .list_idle_sleep_candidates(Utc::now() - chrono::Duration::hours(1))
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn unknown_session_event_is_persisted_without_refreshing_activity() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = test_session("unknown-event");
+        store.save_session(&session).unwrap();
+        let old = Utc::now() - chrono::Duration::hours(2);
+        store
+            .touch_session_activity(&session.session_id, old)
+            .unwrap();
+        store
+            .append_session_event(
+                &session.session_id,
+                &serde_json::json!({
+                    "type": "future_event_type",
+                    "event_id": "future",
+                    "created_at_ms": Utc::now().timestamp_millis(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .load_session_events(&session.session_id)
+                .unwrap()
+                .last()
+                .unwrap()
+                .event["type"],
+            "future_event_type"
+        );
+        assert_eq!(
+            store
+                .session_last_activity(&session.session_id)
+                .unwrap()
+                .unwrap(),
+            old
         );
     }
 
