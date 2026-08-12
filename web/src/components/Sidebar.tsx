@@ -15,7 +15,7 @@ import { PersonaGlyph, personaGlyph } from "./personaIcon";
 import { SearchModal } from "./SearchModal";
 import { baseName } from "../paths";
 import { showPersonas } from "../flags";
-import { translate } from "../i18n";
+import { subscribeLocale, translate } from "../i18n";
 
 const AUTOMATIONS_CHANGED = "opcos://automations-changed";
 const PERSONAS_CHANGED = "opcos://personas-changed";
@@ -194,6 +194,11 @@ type SidebarProps = Partial<Props> & {
 };
 
 export function Sidebar(props: SidebarProps) {
+  const [, setLocaleVersion] = useState(0);
+  useEffect(
+    () => subscribeLocale(() => setLocaleVersion((value) => value + 1)),
+    [],
+  );
   const agent = props.agent ?? "opcos";
   const workspace = props.workspace ?? "";
   const surfaces = props.surfaces ?? { chat: true };
@@ -691,8 +696,8 @@ export function Sidebar(props: SidebarProps) {
               </div>
               {(
                 [
-                  ["grouped", "Persona"],
-                  ["flat", "Chronological"],
+                  ["grouped", "persona"],
+                  ["flat", "chronological"],
                 ] as ["flat" | "grouped", string][]
               ).map(([key, label]) => (
                 <button
@@ -700,7 +705,7 @@ export function Sidebar(props: SidebarProps) {
                   className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-[13px] text-left hover:bg-paper"
                   onClick={() => setGroupBy(key)}
                 >
-                  <span className="flex-1">{label}</span>
+                  <span className="flex-1">{translate(label)}</span>
                   {layout === key && (
                     <span className="text-accent text-[12px]">✓</span>
                   )}
@@ -1381,7 +1386,7 @@ export function Sidebar(props: SidebarProps) {
                 )}
                 {appMenuItem(
                   "inbox",
-                  "Inbox",
+                  translate("inbox"),
                   props.onOpenInbox ?? (() => undefined),
                   props.inboxActive,
                 )}

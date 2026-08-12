@@ -4273,7 +4273,7 @@ function ManageSections({
                   onClick={() => setEnvironmentTab(value)}
                   type="button"
                 >
-                  {label}
+                  {translate(label)}
                 </button>
               ))}
             </div>
@@ -4613,7 +4613,7 @@ function ManageSections({
             ).map(([keyName, label]) => (
               <label className="settings-row" key={keyName}>
                 <div>
-                  <strong>{label}</strong>
+                  <strong>{translate(label)}</strong>
                   <small>{translate("pullRequestWorkflow")}</small>
                 </div>
                 <input
@@ -4902,10 +4902,10 @@ function ManageSections({
                       badge={{
                         label:
                           descriptor.available === false
-                            ? "Not integrated"
+                            ? translate("notIntegrated")
                             : config?.configured
-                              ? "Enabled"
-                              : "Not configured",
+                              ? translate("enabled")
+                              : translate("notConfigured"),
                         tone:
                           descriptor.available === false || !config?.configured
                             ? "neutral"
@@ -4913,10 +4913,10 @@ function ManageSections({
                       }}
                       description={
                         descriptor.available === false
-                          ? "Not integrated."
+                          ? translate("notIntegrated")
                           : config?.configured
-                            ? "Configured securely."
-                            : config?.base_url || "Not configured yet."
+                            ? translate("configuredSecurely")
+                            : config?.base_url || translate("notConfiguredYet")
                       }
                       disabled={descriptor.available === false}
                       onClick={() => {
@@ -7005,12 +7005,12 @@ function ManageSections({
                     const status = configurable
                       ? tokenStatus?.connected
                         ? `Connected as ${tokenStatus.identity || "bot"}`
-                        : "Configurable"
+                        : "configurable"
                       : connector.name === "Linear"
                         ? linearStatus.includes("Connected")
-                          ? "Connected"
-                          : "Configurable"
-                        : "Not integrated";
+                          ? "connected"
+                          : "configurable"
+                        : "notIntegrated";
                     return (
                       <IntegrationCard
                         key={connector.name}
@@ -7019,17 +7019,17 @@ function ManageSections({
                         badge={{
                           label:
                             configurable && tokenStatus?.connected
-                              ? "Connected"
-                              : status === "Configurable"
-                                ? "Configurable"
-                                : status === "Connected"
-                                  ? "Connected"
-                                  : "Not integrated",
+                              ? translate("connected")
+                              : status === "configurable"
+                                ? translate("configurable")
+                                : status === "connected"
+                                  ? translate("connected")
+                                  : translate("notIntegrated"),
                           tone:
                             (configurable && tokenStatus?.connected) ||
-                            status === "Connected"
+                            status === "connected"
                               ? "success"
-                              : status === "Configurable"
+                              : status === "configurable"
                                 ? "info"
                                 : "neutral",
                         }}
@@ -13022,8 +13022,8 @@ function AppContent() {
                               selected.run_state,
                               selected.stop_reason,
                             ) === "restart"
-                              ? "Restart"
-                              : "Retry"
+                              ? translate("restart")
+                              : translate("retry")
                           }
                           onQuestionAnswer={(callId, answer) => {
                             void command("resolve_inbox", {

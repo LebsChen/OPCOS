@@ -619,9 +619,7 @@ export function buildTimeline(
       }
     } else if (type === "model_switch") {
       flush(event.created_at_ms);
-      const model = String(
-        data.model ?? data.model_id ?? data.name ?? data.message ?? "",
-      ).trim();
+      const model = String(data.model ?? data.model_id ?? "").trim();
       if (model) {
         nodes.push({
           kind: "notice",

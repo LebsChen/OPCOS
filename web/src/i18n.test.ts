@@ -76,12 +76,6 @@ const zhEnglishKeyAllowlist = new Set([
   "connectorToken",
   "worktree",
   "worktreeLabel",
-  "knowledgeSection",
-  "playbookSection",
-  "skillSection",
-  "secretsSection",
-  "blueprintSection",
-  "environmentSection",
   "artifactCount",
   "artifactsLabel",
   "prompts",
@@ -143,6 +137,10 @@ describe("i18n source coverage", () => {
       `${sourceRoot}components/ApprovalCard.tsx`,
       "utf8",
     );
+    const composerSource = readFileSync(
+      `${sourceRoot}components/Composer.tsx`,
+      "utf8",
+    );
     const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
     const connectorBlock =
       appSource.match(
@@ -162,6 +160,9 @@ describe("i18n source coverage", () => {
     ].map((match) => match[1]);
     staticLabels.push("light", "dark", "auto");
     expect(staticLabels.filter((key) => !keys.has(key))).toEqual([]);
+    expect(appSource).not.toMatch(/<strong>\{label\}<\/strong>/);
+    expect(appSource).not.toMatch(/>\s*\{label\}\s*</);
+    expect(composerSource).not.toMatch(/\{current\?\.label\s*\|\|\s*mode\}/);
   });
 
   it("does not leave bare product copy in JSX text or visible attributes", () => {

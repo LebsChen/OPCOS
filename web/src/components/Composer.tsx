@@ -1434,11 +1434,11 @@ function ModeMenu({
         aria-expanded={open}
         aria-label={translate("mode")}
         title={
-          `Mode: ${current?.label || mode}` +
-          (unattended ? " · approvals go to the Inbox" : "")
+          `${translate("mode")}: ${current ? translate(current.label) : mode}` +
+          (unattended ? ` · ${translate("approvalsInInbox")}` : "")
         }
       >
-        {current?.label || mode}
+        {current ? translate(current.label) : mode}
         <Icon name="chevronDown" size={11} className="text-faint" />
       </button>
       {open && (
