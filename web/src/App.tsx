@@ -3374,11 +3374,11 @@ function CiMonitorPanel({
       .catch(onError);
   return (
     <details>
-      <summary>GitHub CI failure monitor and event source</summary>
+      <summary>{translate("ciMonitorTitle")}</summary>
       <input
         value={monitorId}
         onChange={(event) => setMonitorId(event.target.value)}
-        placeholder="monitor id"
+        placeholder={translate("monitorId")}
       />
       <input
         value={repo}
@@ -3388,24 +3388,24 @@ function CiMonitorPanel({
       <input
         value={pullRequest}
         onChange={(event) => setPullRequest(event.target.value)}
-        placeholder="PR number"
+        placeholder={translate("prNumber")}
       />
       <input
         value={branch}
         onChange={(event) => setBranch(event.target.value)}
-        placeholder="branch"
+        placeholder={translate("branch")}
       />
-      <Button onClick={save}>Save monitor</Button>
+      <Button onClick={save}>{translate("saveMonitor")}</Button>
       {monitor ? (
         <Button onClick={toggle}>
-          {enabled ? "Disable monitoring" : "Enable monitoring"}
+          {enabled
+            ? translate("disableMonitoring")
+            : translate("enableMonitoring")}
         </Button>
       ) : null}
-      <Button onClick={refresh}>Refresh status</Button>
+      <Button onClick={refresh}>{translate("refreshStatus")}</Button>
       <p className="muted small">
-        Enabling this monitor explicitly authorizes the bounded CI repair loop
-        for this PR. The runner remains separately controlled by the global
-        runner setting. Disable the monitor to revoke its repair authorization.
+        {translate("ciAuthorizationNotice")}
       </p>
       {repairItems.length > 0 ? (
         <div className="stack">
@@ -3440,21 +3440,24 @@ function CiMonitorPanel({
             return (
               <article key={record.queue_id ?? JSON.stringify(item)}>
                 <strong>{record.queue_id ?? "ci_repair_loop"}</strong>
-                <div>Status: {record.status ?? "unknown"}</div>
-                <div>Phase: {state.phase ?? "queued"}</div>
+                <div>{translate("status")}: {record.status ?? "unknown"}</div>
+                <div>{translate("phase")}: {state.phase ?? "queued"}</div>
                 <div>
-                  Attempts: {state.repair_attempts ?? 0} /{" "}
+                  {translate("attempts")}: {state.repair_attempts ?? 0} /{" "}
                   {state.max_repair_attempts ?? 3}
                 </div>
                 <div>
-                  Polls: {state.poll_count ?? 0} / {state.max_polls ?? 20}
+                  {translate("polls")}: {state.poll_count ?? 0} /{" "}
+                  {state.max_polls ?? 20}
                 </div>
-                <div>Deadline: {state.deadline ?? "not set"}</div>
-                <div>Current SHA: {state.head_sha ?? "not set"}</div>
-                <div>Expected SHA: {state.expected_head_sha ?? "not set"}</div>
-                <div>Stop reason: {state.stop_reason ?? "none"}</div>
+                <div>{translate("deadline")}: {state.deadline ?? "not set"}</div>
+                <div>{translate("currentSha")}: {state.head_sha ?? "not set"}</div>
                 <div>
-                  Signatures:{" "}
+                  {translate("expectedSha")}: {state.expected_head_sha ?? "not set"}
+                </div>
+                <div>{translate("stopReason")}: {state.stop_reason ?? "none"}</div>
+                <div>
+                  {translate("signatures")}:{" "}
                   {signatures.length > 0 ? signatures.join(" → ") : "none"}
                 </div>
               </article>
@@ -3527,52 +3530,51 @@ function RunnerPanel({
       .catch(onError);
   return (
     <details>
-      <summary>Autonomous runner profile</summary>
+      <summary>{translate("autonomousRunnerProfile")}</summary>
       <p className="muted small">
-        The runner is disabled by default. A profile explicitly selects the
-        host, provider, model, and workspace for sessionless work items.
+        {translate("runnerDescription")}
       </p>
       <input
         value={hostId}
         onChange={(event) => setHostId(event.target.value)}
-        placeholder="host id"
+        placeholder={translate("hostId")}
       />
       <input
         value={provider}
         onChange={(event) => setProvider(event.target.value)}
-        placeholder="provider"
+        placeholder={translate("provider")}
       />
       <input
         value={model}
         onChange={(event) => setModel(event.target.value)}
-        placeholder="model"
+        placeholder={translate("model")}
       />
       <input
         value={workspace}
         onChange={(event) => setWorkspace(event.target.value)}
-        placeholder="workspace"
+        placeholder={translate("workspace")}
       />
-      <Button onClick={save}>Save runner profile</Button>
+      <Button onClick={save}>{translate("saveRunnerProfile")}</Button>
       <label>
         <input
           type="checkbox"
           checked={enabled}
           onChange={(event) => setEnabled(event.target.checked)}
         />
-        Profile enabled
+        {translate("profileEnabled")}
       </label>
       <input
         value={maxConcurrency}
         onChange={(event) => setMaxConcurrency(event.target.value)}
         inputMode="numeric"
-        placeholder="max concurrency"
+        placeholder={translate("maxConcurrency")}
       />
       <Button onClick={toggleRunner}>
         {runnerEnabled
-          ? "Disable background runner"
-          : "Enable background runner"}
+          ? translate("disableBackgroundRunner")
+          : translate("enableBackgroundRunner")}
       </Button>
-      <Button onClick={refresh}>Refresh runner settings</Button>
+      <Button onClick={refresh}>{translate("refreshRunnerSettings")}</Button>
     </details>
   );
 }
