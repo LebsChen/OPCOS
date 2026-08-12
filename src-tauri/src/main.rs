@@ -14,8 +14,8 @@ use opcos_engine::SecretScrubber;
 use opcos_engine::{
     AcpHarness, AcpHarnessConfig, AgentAutomationAction, AgentEngine, AgentRole, ArtifactReference,
     ArtifactRequest, ArtifactSink, BoundedWorkType, CapturedFrame, EngineError,
-    ExternalContextAttachment, Harness, LifecycleHook, LifecycleHookConfig, PreflightDecision,
-    RecordingSource, SessionRecorder, ToolExecutor, ToolOrigin, TurnEngine,
+    ExternalContextAttachment, Harness, HookCommandOutput, LifecycleHook, LifecycleHookConfig,
+    PreflightDecision, RecordingSource, SessionRecorder, ToolExecutor, ToolOrigin, TurnEngine,
     computer_use::{
         BestEffortScreenshotChangedVerifier, ComputerUseLoopConfig, ComputerUseStep,
         run_computer_use_loop,
@@ -638,6 +638,7 @@ struct DesktopState {
     engines: Arc<AsyncMutex<HashMap<String, Arc<GuiEngine>>>>,
     engine_capabilities: AsyncMutex<HashMap<String, HostCapabilities>>,
     engine_hosts: AsyncMutex<HashMap<String, String>>,
+    lifecycle_started_sessions: AsyncMutex<HashSet<String>>,
     acp_engines: AsyncMutex<HashMap<String, Arc<opcos_engine::AcpHarness<SqliteStore>>>>,
     acp_event_sessions: AsyncMutex<HashSet<String>>,
     acp_streams: Mutex<HashMap<String, UnboundedSender<(String, Value)>>>,
@@ -942,6 +943,23 @@ async fn probe_session_capabilities(
         .capabilities()
         .await
         .map_err(|error| format!("remote capabilities unavailable: {error}"))
+    }
+}
+
+const SESSION_END_TOTAL_BUDGET: Duration = Duration::from_secs(10);
+
+async fn run_session_end_with_budget<F, Fut>(count: usize, budget: Duration, mut run: F)
+where
+    F: FnMut(usize, Duration) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
+    for index in 0..count {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        run(index, deadline.saturating_duration_since(now)).await;
     }
 }
 
@@ -5352,14 +5370,14 @@ impl ToolExecutor for RemoteExecutor {
         command: &str,
         input: Value,
         timeout: Duration,
-    ) -> Result<Option<Value>, String> {
+    ) -> Result<HookCommandOutput, String> {
         let platform = self
             .client
             .health()
             .await
             .ok()
             .and_then(|health| health.platform);
-        run_hook_on_client(
+        let output = run_hook_on_client(
             &self.client,
             command,
             input,
@@ -5367,7 +5385,11 @@ impl ToolExecutor for RemoteExecutor {
             self.workspace.clone(),
             platform.as_deref(),
         )
-        .await
+        .await?;
+        Ok(match output {
+            Some(value) => HookCommandOutput::Json(value),
+            None => HookCommandOutput::InvalidOutput,
+        })
     }
 
     async fn execute(&self, name: &str, arguments: Value) -> Result<Value, String> {
@@ -5879,11 +5901,11 @@ impl ToolExecutor for DesktopExecutor {
         command: &str,
         input: Value,
         timeout: Duration,
-    ) -> Result<Option<Value>, String> {
+    ) -> Result<HookCommandOutput, String> {
         match self {
             Self::Remote(executor) => executor.run_hook_command(command, input, timeout).await,
             Self::Local(executor) => {
-                run_hook_on_host(
+                let output = run_hook_on_host(
                     &executor.host,
                     command,
                     input,
@@ -5891,7 +5913,11 @@ impl ToolExecutor for DesktopExecutor {
                     executor.workspace.clone(),
                     Some(std::env::consts::OS),
                 )
-                .await
+                .await?;
+                Ok(match output {
+                    Some(value) => HookCommandOutput::Json(value),
+                    None => HookCommandOutput::InvalidOutput,
+                })
             }
         }
     }
@@ -13069,10 +13095,20 @@ async fn engine_for_with_context(
         return Ok(engine);
     }
     let mut engines = state.engines.lock().await;
+    let inserted = !engines.contains_key(session_id);
     let entry = engines
         .entry(session_id.to_owned())
-        .or_insert_with(|| Arc::clone(&engine));
-    Ok(Arc::clone(entry))
+        .or_insert_with(|| Arc::clone(&engine))
+        .clone();
+    drop(engines);
+    if inserted {
+        let mut started = state.lifecycle_started_sessions.lock().await;
+        if started.insert(session_id.to_owned()) {
+            drop(started);
+            entry.session_start_hook().await;
+        }
+    }
+    Ok(entry)
 }
 
 fn structured_ui_message(code: &str, params: Value) -> String {
@@ -29800,6 +29836,7 @@ fn main() {
                 engines: Arc::clone(&engines),
                 engine_capabilities: AsyncMutex::new(HashMap::new()),
                 engine_hosts: AsyncMutex::new(HashMap::new()),
+                lifecycle_started_sessions: AsyncMutex::new(HashSet::new()),
                 acp_engines: AsyncMutex::new(HashMap::new()),
                 acp_event_sessions: AsyncMutex::new(HashSet::new()),
                 acp_streams: Mutex::new(HashMap::new()),
@@ -30185,6 +30222,28 @@ fn main() {
         .run(|app: &tauri::AppHandle, event: RunEvent| {
             if matches!(event, RunEvent::Exit) {
                 let state = app.state::<DesktopState>();
+                let engines = tauri::async_runtime::block_on(async {
+                    state
+                        .engines
+                        .lock()
+                        .await
+                        .values()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                });
+                tauri::async_runtime::block_on(async move {
+                    run_session_end_with_budget(
+                        engines.len(),
+                        SESSION_END_TOTAL_BUDGET,
+                        |index, timeout| {
+                            let engine = Arc::clone(&engines[index]);
+                            async move {
+                                engine.session_end_hook(timeout).await;
+                            }
+                        },
+                    )
+                    .await;
+                });
                 if let Ok(stop) = state.trigger_watcher_stop.lock()
                     && let Some(stop) = stop.as_ref()
                 {
@@ -30311,6 +30370,21 @@ mod m7_tests {
         assert!(!returned);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn session_end_budget_stops_serial_waiting() {
+        let started = std::time::Instant::now();
+        let mut completed = 0;
+        run_session_end_with_budget(5, Duration::from_millis(80), |_, _| {
+            completed += 1;
+            async {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+        })
+        .await;
+        assert!(completed < 5);
+        assert!(started.elapsed() < Duration::from_millis(180));
     }
 
     fn wake_test_session(store: &SqliteStore, session_id: &str, harness: &str) {
