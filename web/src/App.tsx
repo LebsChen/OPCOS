@@ -2367,8 +2367,13 @@ function ProjectCoordinationPanel({
             {translate("currentStage")}：
             {snapshot?.status === "done"
               ? translate("completed")
-              : snapshot?.workflow?.workflow?.[snapshot.stage_index]?.stage ||
-                translate("notStarted")}
+              : (() => {
+                  const stage =
+                    snapshot?.workflow?.workflow?.[snapshot.stage_index]?.stage;
+                  return stage
+                    ? translate(String(stage))
+                    : translate("notStarted");
+                })()}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -4100,10 +4105,6 @@ function ManageSections({
         : tab === "command"
           ? "command"
           : libraryKind;
-  const assetLabel =
-    assetTabKind === "agents"
-      ? translate("rulesSection")
-      : assetTabKind[0].toUpperCase() + assetTabKind.slice(1);
   useEffect(() => {
     if (tab !== "instructions") return;
     setInstructionsDraft(
@@ -6250,37 +6251,17 @@ function ManageSections({
           <div>
             {(
               [
-                [
-                  "agents",
-                  translate("rulesSection"),
-                  translate("rulesDescription"),
-                ],
-                [
-                  "instructions",
-                  translate("instructionsSection"),
-                  translate("instructionsDescription"),
-                ],
-                [
-                  "knowledge",
-                  "Knowledge",
-                  "Reusable reference material added to the knowledge context.",
-                ],
-                [
-                  "playbook",
-                  "Playbook",
-                  "A repeatable workflow that can be run by an automation.",
-                ],
-                [
-                  "skill",
-                  "Skill",
-                  "A focused capability or instruction bundle available to the agent.",
-                ],
+                ["agents", "rulesSection"],
+                ["instructions", "instructionsSection"],
+                ["knowledge", "knowledgeSection"],
+                ["playbook", "playbookSection"],
+                ["skill", "skillSection"],
               ] as const
             )
               .filter(
                 ([kind]) => kind === assetTabKind && kind !== "instructions",
               )
-              .map(([kind, label, description]) => (
+              .map(([kind, labelKey]) => (
                 <CollectionPage
                   key={kind}
                   search={assetSearch}
@@ -6288,7 +6269,9 @@ function ManageSections({
                   searchPlaceholder={
                     kind === "agents"
                       ? translate("searchRules")
-                      : `Search ${label}`
+                      : translate("searchAssetsWithLabel", {
+                          label: translate(labelKey),
+                        })
                   }
                   actions={
                     tab === "knowledge" || tab === "playbook" ? (
@@ -6430,7 +6413,9 @@ function ManageSections({
                     >
                       {kind === "agents"
                         ? translate("newRule")
-                        : translate("newAssetWithLabel", { label })}
+                        : translate("newAssetWithLabel", {
+                            label: translate(labelKey),
+                          })}
                     </Button>
                   }
                   rows={
@@ -6557,7 +6542,9 @@ function ManageSections({
                         <p className="px-4 py-6 text-[13px] text-muted">
                           {kind === "agents"
                             ? translate("noRules")
-                            : translate("noAssetsForLabel", { label })}
+                            : translate("noAssetsForLabel", {
+                                label: translate(labelKey),
+                              })}
                         </p>
                       )}
                     </>
@@ -6565,7 +6552,9 @@ function ManageSections({
                   empty={
                     kind === "agents"
                       ? translate("noRules")
-                      : translate("noAssetsForLabel", { label })
+                      : translate("noAssetsForLabel", {
+                          label: translate(labelKey),
+                        })
                   }
                 />
               ))}
@@ -7344,7 +7333,7 @@ function ManageSections({
           <CollectionPage
             search=""
             onSearch={() => undefined}
-            searchPlaceholder="Repository index"
+            searchPlaceholder={translate("repositoryIndex")}
             primary={
               <Button
                 className="primary"
@@ -7967,7 +7956,10 @@ function McpManage({
                     icon={String(server.name).slice(0, 1).toUpperCase()}
                     title={String(server.name)}
                     badge={{
-                      label: String(server.status || "configured"),
+                      label:
+                        String(server.status || "configured") === "disabled"
+                          ? translate("disabled")
+                          : String(server.status || "configured"),
                       tone:
                         String(server.status || "").toLowerCase() === "error"
                           ? "neutral"
@@ -8036,7 +8028,10 @@ function McpManage({
                   icon={String(tool.name).slice(0, 1).toUpperCase()}
                   title={String(tool.name)}
                   badge={{
-                    label: tool.enabled === true ? "Enabled" : "Disabled",
+                    label:
+                      tool.enabled === true
+                        ? translate("enabled")
+                        : translate("disabled"),
                     tone: tool.enabled === true ? "success" : "neutral",
                   }}
                   description={`${String(tool.transport || "remote")} · ${String(tool.command || tool.url || "host-provided")}`}
@@ -8073,8 +8068,8 @@ function McpManage({
         }
         empty={
           selected
-            ? "No MCP tools available."
-            : "Select a session to inspect its host MCP tools."
+            ? translate("noMcpToolsAvailable")
+            : translate("selectSessionMcpTools")
         }
       />
       {selectedServer && (

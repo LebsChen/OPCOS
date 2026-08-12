@@ -73,12 +73,10 @@ const zhEnglishKeyAllowlist = new Set([
   "mcpServerId",
   "accountId",
   "secretsLabel",
-  "connectorToken",
   "worktree",
   "worktreeLabel",
   "artifactCount",
   "artifactsLabel",
-  "prompts",
   "tokens",
   "hash",
   "cloneExample",
@@ -166,6 +164,11 @@ describe("i18n source coverage", () => {
     expect(appSource).not.toMatch(/<strong>\{label\}<\/strong>/);
     expect(appSource).not.toMatch(/>\s*\{label\}\s*</);
     expect(composerSource).not.toMatch(/\{current\?\.label\s*\|\|\s*mode\}/);
+    expect(appSource).not.toMatch(/`Search \$\{label\}`/);
+    expect(appSource).not.toMatch(/searchPlaceholder="Repository index"/);
+    expect(appSource).not.toMatch(
+      /tool\.enabled === true \? "Enabled" : "Disabled"/,
+    );
   });
 
   it("does not leave bare product copy in JSX text or visible attributes", () => {
