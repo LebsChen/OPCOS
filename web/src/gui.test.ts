@@ -500,11 +500,13 @@ describe("GUI boundary behavior", () => {
     expect(source).toContain("command<{\n        url: string;");
     expect(source).not.toContain("ws://127.0.0.1:");
     expect(source).not.toContain("surface-ended");
-    expect(source).not.toContain("<code>{surfaceUrl}</code>");
-    expect(source).toContain("command<{\n        url: string;");
+    expect(source).not.toMatch(
+      /<(?:code|iframe|img)[^>]*(?:\{surfaceUrl\}|(?:src|href|title|aria-label)=\{surfaceUrl\})/,
+    );
     expect(source).not.toContain('start("cdp"');
     expect(source).toContain("new WebSocket(surfaceUrl)");
     expect(source).toContain("new RFB(vncHost.current, surfaceUrl");
+    expect(source).toContain("intentionallyClosed = true");
     expect(source).toContain('command<string>("ide_url"');
     expect(source).toContain("Remote IDE workspace is not configured");
     expect(source).not.toContain(
@@ -563,6 +565,7 @@ describe("GUI boundary behavior", () => {
     expect(source).toContain("retrySurface");
     expect(source).toContain("surfaceRetryToken");
     expect(source).toContain("surfaceUnavailable");
+    expect(source).toContain("if (!cancelled && !failed)");
     expect(source).toContain("preserveSurfaceTabWhileSleeping");
     expect(source).toContain("touchSessionActivity");
   });

@@ -2709,6 +2709,7 @@ function SurfaceView({
     let cancelled = false;
     let timer: number | undefined;
     const poll = async () => {
+      let failed = false;
       try {
         const frame = await command<{
           image: string;
@@ -2721,10 +2722,12 @@ function SurfaceView({
         }
       } catch (error) {
         if (!cancelled) {
+          failed = true;
           markSurfaceFailed(errorMessage(error));
         }
       }
-      if (!cancelled) timer = window.setTimeout(() => void poll(), 1000);
+      if (!cancelled && !failed)
+        timer = window.setTimeout(() => void poll(), 1000);
     };
     void poll();
     return () => {
@@ -2741,6 +2744,7 @@ function SurfaceView({
     });
     terminal.open(terminalHost.current);
     const socket = new WebSocket(surfaceUrl);
+    let intentionallyClosed = false;
     socket.binaryType = "arraybuffer";
     const pending: Array<string | Uint8Array> = [];
     const send = (data: string | Uint8Array) => {
@@ -2752,6 +2756,7 @@ function SurfaceView({
       while (pending.length) socket.send(pending.shift()!);
     };
     const reportFailure = () => {
+      if (intentionallyClosed) return;
       surfaceUrlRef.current = "";
       setSurfaceUrl("");
       if (!surfaceFailedRef.current)
@@ -2786,6 +2791,7 @@ function SurfaceView({
     observer.observe(terminalHost.current);
     requestAnimationFrame(resize);
     return () => {
+      intentionallyClosed = true;
       observer.disconnect();
       input.dispose();
       socket.close();
@@ -2799,7 +2805,9 @@ function SurfaceView({
     });
     rfb.scaleViewport = true;
     let connected = false;
+    let intentionallyClosed = false;
     const report = (message: string) => {
+      if (intentionallyClosed) return;
       surfaceUrlRef.current = "";
       setSurfaceUrl("");
       markSurfaceFailed(message);
@@ -2836,6 +2844,7 @@ function SurfaceView({
     host?.addEventListener("keydown", onUserInput);
     host?.addEventListener("wheel", onUserInput, { passive: true });
     return () => {
+      intentionallyClosed = true;
       host?.removeEventListener("pointerdown", onUserInput);
       host?.removeEventListener("keydown", onUserInput);
       host?.removeEventListener("wheel", onUserInput);
