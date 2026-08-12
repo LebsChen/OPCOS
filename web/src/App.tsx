@@ -1735,17 +1735,17 @@ function ProjectConfigPanel({
         </p>
         <div className="grid gap-3 md:grid-cols-2">
           <div className="grid gap-2 rounded-lg border border-line p-3">
-            <strong className="text-sm text-ink">Provider key</strong>
+            <strong className="text-sm text-ink">{translate("providerKey")}</strong>
             <input
               value={providerName}
               onChange={(event) => setProviderName(event.target.value)}
-              placeholder="Provider ID"
+              placeholder={translate("providerId")}
             />
             <input
               type="password"
               value={providerKey}
               onChange={(event) => setProviderKey(event.target.value)}
-              placeholder="Provider key"
+              placeholder={translate("providerKey")}
             />
             <button
               className="btn"
@@ -1764,17 +1764,17 @@ function ProjectConfigPanel({
             </button>
           </div>
           <div className="grid gap-2 rounded-lg border border-line p-3">
-            <strong className="text-sm text-ink">MCP credential</strong>
+            <strong className="text-sm text-ink">{translate("mcpCredential")}</strong>
             <input
               value={mcpServerId}
               onChange={(event) => setMcpServerId(event.target.value)}
-              placeholder="MCP server ID"
+              placeholder={translate("mcpServerId")}
             />
             <input
               type="password"
               value={mcpCredential}
               onChange={(event) => setMcpCredential(event.target.value)}
-              placeholder="Credential JSON"
+              placeholder={translate("credentialJson")}
             />
             <button
               className="btn"
@@ -1793,17 +1793,17 @@ function ProjectConfigPanel({
             </button>
           </div>
           <div className="grid gap-2 rounded-lg border border-line p-3">
-            <strong className="text-sm text-ink">Connector token</strong>
+            <strong className="text-sm text-ink">{translate("connectorToken")}</strong>
             <input
               value={connectorKind}
               onChange={(event) => setConnectorKind(event.target.value)}
-              placeholder="Connector kind"
+              placeholder={translate("connectorKind")}
             />
             <input
               type="password"
               value={connectorToken}
               onChange={(event) => setConnectorToken(event.target.value)}
-              placeholder="Token"
+              placeholder={translate("token")}
             />
             <button
               className="btn"
@@ -1822,7 +1822,9 @@ function ProjectConfigPanel({
             </button>
           </div>
           <div className="grid gap-2 rounded-lg border border-line p-3">
-            <strong className="text-sm text-ink">GitHub Enterprise 实例</strong>
+            <strong className="text-sm text-ink">
+              {translate("githubEnterpriseInstance")}
+            </strong>
             <span className="text-xs text-faint">
               github.com 默认可用。企业实例登记后 API base 归一化为
               https://&lt;host&gt;/api/v3，凭据使用 connector kind
@@ -1836,7 +1838,7 @@ function ProjectConfigPanel({
             <input
               value={githubApiBase}
               onChange={(event) => setGithubApiBase(event.target.value)}
-              placeholder="API base（可选，默认 https://host/api/v3）"
+              placeholder={translate("apiBaseOptional")}
             />
             <button
               className="btn"
@@ -3583,7 +3585,7 @@ function DiffView({ diff }: { diff: Record<string, unknown> | null }) {
   if (!diff)
     return (
       <div className="diff-view empty-surface">
-        {translate("Select a changed file.")}
+        {translate("selectChangedFile")}
       </div>
     );
   const text =
@@ -3683,7 +3685,7 @@ function WorklogView({
   return (
     <div className="surface-panel">
       <div className="surface-toolbar">
-        <span>{translate("Worklog timeline")}</span>
+        <span>{translate("worklogTimeline")}</span>
         <Button onClick={load}>
           <Icon name="refresh" /> Reload
         </Button>
@@ -3696,7 +3698,7 @@ function WorklogView({
       )}
       {!worklog && (
         <div className="empty-surface">
-          <p>{translate("Load the remote worklog for this session.")}</p>
+          <p>{translate("loadRemoteWorklog")}</p>
           <Button onClick={load}>{translate("openWorklog")}</Button>
         </div>
       )}
@@ -9844,7 +9846,7 @@ function StandalonePane({ route }: { route: PaneRoute }) {
         {selected && route.tab === "info" && (
           <div className="info">
             <Field k={translate("Session ID")} v={selected.id} />
-            <Field k={translate("Status")} v="Ready" />
+        <Field k={translate("Status")} v={translate("ready")} />
             <Field k={translate("Host")} v={selected.host_name} />
             <Field
               k={translate("Workspace")}
@@ -10739,7 +10741,7 @@ function TasksPane({ events }: { events: TimelineEvent[] }) {
   if (!steps?.length) {
     return (
       <section className="tasks-pane">
-        <div className="tasks-empty">No tasks yet.</div>
+        <div className="tasks-empty">{translate("noTasksYet")}</div>
       </section>
     );
   }
@@ -10996,8 +10998,8 @@ function SessionRightPanel({
               )}
               <button
                 className="drawer-action"
-                title={translate("Collapse session panel")}
-                aria-label={translate("Collapse session panel")}
+                title={translate("collapseSessionPanel")}
+                aria-label={translate("collapseSessionPanel")}
                 onClick={() => {
                   onCollapsedChange?.(true);
                 }}
@@ -11371,7 +11373,7 @@ function InboxPane({
                             [item.call_id]: event.target.value,
                           }))
                         }
-                        placeholder="Type your answer"
+                        placeholder={translate("typeAnswer")}
                       />
                       <button
                         className="btn approval-primary"
@@ -11440,8 +11442,8 @@ function QuestionCard({
         <button
           className="transcript-question-close"
           type="button"
-          aria-label="Collapse question"
-          title="Collapse question"
+          aria-label={translate("collapseQuestion")}
+          title={translate("collapseQuestion")}
           onClick={onCollapse}
         >
           ×
@@ -13172,7 +13174,7 @@ function AppContent() {
                         <button
                           className="pill-x"
                           type="button"
-                          title="移除附件"
+                    title={translate("removeAttachment")}
                           onClick={() => setHomeAttachment(null)}
                         >
                           ×
@@ -13252,11 +13254,11 @@ function AppContent() {
                       title={translate("role")}
                       value={homeRole}
                       onChange={(event) => setHomeRole(event.target.value)}
-                      placeholder="Role"
+                    placeholder={translate("role")}
                     />
                     <select
                       className="chip"
-                      title="Harness"
+                      title={translate("harness")}
                       value={homeHarness}
                       onChange={(event) => setHomeHarness(event.target.value)}
                     >
@@ -13394,7 +13396,7 @@ function AppContent() {
           <div className="error-toast" role="alert" data-testid="error-toast">
             {error}
             <button
-              aria-label="Dismiss notification"
+              aria-label={translate("dismissNotification")}
               onClick={() => {
                 setError("");
                 if (errorTimer.current !== undefined)
