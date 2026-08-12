@@ -1,4 +1,4 @@
-import { translate } from "./i18n";
+import { translate, translateBackendError } from "./i18n";
 
 export type ErrorPresentation = {
   summary: string;
@@ -19,8 +19,11 @@ function friendlyErrorText(text: string): string {
 }
 
 export function providerErrorPresentation(text: string): ErrorPresentation {
+  const translatedText = translateBackendError(text);
   const translatedProviderError =
-    /^(Provider request failed|提供商请求失败)(?::|：)/.test(text.trim());
+    /^(Provider request failed|提供商请求失败)(?::|：)/.test(
+      translatedText.trim(),
+    );
   let status: number | undefined;
   let message = text;
   try {
@@ -38,7 +41,9 @@ export function providerErrorPresentation(text: string): ErrorPresentation {
   const statusText = status ? ` — HTTP ${status}` : "";
   return {
     summary: translate("providerRequestFailed", { status: statusText }),
-    toast: translatedProviderError ? text : friendlyErrorText(message),
+    toast: translatedProviderError
+      ? translatedText
+      : friendlyErrorText(message),
     detail: text,
   };
 }

@@ -11,6 +11,14 @@ describe("transcript presentation helpers", () => {
     expect(error.detail).toContain("system_cpu_overloaded");
   });
 
+  it("recognizes structured provider errors before toast humanization", () => {
+    const error = providerErrorPresentation(
+      'provider_request_failed {"detail":"upstream overloaded"}',
+    );
+    expect(error.toast).toBe("Provider request failed: upstream overloaded");
+    expect(error.toast).not.toContain("provider_request_failed");
+  });
+
   it.each([
     ["running", "running"],
     ["ok", "ok"],

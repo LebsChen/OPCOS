@@ -678,6 +678,17 @@ describe("i18n source coverage", () => {
     );
   });
 
+  it("matches approval-flow suppression by backend code, not translated copy", () => {
+    const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
+    expect(appSource).toContain("isApprovalFlowError(reason)");
+    expect(appSource).not.toContain(
+      'message.includes(translate("approvalRequiredBeforeToolContinue"))',
+    );
+    expect(appSource).not.toContain(
+      'message.includes(translate("questionRequiresAnswerBeforeToolContinue"))',
+    );
+  });
+
   it("formats insight durations with their millisecond unit", () => {
     const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
     expect(appSource).toMatch(

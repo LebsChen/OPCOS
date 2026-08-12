@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import {
   canRebindSession,
   hostFailureMessage,
+  isApprovalFlowError,
   noticeClass,
   redactApproval,
   submitFailureMessage,
@@ -31,6 +32,21 @@ import {
 } from "./gui";
 
 describe("GUI boundary behavior", () => {
+  it("suppresses approval-flow invoke rejections by backend code", () => {
+    expect(isApprovalFlowError("approval_required_before_tool_continue")).toBe(
+      true,
+    );
+    expect(
+      isApprovalFlowError("question_requires_answer_before_tool_continue"),
+    ).toBe(true);
+    expect(
+      isApprovalFlowError(
+        'approval_required_before_tool_continue {"call_id":"call-1"}',
+      ),
+    ).toBe(true);
+    expect(isApprovalFlowError("provider_request_failed")).toBe(false);
+  });
+
   it("routes session lifecycle events through the shared Tauri event channel", () => {
     expect(
       shouldRefreshForSessionLifecycleEvent({ kind: "session-sleep" }),
