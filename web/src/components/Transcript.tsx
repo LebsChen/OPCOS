@@ -212,7 +212,7 @@ function QuestionCard({
             setAnswer("");
           }}
         >
-          Send
+          {translate("send")}
         </button>
       </div>
     </div>
@@ -569,7 +569,10 @@ export function Transcript({
         if (node.kind === "approval")
           return node.resolved ? (
             <div className="transcript-resolved" key={index}>
-              Worked · {node.resolved === "allow" ? "Allowed" : "Denied"}{" "}
+              {translate("workedDetail")} ·{" "}
+              {node.resolved === "allow"
+                ? translate("allowedLabel")
+                : translate("deniedLabel")}{" "}
               {node.name}
             </div>
           ) : null;
@@ -641,11 +644,14 @@ export function Transcript({
                 <span className="transcript-row-meta">{row.shellId}</span>
               )}
               {row.exitCode !== undefined && row.exitCode !== 0 && (
-                <span className="transcript-row-meta">exit {row.exitCode}</span>
+                <span className="transcript-row-meta">
+                  {translate("exitLabel")} {row.exitCode}
+                </span>
               )}
               {row.denied && (
                 <span className="ml-2 text-xs text-muted">
-                  not run{row.detail ? ` · ${row.detail}` : ""}
+                  {translate("notRunDetail")}
+                  {row.detail ? ` · ${row.detail}` : ""}
                 </span>
               )}
               {row.durationMs !== undefined && (
@@ -657,7 +663,7 @@ export function Transcript({
                 <span
                   className={`transcript-row-result${row.resultError ? " text-danger" : ""}`}
                 >
-                  {row.resultError && "failed · "}
+                  {row.resultError && `${translate("failed")} · `}
                   {row.resultSummary}
                 </span>
               )}
@@ -684,12 +690,13 @@ export function Transcript({
                 row.exitCode !== 0 &&
                 !hasTerminalOutput && (
                   <span className="transcript-row-meta">
-                    exit {row.exitCode}
+                    {translate("exitLabel")} {row.exitCode}
                   </span>
                 )}
               {row.denied && !hasTerminalOutput && (
                 <span className="ml-2 text-xs text-muted">
-                  not run{row.detail ? ` · ${row.detail}` : ""}
+                  {translate("notRunDetail")}
+                  {row.detail ? ` · ${row.detail}` : ""}
                 </span>
               )}
               {row.durationMs !== undefined && !hasTerminalOutput && (
@@ -701,7 +708,7 @@ export function Transcript({
                 <span
                   className={`transcript-row-result${row.resultError ? " text-danger" : ""}`}
                 >
-                  {row.resultError && "failed · "}
+                  {row.resultError && `${translate("failed")} · `}
                   {row.resultSummary}
                 </span>
               )}

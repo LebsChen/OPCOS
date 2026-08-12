@@ -908,7 +908,9 @@ export function Sidebar(props: SidebarProps) {
                                 setProjShowAll((s) => toggleSet(s, proj))
                               }
                             >
-                              Show more ({list.length - peek})
+                              {translate("showMoreCount", {
+                                count: list.length - peek,
+                              })}
                             </button>
                           )}
                         </div>
@@ -944,7 +946,9 @@ export function Sidebar(props: SidebarProps) {
                         setPersonaShowAll((s) => toggleSet(s, browseKey))
                       }
                     >
-                      Show more ({mine.filter(matches).length - peek})
+                      {translate("showMoreCount", {
+                        count: mine.filter(matches).length - peek,
+                      })}
                     </button>
                   )}
               </>
@@ -963,7 +967,7 @@ export function Sidebar(props: SidebarProps) {
                 size={13}
                 className="shrink-0"
               />
-              Archived ({archived.length})
+              {translate("archivedCount", { count: archived.length })}
             </button>
             {showArchived && (
               <div className="space-y-0.5 mt-0.5">
@@ -1126,7 +1130,7 @@ export function Sidebar(props: SidebarProps) {
           <div>
             <div className="flex items-center justify-between px-1.5 mb-1">
               <span className="text-[10.5px] uppercase tracking-[0.07em] text-faint font-semibold">
-                项目
+                {translate("projectLabel")}
               </span>
               <button
                 className="w-6 h-6 grid place-items-center rounded-md text-faint hover:text-ink hover:bg-paper"
@@ -1180,7 +1184,7 @@ export function Sidebar(props: SidebarProps) {
                   className="w-full px-2 py-1.5 text-left text-[12px] text-faint hover:text-ink"
                   onClick={onCreateProject}
                 >
-                  新建项目
+                  {translate("newProject")}
                 </button>
               )}
             </div>

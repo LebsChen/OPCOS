@@ -1408,7 +1408,7 @@ function ProjectConfigPanel({
             ["agents", translate("rules")],
             ["experts", translate("experts")],
             ["teams", translate("teams")],
-            ["command", "Command"],
+            ["command", translate("command")],
             ["knowledge", "Knowledge"],
             ["playbook", "Playbook"],
             ["mcp", "MCP"],
@@ -1497,7 +1497,9 @@ function ProjectConfigPanel({
                         onClick={() => {
                           if (
                             window.confirm(
-                              `将删除项目覆盖「${template.name}」，恢复继承全局预设。确定继续吗？`,
+                              translate("restoreProjectOverrideConfirm", {
+                                name: template.name,
+                              }),
                             )
                           ) {
                             void command("restore_project_configuration", {
@@ -1699,7 +1701,7 @@ function ProjectConfigPanel({
                 <span className="ml-2 text-xs text-faint">
                   {secret.project_id
                     ? secret.purpose
-                    : `${secret.purpose} · 全局回退`}
+                    : `${secret.purpose} · ${translate("globalFallback")}`}
                 </span>
               </span>
               {secret.project_id === project.id && (
@@ -1828,9 +1830,7 @@ function ProjectConfigPanel({
               {translate("githubEnterpriseInstance")}
             </strong>
             <span className="text-xs text-faint">
-              github.com 默认可用。企业实例登记后 API base 归一化为
-              https://&lt;host&gt;/api/v3，凭据使用 connector kind
-              github@&lt;host&gt;。
+              {translate("githubEnterpriseDescription")}
             </span>
             <input
               value={githubHost}
@@ -1858,7 +1858,7 @@ function ProjectConfigPanel({
                   .catch(onError)
               }
             >
-              登记企业实例
+              {translate("registerEnterpriseInstance")}
             </button>
             {githubInstances.map((instance) => (
               <div
@@ -1879,7 +1879,7 @@ function ProjectConfigPanel({
                       .catch(onError)
                   }
                 >
-                  删除
+                  {translate("delete")}
                 </button>
               </div>
             ))}
@@ -1967,7 +1967,7 @@ function ProjectBoard({
   const deleteMember = async (agent: ProjectAgent, force = false) => {
     if (
       !force &&
-      !window.confirm(`确定删除成员「${agent.name}」？其 worktree 将被回收。`)
+      !window.confirm(translate("deleteMemberConfirm", { name: agent.name }))
     )
       return;
     try {
@@ -1990,7 +1990,7 @@ function ProjectBoard({
   const archiveProject = async () => {
     if (
       !window.confirm(
-        `确定归档项目「${project.name}」？归档不会删除 worktree。`,
+        translate("archiveProjectConfirm", { name: project.name }),
       )
     )
       return;
@@ -2029,9 +2029,7 @@ function ProjectBoard({
   const deleteProject = async (force = false) => {
     if (
       !force &&
-      !window.confirm(
-        `确定删除项目「${project.name}」？这会回收所有成员 worktree，且不可撤销。`,
-      )
+      !window.confirm(translate("deleteProjectConfirm", { name: project.name }))
     )
       return;
     setProjectActionBusy(true);
@@ -3698,10 +3696,7 @@ function WorklogView({
         </Button>
       </div>
       {Boolean(worklog?.window_lost) && (
-        <div className="warning">
-          The requested worklog window was lost. Reloaded from the current
-          window.
-        </div>
+        <div className="warning">{translate("worklogWindowLost")}</div>
       )}
       {!worklog && (
         <div className="empty-surface">
@@ -4278,7 +4273,7 @@ function ManageSections({
                 <div>
                   <strong>{translate("blueprints")}</strong>
                   <small className="block">
-                    当前生效来源：
+                    {translate("currentSource")}
                     {blueprintStatus?.source === "project"
                       ? translate("projectBlueprint")
                       : blueprintStatus?.source === "global"
@@ -4290,7 +4285,7 @@ function ManageSections({
                 </div>
                 {!selected ? (
                   <div className="text-sm text-muted">
-                    请先打开一个项目会话查看 Blueprint
+                    {translate("openProjectSessionBlueprint")}
                   </div>
                 ) : (
                   <>
@@ -4315,7 +4310,7 @@ function ManageSections({
                             .catch(onError)
                         }
                       >
-                        重新读取
+                        {translate("reloadBlueprint")}
                       </Button>
                       <Button
                         className="primary"
@@ -4332,12 +4327,12 @@ function ManageSections({
                             enabled: true,
                           })
                             .then(() =>
-                              setEnvironmentStatus("Blueprint 已保存"),
+                              setEnvironmentStatus(translate("blueprintSaved")),
                             )
                             .catch(onError)
                         }
                       >
-                        保存当前作用域
+                        {translate("saveCurrentScope")}
                       </Button>
                     </div>
                     {environmentStatus && (
@@ -4351,8 +4346,7 @@ function ManageSections({
               <section className="rounded-lg border border-line p-4">
                 <strong>{translate("snapshots")}</strong>
                 <p className="mt-2 text-sm text-muted">
-                  本产品不适用：Local/RVM
-                  是长期固定环境，不提供快照，也不伪造等价的快照能力。
+                  {translate("snapshotsNotApplicable")}
                 </p>
               </section>
             )}
@@ -4361,7 +4355,7 @@ function ManageSections({
                 <div>
                   <strong>{translate("advancedRepositories")}</strong>
                   <small className="block">
-                    setup executor 会按此列表顺序执行 clone 与 setup。
+                    {translate("setupExecutorDescription")}
                   </small>
                 </div>
                 {environmentRepositories.map((item, index) => (
@@ -4435,7 +4429,7 @@ function ManageSections({
                           )
                         }
                       >
-                        删除
+                        {translate("deleteRepository")}
                       </Button>
                     </div>
                   </div>
@@ -4453,7 +4447,7 @@ function ManageSections({
                       ])
                     }
                   >
-                    添加仓库
+                    {translate("addRepository")}
                   </Button>
                   <Button
                     className="primary"
@@ -4468,7 +4462,7 @@ function ManageSections({
                         .catch(onError)
                     }
                   >
-                    保存顺序
+                    {translate("saveOrder")}
                   </Button>
                 </div>
                 {environmentStatus && (
@@ -4480,8 +4474,7 @@ function ManageSections({
               <section className="rounded-lg border border-line p-4">
                 <strong>{translate("outposts")}</strong>
                 <p className="mt-2 text-sm text-muted">
-                  OPCOS 将 Outposts 映射为已登记的长期主机（Local/RVM）；
-                  这里展示主机清单，不额外虚构独立 Outpost 资源。
+                  {translate("outpostsDescription")}
                 </p>
                 <div className="mt-3 space-y-2">
                   {hosts.length === 0 ? (
@@ -4692,7 +4685,7 @@ function ManageSections({
                     .catch(onError)
                 }
               >
-                保存 Agent 设置
+                {translate("saveAgentSettings")}
               </Button>
             </div>
             <div className="pt-5">
@@ -4700,7 +4693,7 @@ function ManageSections({
                 <div>
                   <strong>{translate("manageCommands")}</strong>
                   <small className="block">
-                    System 命令可覆盖或 Reset；Custom 命令可添加、编辑和删除。
+                    {translate("commandManagementDescription")}
                   </small>
                 </div>
                 <Button
@@ -4750,7 +4743,7 @@ function ManageSections({
                                 .catch(onError)
                             }
                           >
-                            Reset
+                            {translate("resetSystem")}
                           </Button>
                         )}
                         {item.kind === "custom" && (
@@ -4770,7 +4763,7 @@ function ManageSections({
                                 .catch(onError)
                             }
                           >
-                            删除
+                            {translate("delete")}
                           </Button>
                         )}
                       </span>
@@ -4800,7 +4793,7 @@ function ManageSections({
                           }).catch(onError)
                         }
                       >
-                        保存
+                        {translate("save")}
                       </Button>
                     </div>
                   </div>
@@ -4882,7 +4875,7 @@ function ManageSections({
                     setCustomProviderEditorOpen(true);
                   }}
                 >
-                  添加自定义 Provider
+                  {translate("addCustomProvider")}
                 </Button>
               </div>
               <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,440px),440px))] gap-2.5">
@@ -4969,7 +4962,7 @@ function ManageSections({
                     className="text-[12.5px] text-muted hover:text-ink"
                     onClick={() => setSelectedProvider(null)}
                   >
-                    ‹ All providers
+                    {`‹ ${translate("allProviders")}`}
                   </button>
                   <div className="flex items-center gap-3 mt-3 mb-1">
                     <span className="rounded-lg border border-line grid place-items-center shrink-0 w-9 h-9 bg-paper">
@@ -5085,7 +5078,7 @@ function ManageSections({
                           )
                           .map((item) => ({
                             value: item.id,
-                            label: `${item.label}${item.capabilities_known ? "" : " (能力未知)"}`,
+                            label: `${item.label}${item.capabilities_known ? "" : ` (${translate("unknownCapabilities")})`}`,
                           }))}
                       />
                     </label>
@@ -5093,11 +5086,11 @@ function ManageSections({
                   {providerModelOptions[descriptor.name] && (
                     <div className="flex items-center gap-2 mt-2 text-[11.5px] text-faint">
                       <span>
-                        来源：
+                        {translate("sourceLabel")}
                         {providerModelOptions[descriptor.name].source === "live"
-                          ? "API 实时发现"
+                          ? translate("liveApiDiscovery")
                           : `${translate("builtIn")} (${providerModelOptions[descriptor.name].fallback_reason || translate("unknownReason")})`}
-                        ，上次刷新：
+                        {` ${translate("lastRefresh")}`}
                         {providerModelOptions[descriptor.name].discovered_at}
                       </span>
                       {providerModelOptions[descriptor.name].models.some(
@@ -5129,7 +5122,7 @@ function ManageSections({
                           )
                         }
                       >
-                        刷新
+                        {translate("reload")}
                       </Button>
                     </div>
                   )}
@@ -5400,7 +5393,7 @@ function ManageSections({
               </div>
               <div className="flex items-center justify-end gap-2">
                 <Button onClick={() => setCustomProviderEditorOpen(false)}>
-                  关闭
+                  {translate("close")}
                 </Button>
                 <Button
                   className="primary"
@@ -5452,7 +5445,7 @@ function ManageSections({
                       );
                   }}
                 >
-                  验证并保存
+                  {translate("validateAndSave")}
                 </Button>
               </div>
               {customProviderStatus && (
@@ -5645,10 +5638,10 @@ function ManageSections({
                 <>
                   <div className="rounded-xl2 border border-line bg-panel p-5">
                     <h2 className="text-[15px] font-semibold text-ink">
-                      全局指令
+                      {translate("globalInstructions")}
                     </h2>
                     <p className="text-[13px] text-muted mt-1">
-                      这里的内容会追加到所有会话的系统指令中。
+                      {translate("globalInstructionsDescription")}
                     </p>
                     <textarea
                       className="mt-4 min-h-[260px] w-full"
@@ -5660,7 +5653,7 @@ function ManageSections({
                     />
                     <div className="inline-actions">
                       <Button className="primary" onClick={saveInstructions}>
-                        保存指令
+                        {translate("saveInstructions")}
                       </Button>
                       {instructions && (
                         <Button
@@ -5676,7 +5669,7 @@ function ManageSections({
                               .catch(onError);
                           }}
                         >
-                          版本历史
+                          {translate("versionHistory")}
                         </Button>
                       )}
                     </div>
@@ -5693,7 +5686,7 @@ function ManageSections({
                             setCompareVersionId(null);
                           }}
                         >
-                          关闭
+                          {translate("close")}
                         </Button>
                       </div>
                       {assetVersions.map((version) => {
@@ -5705,7 +5698,7 @@ function ManageSections({
                             <span>
                               <strong>
                                 v{String(version.version)}
-                                {isCurrent ? " · 当前" : ""}
+                                {isCurrent ? ` · ${translate("current")}` : ""}
                               </strong>
                               <small>{String(version.created_at)}</small>
                             </span>
@@ -5720,7 +5713,7 @@ function ManageSections({
                                   .catch(onError)
                               }
                             >
-                              回滚
+                              {translate("rollback")}
                             </Button>
                           </div>
                         );
@@ -5767,7 +5760,7 @@ function ManageSections({
                       .catch(onError)
                   }
                 >
-                  从仓库导入专家
+                  {translate("importExpertFromRepository")}
                 </button>
               </div>
             )}
@@ -5806,7 +5799,7 @@ function ManageSections({
                       .catch(onError)
                   }
                 >
-                  当前项目另存为 Team
+                  {translate("saveProjectAsTeam")}
                 </button>
               </div>
             )}
@@ -5823,7 +5816,7 @@ function ManageSections({
                   setTemplateEditorOpen(true);
                 }}
               >
-                添加
+                {translate("add")}
               </button>
             </div>
             {templateEditorOpen && (
@@ -5846,7 +5839,7 @@ function ManageSections({
                       className="btn"
                       onClick={() => setTemplateEditorOpen(false)}
                     >
-                      关闭
+                      {translate("close")}
                     </button>
                   </div>
                   <div className="grid gap-2 md:grid-cols-2">
@@ -5908,7 +5901,7 @@ function ManageSections({
                           .catch(onError);
                       }}
                     >
-                      保存
+                      {translate("save")}
                     </button>
                   </div>
                 </section>
@@ -5954,14 +5947,16 @@ function ManageSections({
                           type="button"
                           className="btn"
                           onClick={() => {
-                            setTemplateDraftName(`${template.name} 副本`);
+                            setTemplateDraftName(
+                              `${template.name} ${translate("copySuffix")}`,
+                            );
                             setTemplateDraftId(null);
                             setTemplateDraftDescription(template.description);
                             setTemplateDraftContent(template.content);
                             setTemplateEditorOpen(true);
                           }}
                         >
-                          另存为
+                          {translate("saveAs")}
                         </button>
                       </div>
                     )}
@@ -5988,7 +5983,7 @@ function ManageSections({
                                 if (
                                   message.includes("confirm overwrite") &&
                                   window.confirm(
-                                    `目标文件已有不同内容，确定覆盖吗？\n${message}`,
+                                    `${translate("overwriteDifferentFileConfirm")}\n${message}`,
                                   )
                                 ) {
                                   return command(
@@ -6008,7 +6003,7 @@ function ManageSections({
                               })
                           }
                         >
-                          导出到仓库
+                          {translate("exportToRepository")}
                         </button>
                       )}
                     {!template.readonly && (
@@ -6030,13 +6025,19 @@ function ManageSections({
                             setTemplateEditorOpen(true);
                           }}
                         >
-                          编辑
+                          {translate("edit")}
                         </button>
                         <button
                           type="button"
                           className="btn danger"
                           onClick={() => {
-                            if (!window.confirm(`删除「${template.name}」？`))
+                            if (
+                              !window.confirm(
+                                translate("deleteTemplateConfirm", {
+                                  name: template.name,
+                                }),
+                              )
+                            )
                               return;
                             void command("delete_template", {
                               id: template.id,
@@ -6050,7 +6051,7 @@ function ManageSections({
                               .catch(onError);
                           }}
                         >
-                          删除
+                          {translate("delete")}
                         </button>
                       </div>
                     )}
@@ -6090,7 +6091,7 @@ function ManageSections({
                 <div>
                   <strong>{translate("skillUsage")}</strong>
                   <small className="block">
-                    数据来自技能实际注入会话上下文时的埋点；同一会话同一技能只计一次。
+                    {translate("skillUsageDescription")}
                   </small>
                 </div>
               </div>
@@ -6133,15 +6134,16 @@ function ManageSections({
                       >
                         <code className="flex-1">{item.name}</code>
                         <span className="text-xs text-muted">
-                          {item.calls} 次 · {item.sessions} 个会话 · 最近启用{" "}
-                          {item.last_used}
+                          {item.calls} {translate("activations")} ·{" "}
+                          {item.sessions} {translate("sessionsCount")} ·{" "}
+                          {translate("recentlyEnabled")} {item.last_used}
                         </span>
                       </div>
                     ))}
                   </div>
                   {skillUsage.timeline.length > 0 && (
                     <div className="mt-4 text-xs text-muted">
-                      随时间变化（启用）：
+                      {translate("enabledOverTime")}
                       {skillUsage.timeline
                         .map((item) => ` ${item.date} (${item.calls})`)
                         .join(" · ")}
@@ -6155,13 +6157,13 @@ function ManageSections({
                 <div>
                   <strong>{translate("browse")}</strong>
                   <small className="block">
-                    浏览仓库发现的 .agents/skills 与规则文件；Skill 不在此创建。
+                    {translate("browseRepositoryAssets")}
                   </small>
                 </div>
               </div>
               {!selected ? (
                 <div className="text-sm text-muted py-6">
-                  请先打开一个项目会话以浏览仓库技能和规则
+                  {translate("openProjectSessionAssets")}
                 </div>
               ) : !skillBrowse ? (
                 <div className="text-sm text-muted py-6">
@@ -6752,11 +6754,7 @@ function ManageSections({
               </h2>
               <p className="muted mt-1">{translate("ingressDisabledNotice")}</p>
               <p className="muted mt-1">
-                GitHub repository events are best-effort polling: GitHub
-                documents up to 300 events from the last 30 days and may delay
-                delivery. Pull requests, comments, and issues are mapped.
-                Check-run state is not exposed by this Events API source; use
-                the later webhook/Checks integration for CI state triggers.
+                {translate("githubEventsDescription")}
               </p>
               <div className="form-grid mt-4">
                 <label className="field-label">
@@ -6796,7 +6794,7 @@ function ManageSections({
                     <option value="30">{translate("seconds30")}</option>
                     <option value="60">{translate("minute1")}</option>
                     <option value="300">{translate("minutes5")}</option>
-                    <option value="900">15 minutes</option>
+                    <option value="900">{translate("fifteenMinutes")}</option>
                   </select>
                 </label>
                 <div className="flex items-end gap-2">
@@ -6972,8 +6970,7 @@ function ManageSections({
                     {translate("openWorkerDirectory")}
                   </h2>
                   <p className="muted mt-1">
-                    Default connector catalog from OpenWorker. OPCOS only
-                    enables integrations that are implemented locally.
+                    {translate("connectorCatalogDescription")}
                   </p>
                 </>
               )}
@@ -7089,8 +7086,7 @@ function ManageSections({
                       openConnector as (typeof OAUTH_CONNECTOR_KINDS)[number],
                     ) && (
                       <p className="muted col-span-full">
-                        Use your own OAuth application credentials. OPCOS opens
-                        the provider authorization page in your browser.
+                        {translate("oauthCredentialsDescription")}
                       </p>
                     )}
                     {(CONNECTOR_FIELDS[openConnector] || []).map((field) => (
@@ -7212,10 +7208,7 @@ function ManageSections({
               <h2 className="text-[15px] font-semibold text-ink">
                 {translate("linear")}
               </h2>
-              <p className="muted mt-1">
-                Direct GraphQL integration using a Personal API Key stored in
-                SecretStore. No OAuth callback or public listener is used.
-              </p>
+              <p className="muted mt-1">{translate("linearDescription")}</p>
               <div className="form-grid mt-4">
                 <label className="field-label">
                   {translate("linearApiKeyLabel")}
@@ -7358,8 +7351,8 @@ function ManageSections({
                   <span>
                     <strong>{indexStatus.status}</strong>
                     <small>
-                      {indexStatus.file_count} files ·{" "}
-                      {indexStatus.symbol_count} symbols
+                      {indexStatus.file_count} {translate("files")} ·{" "}
+                      {indexStatus.symbol_count} {translate("symbols")}
                       {indexStatus.truncated ? " · limited by size" : ""}
                     </small>
                   </span>
@@ -8064,9 +8057,9 @@ function McpManage({
       {selectedServer && (
         <section className="panel mt-4">
           <h2>
-            {String(selectedServer.name)} resources ({resources.length}) ·
-            prompts ({prompts.length}) · tools (
-            {Number(selectedServer.tool_count || 0)})
+            {String(selectedServer.name)} {translate("resources")} (
+            {resources.length}) · {translate("prompts")} ({prompts.length}) ·{" "}
+            {translate("tools")} ({Number(selectedServer.tool_count || 0)})
           </h2>
           <div className="grid gap-2">
             {resources.map((resource) => (
@@ -8779,7 +8772,7 @@ function Activity({
                               {String(item.task_type)} · {String(item.status)}
                             </strong>
                             <small>
-                              attempts {String(item.attempts)}/
+                              {translate("attempts")} {String(item.attempts)}/
                               {String(item.max_attempts)} ·{" "}
                               {String(item.queue_id)}
                               {item.status === "pending_approval" && (
@@ -8828,11 +8821,11 @@ function Activity({
                           >
                             <span>
                               <strong>
-                                {String(event.kind)} · seq{" "}
+                                {String(event.kind)} · {translate("sequence")}{" "}
                                 {String(event.sequence)}
                               </strong>
                               <small>
-                                {String(event.source)} · caused by{" "}
+                                {String(event.source)} · {translate("causedBy")}{" "}
                                 {String(event.caused_by ?? "none")} ·{" "}
                                 {JSON.stringify(event.payload)}
                               </small>
@@ -8907,7 +8900,8 @@ function Activity({
                       <div className="text-[13px]">
                         <strong>{String(currentPlan.title)}</strong>{" "}
                         <span className="text-muted">
-                          revision {String(currentPlan.revision)}
+                          {translate("revisionLabel")}{" "}
+                          {String(currentPlan.revision)}
                         </span>
                       </div>
                       <p className="text-[12px] text-muted">
@@ -8938,7 +8932,7 @@ function Activity({
                     </>
                   ) : (
                     <p className="text-[12px] text-muted">
-                      No tracked plan for the selected session.
+                      {translate("noTrackedPlan")}
                     </p>
                   )}
                 </div>
@@ -8992,7 +8986,10 @@ function Activity({
                             >
                               <span>
                                 <strong>{String(binding.account_id)}</strong>
-                                <small>host · {String(binding.host_id)}</small>
+                                <small>
+                                  {translate("host")} ·{" "}
+                                  {String(binding.host_id)}
+                                </small>
                               </span>
                             </div>
                           ))}
@@ -9069,7 +9066,7 @@ function Activity({
                   </div>
                   {loginProfile ? (
                     <small className="text-muted">
-                      validation ·{" "}
+                      {translate("validation")} ·{" "}
                       {String(
                         loginProfile.latest_validation_status ?? "not checked",
                       )}{" "}
@@ -9146,8 +9143,8 @@ function Activity({
                               <span>
                                 <strong>{String(backup.created_at)}</strong>
                                 <small>
-                                  {String(backup.size)} bytes · hash{" "}
-                                  {String(backup.hash)}
+                                  {String(backup.size)} {translate("bytes")} ·{" "}
+                                  {translate("hash")} {String(backup.hash)}
                                 </small>
                               </span>
                               <Button
@@ -9182,8 +9179,7 @@ function Activity({
                     placeholder="Describe the outcome this company is pursuing"
                   />
                   <p className="text-[12px] text-muted">
-                    New goals default to propose mode, one planning round per
-                    hour, and a bounded queue.
+                    {translate("goalsDescription")}
                   </p>
                   <Button
                     className="primary"
@@ -9229,7 +9225,8 @@ function Activity({
                                 {String(goal.status)}
                               </strong>
                               <small>
-                                {String(goal.autonomy_level)} · failures{" "}
+                                {String(goal.autonomy_level)} ·{" "}
+                                {translate("failuresLabel")}{" "}
                                 {String(goal.consecutive_failures)}/
                                 {String(goal.failure_limit)}
                                 <button
@@ -9273,11 +9270,12 @@ function Activity({
                           >
                             <span>
                               <strong>
-                                {String(round.status)} · goal{" "}
-                                {String(round.goal_id)}
+                                {String(round.status)} ·{" "}
+                                {translate("goalLabel")} {String(round.goal_id)}
                               </strong>
                               <small>
-                                produced {String(round.produced_count)} ·{" "}
+                                {translate("produced")}{" "}
+                                {String(round.produced_count)} ·{" "}
                                 {String(round.reason ?? "completed")}
                               </small>
                             </span>
@@ -9328,8 +9326,7 @@ function Activity({
                         placeholder='[{"id":"leader","sort_order":0,"session_id":"","state":"Active"}]'
                       />
                       <p className="field-help">
-                        Use the JSON shape shown above when starting a new
-                        board.
+                        {translate("boardJsonDescription")}
                       </p>
                     </div>
                     <Button
@@ -9405,7 +9402,8 @@ function Activity({
                                 <span>
                                   <strong>{String(role.id)}</strong>
                                   <small>
-                                    {String(role.state)} · Session{" "}
+                                    {String(role.state)} ·{" "}
+                                    {translate("sessionLabel")}{" "}
                                     {String(role.session_id)}
                                   </small>
                                 </span>
@@ -9551,7 +9549,8 @@ function Activity({
                                     {String(item.from)} → {String(item.to)}
                                   </strong>
                                   <small>
-                                    Kind: {String(item.kind)} · Message:{" "}
+                                    {translate("kindLabel")} {String(item.kind)}{" "}
+                                    · {translate("messageLabel")}{" "}
                                     {String(item.msg_id)}
                                   </small>
                                 </span>
@@ -9725,8 +9724,7 @@ function Activity({
                           placeholder='{"kind":"status","payload":{}}'
                         />
                         <p className="field-help">
-                          Messages use the coordination envelope accepted by the
-                          remote host.
+                          {translate("coordinationEnvelopeDescription")}
                         </p>
                         <Button
                           className="bordered"
@@ -9758,9 +9756,16 @@ function Activity({
                           <strong>
                             {String(item.from)} → {String(item.to)}
                           </strong>
-                          <span>Kind: {String(item.kind)}</span>
-                          <span>Message: {String(item.msg_id)}</span>
-                          <span>Reply: {String(item.reply_to || "—")}</span>
+                          <span>
+                            {translate("kindLabel")} {String(item.kind)}
+                          </span>
+                          <span>
+                            {translate("messageLabel")} {String(item.msg_id)}
+                          </span>
+                          <span>
+                            {translate("replyLabel")}{" "}
+                            {String(item.reply_to || "—")}
+                          </span>
                           <pre>{JSON.stringify(item.payload, null, 2)}</pre>
                         </div>
                       ))
@@ -10131,7 +10136,7 @@ function ArtifactsPane({ selected }: { selected: Session }) {
               <div className="flex items-center justify-between text-sm">
                 <strong>{translate("sampledScreenshotTimeline")}</strong>
                 <span>
-                  {manifest.frames?.length ?? 0} frames
+                  {manifest.frames?.length ?? 0} {translate("framesLabel")}
                   {manifest.truncated ? " · truncated at limit" : ""}
                 </span>
               </div>
@@ -10184,7 +10189,8 @@ function ArtifactsPane({ selected }: { selected: Session }) {
     <section className="rail-section">
       <div className="rail-section-head">
         <strong>
-          Artifacts{artifacts.length ? ` (${artifacts.length})` : ""}
+          {translate("artifactsLabel")}
+          {artifacts.length ? ` (${artifacts.length})` : ""}
         </strong>
         <button
           className="rail-mini-btn"
@@ -10283,8 +10289,8 @@ function ShellHistoryPane({ selected }: { selected: Session }) {
                     className={item.exit_code === 0 ? "rail-ok" : "rail-muted"}
                   >
                     {item.exit_code == null
-                      ? "running"
-                      : `exit ${item.exit_code}`}
+                      ? translate("running")
+                      : `${translate("exitLabel")} ${item.exit_code}`}
                   </span>
                 </button>
                 <div className="rail-event-meta">
@@ -10318,17 +10324,26 @@ function IterationStatsPane({ events }: { events: TimelineEvent[] }) {
         {translate("iterationStats")}
       </h3>
       <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
-        <Field k="Iterations" v={String(summary.iterations.length)} />
-        <Field k="Input tokens" v={formatStat(summary.totalInputTokens)} />
-        <Field k="Output tokens" v={formatStat(summary.totalOutputTokens)} />
         <Field
-          k="Total duration"
+          k={translate("iterations")}
+          v={String(summary.iterations.length)}
+        />
+        <Field
+          k={`${translate("input")} tokens`}
+          v={formatStat(summary.totalInputTokens)}
+        />
+        <Field
+          k={`${translate("output")} tokens`}
+          v={formatStat(summary.totalOutputTokens)}
+        />
+        <Field
+          k={translate("totalDuration")}
           v={formatStat(summary.totalDurationMs, " ms")}
         />
-        <Field k="Retries" v={formatStat(summary.totalRetries)} />
+        <Field k={translate("retries")} v={formatStat(summary.totalRetries)} />
         <Field
-          k="Compactions"
-          v={`${summary.totalCompactions} (${summary.automaticCompactions} automatic, ${summary.manualCompactions} manual)`}
+          k={translate("compactions")}
+          v={`${summary.totalCompactions} (${summary.automaticCompactions} ${translate("automaticCompactions")}, ${summary.manualCompactions} ${translate("manualCompactions")})`}
         />
       </div>
       {summary.iterations.length > 0 && (
@@ -10339,21 +10354,42 @@ function IterationStatsPane({ events }: { events: TimelineEvent[] }) {
               className="rounded border border-line"
             >
               <summary className="cursor-pointer px-2 py-1 text-xs text-muted">
-                Iteration {item.iteration} · #{item.detailIndex} ·{" "}
-                {item.toolCalls} tool calls
+                {translate("iterationLabel")} {item.iteration} · #
+                {item.detailIndex} · {item.toolCalls} {translate("toolCalls")}
               </summary>
               <div className="grid grid-cols-2 gap-1 px-2 pb-2 text-xs">
-                <Field k="Duration" v={formatStat(item.durationMs, " ms")} />
-                <Field k="Inference" v={formatStat(item.inferenceMs, " ms")} />
                 <Field
-                  k="Tool execution"
+                  k={translate("duration")}
+                  v={formatStat(item.durationMs, " ms")}
+                />
+                <Field
+                  k={translate("inference")}
+                  v={formatStat(item.inferenceMs, " ms")}
+                />
+                <Field
+                  k={translate("toolExecution")}
                   v={formatStat(item.toolExecMs, " ms")}
                 />
-                <Field k="Harness" v={formatStat(item.harnessMs, " ms")} />
-                <Field k="Input" v={formatStat(item.inputTokens)} />
-                <Field k="Output" v={formatStat(item.outputTokens)} />
-                <Field k="Retries" v={formatStat(item.retryCount)} />
-                <Field k="Compactions" v={formatStat(item.compactionCount)} />
+                <Field
+                  k={translate("harness")}
+                  v={formatStat(item.harnessMs, " ms")}
+                />
+                <Field
+                  k={`${translate("input")} tokens`}
+                  v={formatStat(item.inputTokens)}
+                />
+                <Field
+                  k={`${translate("output")} tokens`}
+                  v={formatStat(item.outputTokens)}
+                />
+                <Field
+                  k={translate("retries")}
+                  v={formatStat(item.retryCount)}
+                />
+                <Field
+                  k={translate("compactions")}
+                  v={formatStat(item.compactionCount)}
+                />
               </div>
             </details>
           ))}
@@ -10491,7 +10527,9 @@ function ChangesPane({ selected }: { selected: Session }) {
                   onClick={() => setOpen(open === item.path ? null : item.path)}
                 >
                   <code>{item.path}</code>
-                  <span className="rail-muted">{item.edit_count} edits</span>
+                  <span className="rail-muted">
+                    {item.edit_count} {translate("editsLabel")}
+                  </span>
                 </button>
                 {open === item.path &&
                   item.edits.map((edit, index) => (
@@ -10649,10 +10687,7 @@ function AgentRosterPane({
           <strong>{translate("agents")}</strong>
         </div>
         <div className="rail-section-body">
-          <div className="rail-muted">
-            This session is not associated with a project, so no project agent
-            roster is available.
-          </div>
+          <div className="rail-muted">{translate("sessionNotAssociated")}</div>
         </div>
       </section>
     );
@@ -10698,11 +10733,12 @@ function AgentRosterPane({
         {error && <div className="rail-error">{error}</div>}
         {workflow && (
           <div className="rail-muted agent-roster-workflow">
-            Workflow stage:{" "}
+            {translate("workflowStage")}{" "}
             {typeof workflow.stage_index === "number"
               ? workflow.stage_index + 1
-              : "Unknown"}{" "}
-            · Status: {workflow.status?.trim() || "Unknown"}
+              : translate("stageUnknown")}{" "}
+            · {translate("statusLabelInline")}{" "}
+            {workflow.status?.trim() || translate("unknownValue")}
             {Array.isArray(workflow.tasks) &&
               ` · Tasks: ${workflow.tasks.length}`}
           </div>
@@ -10799,7 +10835,7 @@ function TasksPane({ events }: { events: TimelineEvent[] }) {
   return (
     <section className="tasks-pane">
       <div className="tasks-progress">
-        {completed} / {steps.length} tasks completed
+        {completed} / {steps.length} {translate("tasksCompleted")}
       </div>
       <div className="tasks-list">
         {steps.map((step, index) => {
@@ -10920,7 +10956,7 @@ function SessionRightPanel({
     { id: "progress", label: "Progress", icon: "progress" },
     { id: "tasks", label: "Tasks", icon: "tasks" },
     { id: "agents", label: "Agents", icon: "agents" },
-    { id: "artifacts", label: "Artifacts", icon: "file" },
+    { id: "artifacts", label: translate("artifactsLabel"), icon: "file" },
     { id: "pr", label: "PR", icon: "branch" },
     { id: "insights", label: "Insights", icon: "sparkle" },
   ];
@@ -11342,7 +11378,9 @@ function InboxPane({
     <div className="surface-panel p-4">
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-base font-semibold">{translate("inbox")}</h2>
-        <span className="text-xs text-faint">{pending.length} pending</span>
+        <span className="text-xs text-faint">
+          {pending.length} {translate("pendingLabel")}
+        </span>
       </div>
       <div className="space-y-3">
         {pending.length === 0 && (
@@ -12507,7 +12545,10 @@ function AppContent() {
           harness: homeHarness,
           workspace: homeWorkspace || null,
           systemPrompt:
-            [homeRole ? `你的角色是：${homeRole}` : "", homeSystemPrompt]
+            [
+              homeRole ? `${translate("rolePromptPrefix")}${homeRole}` : "",
+              homeSystemPrompt,
+            ]
               .filter(Boolean)
               .join("\n\n") || null,
         }),
@@ -12884,7 +12925,7 @@ function AppContent() {
                 <div className="main-topbar-side main-topbar-actions">
                   {secretBackend && (
                     <span className="backend-badge">
-                      Secrets: {secretBackend}
+                      {translate("secretsLabel")} {secretBackend}
                     </span>
                   )}
                   <button
@@ -13282,7 +13323,7 @@ function AppContent() {
                           setHomeMode(content.mode || "Auto");
                           setHomeSystemPrompt(content.system_prompt || "");
                         } catch {
-                          onError("Agent 模板内容不是有效 JSON");
+                          onError(translate("agentTemplateInvalidJson"));
                         }
                       }}
                     >
@@ -13366,7 +13407,9 @@ function AppContent() {
                         .map((model) => (
                           <option key={model.id} value={model.id}>
                             {model.label}
-                            {model.likely_non_chat ? " (非对话模型)" : ""}
+                            {model.likely_non_chat
+                              ? ` (${translate("nonChatModel")})`
+                              : ""}
                           </option>
                         ))}
                     </select>

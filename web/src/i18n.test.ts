@@ -1,9 +1,48 @@
 import { describe, expect, it } from "vitest";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import { messages } from "./i18n";
 
 const sourceRoot = fileURLToPath(new URL(".", import.meta.url));
+const allowlist = [
+  // Brand name and technical identifiers are intentionally preserved.
+  {
+    pattern: /^(OPCOS|Terminal|Desktop|IDE|MCP|CDP|VNC|PR|ACP)$/,
+    reason: "technical identifier",
+  },
+  // Examples teach users the expected format rather than naming a UI action.
+  {
+    pattern: /^https:\/\/github\.com\/org\/repo\.git$/,
+    reason: "repository URL example",
+  },
+  { pattern: /^ghe\.example\.com$/, reason: "host example" },
+  {
+    pattern: /^https:\/\/github\.com\/owner\/repository\/pull\/123$/,
+    reason: "pull request URL example",
+  },
+  { pattern: /^owner\/repository$/, reason: "repository slug example" },
+  { pattern: /^\/command$/, reason: "slash command example" },
+  { pattern: /^NextAPI$/, reason: "provider name example" },
+  {
+    pattern: /^https:\/\/api\.nextapi\.store\/v1$/,
+    reason: "provider URL example",
+  },
+  { pattern: /^glm-5\.2$/, reason: "model ID example" },
+  { pattern: /^https:\/\/example\.com\/mcp$/, reason: "MCP URL example" },
+  {
+    pattern: /^Describe the outcome this company is pursuing$/,
+    reason: "goal prompt example",
+  },
+  { pattern: /^\{.*\}$/, reason: "JSON payload example" },
+  {
+    pattern: /^\[\{"id":"leader".*\}\]$/,
+    reason: "coordination roles JSON example",
+  },
+  { pattern: /^(v|· v)$/, reason: "version notation" },
+  { pattern: /^(Esc|A|O)$/, reason: "keyboard shortcut label" },
+  { pattern: /^(per|s)$/, reason: "duration unit fragment" },
+];
 
 describe("i18n source coverage", () => {
   it("keeps English and Chinese dictionaries key-identical", () => {
@@ -15,7 +54,7 @@ describe("i18n source coverage", () => {
   it("defines every literal translate key used by the frontend", () => {
     const keys = new Set(Object.keys(messages.en));
     const missing: string[] = [];
-    for (const file of ["App.tsx", ...tsxFiles()]) {
+    for (const file of sourceFiles()) {
       const source = readFileSync(`${sourceRoot}${file}`, "utf8");
       for (const key of source.matchAll(/translate\("([^"]+)"/g)) {
         if (!keys.has(key[1])) missing.push(`${file}:${key[1]}`);
@@ -25,47 +64,68 @@ describe("i18n source coverage", () => {
   });
 
   it("does not leave bare product copy in JSX text or visible attributes", () => {
-    const allowlist = [
-      { pattern: /^(OPCOS|Esc|A)$/, reason: "brand and keyboard labels" },
-      {
-        pattern: /^(command|revision|frames|edits|pending|void command)$/,
-        reason: "dynamic protocol and artifact fields",
-      },
-      {
-        pattern: /^exit$/,
-        reason: "technical shell exit-code label",
-      },
-    ];
-    expect(allowlist.every((entry) => entry.reason.length > 0)).toBe(true);
     const violations: string[] = [];
-    for (const file of tsxFiles()) {
+    for (const file of sourceFiles().filter((name) => name.endsWith(".tsx"))) {
       const source = readFileSync(`${sourceRoot}${file}`, "utf8");
-      const jsxText = source.replace(/\{[^{}]*\}/g, "");
-      for (const match of jsxText.matchAll(
-        />\s*([A-Za-z][A-Za-z ]{1,80})\s*</g,
-      )) {
-        const text = match[1].trim();
+      const tree = ts.createSourceFile(
+        file,
+        source,
+        ts.ScriptTarget.Latest,
+        true,
+        ts.ScriptKind.TSX,
+      );
+      const visit = (node: ts.Node) => {
+        if (ts.isJsxText(node)) {
+          checkText(node.getText(tree).trim());
+        } else if (
+          ts.isJsxAttribute(node) &&
+          ts.isIdentifier(node.name) &&
+          /^(title|placeholder|aria-label|alt)$/.test(node.name.text) &&
+          node.initializer &&
+          ts.isStringLiteral(node.initializer)
+        ) {
+          checkText(node.initializer.text.trim());
+        } else if (
+          ts.isStringLiteralLike(node) &&
+          /[\u4e00-\u9fff]/.test(node.text)
+        ) {
+          checkText(node.text.trim());
+        }
+        ts.forEachChild(node, visit);
+      };
+      const checkText = (text: string) => {
         if (
           text &&
-          !allowlist.some((entry) => entry.pattern.test(text)) &&
-          !/^[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*$/.test(text)
+          /[A-Za-z\u4e00-\u9fff]/.test(text) &&
+          !allowlist.some((entry) => entry.pattern.test(text))
         ) {
           violations.push(`${file}:${text}`);
         }
-      }
+      };
+      visit(tree);
     }
     expect(violations).toEqual([]);
   });
 });
 
-function tsxFiles(): string[] {
-  return [
-    "App.tsx",
-    "components/ApprovalCard.tsx",
-    "components/Composer.tsx",
-    "components/Markdown.tsx",
-    "components/SearchModal.tsx",
-    "components/Sidebar.tsx",
-    "components/Transcript.tsx",
-  ];
+function sourceFiles(): string[] {
+  const files: string[] = [];
+  const visit = (directory: string) => {
+    for (const entry of readdirSync(`${sourceRoot}${directory}`, {
+      withFileTypes: true,
+    })) {
+      const relative = `${directory}${entry.name}`;
+      if (entry.isDirectory()) {
+        visit(`${relative}/`);
+      } else if (
+        /\.(?:tsx|ts)$/.test(entry.name) &&
+        !entry.name.endsWith(".test.ts") &&
+        !entry.name.endsWith(".test.tsx")
+      ) {
+        files.push(relative);
+      }
+    }
+  };
+  visit("");
+  return files;
 }
