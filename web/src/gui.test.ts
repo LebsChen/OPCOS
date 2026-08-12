@@ -541,7 +541,7 @@ describe("GUI boundary behavior", () => {
     expect(source).toContain('translate("surfaceDisconnected")');
     expect(source).toContain("!showSurfaceRetry");
     expect(source).toContain(
-      'command<{ url: string; runtime_id: number }>("ide_url"',
+      'command<{ url: string; lease_id: number }>("ide_url"',
     );
     expect(source).toContain("Remote IDE workspace is not configured");
     expect(source).not.toContain(

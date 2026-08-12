@@ -68,7 +68,7 @@ use std::io::{Cursor, Read, Write};
 use std::path::{Path as FsPath, PathBuf};
 use std::pin::Pin;
 use std::process::Command as ProcessCommand;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -649,8 +649,8 @@ struct DesktopState {
     trigger_http_port: u16,
     trigger_watcher_reload: Mutex<Option<std_mpsc::Sender<()>>>,
     trigger_watcher_stop: Mutex<Option<std_mpsc::Sender<()>>>,
-    surfaces: AsyncMutex<HashMap<u16, OwnedRuntimeTask>>,
-    ide_proxies: AsyncMutex<HashMap<u16, OwnedRuntimeTask>>,
+    surfaces: AsyncMutex<HashMap<(String, String), SurfaceLease>>,
+    ide_proxies: AsyncMutex<HashMap<String, IdeLease>>,
     coordination: Arc<AsyncMutex<HashMap<String, CoordinationRuntime>>>,
     index_root: PathBuf,
     artifact_root: PathBuf,
@@ -673,37 +673,76 @@ struct DesktopState {
 const CAPABILITY_RECHECK_INTERVAL: ChronoDuration = ChronoDuration::minutes(2);
 const MAX_IDLE_DISCONNECTS_PER_TICK: usize = 8;
 
-struct OwnedRuntimeTask {
+struct SurfaceLease {
     session_id: String,
-    task: tauri::async_runtime::JoinHandle<()>,
+    lease_id: u64,
 }
 
-static NEXT_OWNED_RUNTIME_TASK_ID: AtomicU16 = AtomicU16::new(1);
+struct IdeLease {
+    session_id: String,
+    lease_id: u64,
+}
 
-async fn register_owned_runtime_task(
-    runtimes: &AsyncMutex<HashMap<u16, OwnedRuntimeTask>>,
+static NEXT_RUNTIME_LEASE_ID: AtomicU64 = AtomicU64::new(1);
+
+async fn register_surface_lease(
+    leases: &AsyncMutex<HashMap<(String, String), SurfaceLease>>,
     session_id: &str,
-) -> u16 {
-    let id = NEXT_OWNED_RUNTIME_TASK_ID.fetch_add(1, Ordering::Relaxed);
-    let task = tauri::async_runtime::spawn(async {
-        std::future::pending::<()>().await;
-    });
-    runtimes.lock().await.insert(
-        id,
-        OwnedRuntimeTask {
+    surface: &str,
+) -> u64 {
+    let lease_id = NEXT_RUNTIME_LEASE_ID.fetch_add(1, Ordering::Relaxed);
+    leases.lock().await.insert(
+        (session_id.to_owned(), surface.to_owned()),
+        SurfaceLease {
             session_id: session_id.to_owned(),
-            task,
+            lease_id,
         },
     );
-    id
+    lease_id
 }
 
-async fn release_owned_runtime_task(
-    runtimes: &AsyncMutex<HashMap<u16, OwnedRuntimeTask>>,
-    runtime_id: u16,
+async fn release_surface_lease(
+    leases: &AsyncMutex<HashMap<(String, String), SurfaceLease>>,
+    session_id: &str,
+    surface: &str,
+    lease_id: u64,
 ) {
-    if let Some(runtime) = runtimes.lock().await.remove(&runtime_id) {
-        runtime.task.abort();
+    let key = (session_id.to_owned(), surface.to_owned());
+    let mut leases = leases.lock().await;
+    if leases
+        .get(&key)
+        .is_some_and(|lease| lease.lease_id == lease_id)
+    {
+        leases.remove(&key);
+    }
+}
+
+async fn register_ide_lease(
+    leases: &AsyncMutex<HashMap<String, IdeLease>>,
+    session_id: &str,
+) -> u64 {
+    let lease_id = NEXT_RUNTIME_LEASE_ID.fetch_add(1, Ordering::Relaxed);
+    leases.lock().await.insert(
+        session_id.to_owned(),
+        IdeLease {
+            session_id: session_id.to_owned(),
+            lease_id,
+        },
+    );
+    lease_id
+}
+
+async fn release_ide_lease(
+    leases: &AsyncMutex<HashMap<String, IdeLease>>,
+    session_id: &str,
+    lease_id: u64,
+) {
+    let mut leases = leases.lock().await;
+    if leases
+        .get(session_id)
+        .is_some_and(|lease| lease.lease_id == lease_id)
+    {
+        leases.remove(session_id);
     }
 }
 
@@ -980,32 +1019,16 @@ async fn teardown_idle_session_runtime(
         .any(|runtime| runtime.session_id == session_id);
     idle_teardown_guard(live_surface, live_ide)?;
 
-    let surface_keys = state
+    state
         .surfaces
         .lock()
         .await
-        .iter()
-        .filter(|(_, runtime)| runtime.session_id == session_id)
-        .map(|(port, _)| *port)
-        .collect::<Vec<_>>();
-    for port in surface_keys {
-        if let Some(runtime) = state.surfaces.lock().await.remove(&port) {
-            runtime.task.abort();
-        }
-    }
-    let ide_keys = state
+        .retain(|_, lease| lease.session_id != session_id);
+    state
         .ide_proxies
         .lock()
         .await
-        .iter()
-        .filter(|(_, runtime)| runtime.session_id == session_id)
-        .map(|(port, _)| *port)
-        .collect::<Vec<_>>();
-    for port in ide_keys {
-        if let Some(runtime) = state.ide_proxies.lock().await.remove(&port) {
-            runtime.task.abort();
-        }
-    }
+        .retain(|_, lease| lease.session_id != session_id);
 
     state.engines.lock().await.remove(session_id);
     state.engine_capabilities.lock().await.remove(session_id);
@@ -14133,7 +14156,7 @@ fn delete_host(state: State<'_, DesktopState>, host_id: String) -> Result<(), St
 struct SurfaceConnection {
     url: String,
     vnc_password: Option<String>,
-    runtime_id: u16,
+    lease_id: u64,
 }
 
 #[tauri::command]
@@ -14184,20 +14207,22 @@ async fn surface_url(
     } else {
         None
     };
-    let runtime_id = register_owned_runtime_task(&state.surfaces, &session_id).await;
+    let lease_id = register_surface_lease(&state.surfaces, &session_id, &surface).await;
     Ok(SurfaceConnection {
         url: url.to_string(),
         vnc_password,
-        runtime_id,
+        lease_id,
     })
 }
 
 #[tauri::command]
 async fn release_surface_runtime(
     state: State<'_, DesktopState>,
-    runtime_id: u16,
+    session_id: String,
+    surface: String,
+    lease_id: u64,
 ) -> Result<(), String> {
-    release_owned_runtime_task(&state.surfaces, runtime_id).await;
+    release_surface_lease(&state.surfaces, &session_id, &surface, lease_id).await;
     Ok(())
 }
 
@@ -14266,25 +14291,26 @@ async fn ide_url(
             .set_cookie(cookie)
             .map_err(|error| format!("Could not set remote IDE cookie: {error}"))?;
     }
-    let runtime_id = register_owned_runtime_task(&state.ide_proxies, &session_id).await;
+    let lease_id = register_ide_lease(&state.ide_proxies, &session_id).await;
     Ok(IdeConnection {
         url: url.to_string(),
-        runtime_id,
+        lease_id,
     })
 }
 
 #[derive(Debug, Serialize)]
 struct IdeConnection {
     url: String,
-    runtime_id: u16,
+    lease_id: u64,
 }
 
 #[tauri::command]
 async fn release_ide_runtime(
     state: State<'_, DesktopState>,
-    runtime_id: u16,
+    session_id: String,
+    lease_id: u64,
 ) -> Result<(), String> {
-    release_owned_runtime_task(&state.ide_proxies, runtime_id).await;
+    release_ide_lease(&state.ide_proxies, &session_id, lease_id).await;
     Ok(())
 }
 
@@ -31639,19 +31665,40 @@ mod m7_tests {
     }
 
     #[tokio::test]
-    async fn owned_runtime_tasks_are_scoped_and_releasable() {
-        let runtimes = AsyncMutex::new(HashMap::new());
-        let runtime_id = register_owned_runtime_task(&runtimes, "session-a").await;
-        assert_eq!(
-            runtimes
+    async fn surface_leases_replace_and_release_by_session_and_kind() {
+        let leases = AsyncMutex::new(HashMap::new());
+        let first_id = register_surface_lease(&leases, "session-a", "pty").await;
+        let second_id = register_surface_lease(&leases, "session-a", "pty").await;
+        assert_eq!(leases.lock().await.len(), 1);
+        release_surface_lease(&leases, "session-a", "pty", first_id).await;
+        assert_eq!(leases.lock().await.len(), 1);
+        release_surface_lease(&leases, "session-a", "pty", second_id).await;
+        assert!(leases.lock().await.is_empty());
+        assert!(
+            !leases
                 .lock()
                 .await
-                .get(&runtime_id)
-                .map(|runtime| runtime.session_id.as_str()),
-            Some("session-a")
+                .values()
+                .any(|lease| lease.session_id == "session-a")
         );
-        release_owned_runtime_task(&runtimes, runtime_id).await;
-        assert!(runtimes.lock().await.is_empty());
+        let store = SqliteStore::open_in_memory().unwrap();
+        wake_test_session(&store, "session-a", "builtin");
+        let session = store.load_session("session-a").unwrap().unwrap();
+        assert!(session_can_idle_sleep(&session, &[], false));
+    }
+
+    #[tokio::test]
+    async fn surface_leases_for_other_sessions_remain_independent() {
+        let leases = AsyncMutex::new(HashMap::new());
+        let session_a = register_surface_lease(&leases, "session-a", "vnc").await;
+        let session_b = register_surface_lease(&leases, "session-b", "vnc").await;
+        release_surface_lease(&leases, "session-a", "vnc", session_a).await;
+        let leases = leases.lock().await;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(
+            leases.values().next().map(|lease| lease.lease_id),
+            Some(session_b)
+        );
     }
 
     #[test]
