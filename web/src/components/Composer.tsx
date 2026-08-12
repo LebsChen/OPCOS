@@ -528,7 +528,7 @@ export function Composer(props: Props) {
           <button
             className="shrink-0 opacity-60 hover:opacity-100"
             onClick={() => setAttachNotice(null)}
-            title={translate("Dismiss")}
+            title={translate("dismiss")}
           >
             ✕
           </button>
@@ -541,8 +541,7 @@ export function Composer(props: Props) {
         {props.interactionHeader}
         {legacyOpenCode && (
           <div className="px-3.5 pt-3.5 text-[12px] text-muted">
-            This historical OpenCode session is read-only. Create an ACP session
-            using the <code>opencode acp</code> launch recipe to continue.
+            {translate("legacySessionReadonly")}
           </div>
         )}
         <textarea
@@ -550,7 +549,9 @@ export function Composer(props: Props) {
           className="w-full block px-3.5 pt-3.5 pb-1.5 text-[14.5px]"
           placeholder={
             props.placeholder ||
-            (props.pendingQuestion ? "Type an answer…" : "Ask OPCOS…")
+            (props.pendingQuestion
+              ? translate("typeAnswerEllipsis")
+              : translate("askOpcos"))
           }
           value={text}
           onChange={(e) => {
@@ -589,7 +590,9 @@ export function Composer(props: Props) {
                         : "text-sky-300"
                     }`}
                   >
-                    {command.execution === "action" ? "action" : "prompt"}
+                    {command.execution === "action"
+                      ? translate("action")
+                      : translate("prompt")}
                   </span>
                 </button>
               ))}
@@ -603,7 +606,7 @@ export function Composer(props: Props) {
               <button
                 className="pill-x"
                 type="button"
-                title="Remove attachment reference"
+                title={translate("removeAttachment")}
                 onClick={() =>
                   setAttachments((current) =>
                     current.filter((_, itemIndex) => itemIndex !== index),
@@ -704,7 +707,7 @@ export function Composer(props: Props) {
             props.onAcpModeChange && (
               <select
                 className="chip"
-                title="ACP mode"
+                title={translate("acpMode")}
                 value={props.acpMode.currentModeId || ""}
                 onChange={(event) =>
                   props.onAcpModeChange?.(event.target.value)
@@ -723,7 +726,7 @@ export function Composer(props: Props) {
             props.harnessOptions?.length && (
               <select
                 className="chip"
-                title="Harness"
+                title={translate("harness")}
                 value={props.harness}
                 onChange={(event) =>
                   props.onHarnessChange?.(event.target.value)
@@ -755,7 +758,7 @@ export function Composer(props: Props) {
 
           {dictationBusy === "Transcribing…" && (
             <span className="text-[11.5px] text-accent">
-              {translate("Transcribing\u2026")}
+              {translate("transcribing")}
             </span>
           )}
 
@@ -783,12 +786,10 @@ export function Composer(props: Props) {
               <button
                 className="pill model-warn chip"
                 onClick={() => props.onConnectModel?.()}
-                title={translate("Connect a model")}
-                aria-label={translate(
-                  "No model connected \u2014 connect a model",
-                )}
+                title={translate("connectModel")}
+                aria-label={translate("connectModel")}
               >
-                <span className="pill-label">{translate("No model")}</span>
+                <span className="pill-label">{translate("noModel")}</span>
                 <span className="model-warn-ico" aria-hidden>
                   ⚠
                 </span>
@@ -796,7 +797,7 @@ export function Composer(props: Props) {
             ) : modelsLoaded ? (
               <select
                 className="chip model-chip"
-                title="模型"
+                title={translate("model")}
                 value={props.model}
                 onChange={(event) => props.onModelChange(event.target.value)}
               >
@@ -811,10 +812,10 @@ export function Composer(props: Props) {
                 className="pill chip text-faint cursor-default"
                 disabled
                 data-testid="models-loading"
-                title={translate("Fetching the model list from the server")}
+                title={translate("fetchingModelList")}
               >
                 <span className="pill-label">
-                  {translate("Loading models\u2026")}
+                  {translate("loadingModels")}
                 </span>
               </button>
             ))}
@@ -1084,8 +1085,8 @@ export function PlusMenu({
         ref={triggerRef}
         className="icon-btn"
         type="button"
-        aria-label="更多功能"
-        title="更多功能"
+        aria-label={translate("moreFeatures")}
+        title={translate("moreFeatures")}
         aria-expanded={open}
         aria-haspopup="menu"
         onClick={() => onOpenChange(!open)}
@@ -1102,7 +1103,7 @@ export function PlusMenu({
           {onUpload && (
             <button type="button" role="menuitem" onClick={upload}>
               <Icon name="file" size={15} className="pm-icon" />
-              Upload attachment
+              {translate("uploadAttachment")}
             </button>
           )}
           <div className="pm-divider" />
@@ -1210,7 +1211,7 @@ export function PlusMenu({
                 }
               >
                 <Icon name="shield" size={15} className="pm-icon" />
-                <span>Secrets</span>
+                <span>{translate("secrets")}</span>
                 <Icon name="chevronRight" size={13} className="pm-chevron" />
               </button>
               {openSubmenu === "secrets" && (
@@ -1218,7 +1219,7 @@ export function PlusMenu({
                   ref={submenuRef}
                   className="pm-submenu"
                   role="menu"
-                  aria-label="Secrets items"
+                  aria-label={translate("secretsItems")}
                   style={submenuStyle ?? undefined}
                   onKeyDown={(event) => {
                     if (event.key === "Escape" || event.key === "ArrowLeft") {
@@ -1249,7 +1250,7 @@ export function PlusMenu({
           ) : (
             <button type="button" role="menuitem" disabled>
               <Icon name="shield" size={15} className="pm-icon" />
-              Secrets
+              {translate("secrets")}
             </button>
           )}
         </div>
@@ -1296,11 +1297,11 @@ function UsageChip({
         onClick={() => setOpen((v) => !v)}
         aria-haspopup="menu"
         aria-expanded={open}
-        aria-label={translate("Token usage")}
+        aria-label={translate("tokenUsage")}
         title={
           pct !== null
-            ? `Token usage — ${pct}% of the context window used`
-            : "Token usage this session"
+            ? `${translate("tokenUsage")} — ${pct}% ${translate("contextWindow")}`
+            : `${translate("tokenUsage")} — ${translate("sessionOnly")}`
         }
         data-testid="usage-chip"
       >
@@ -1328,7 +1329,7 @@ function UsageChip({
             {contextWindow ? (
               <div className="mb-2.5">
                 <div className="text-[10.5px] uppercase tracking-[0.06em] text-faint font-semibold mb-1">
-                  Context window
+                  {translate("contextWindow")}
                 </div>
                 <div className="h-1.5 rounded-full bg-line overflow-hidden">
                   <div
@@ -1337,17 +1338,19 @@ function UsageChip({
                   />
                 </div>
                 <div className="mt-1 text-[11.5px] text-muted tabular-nums">
-                  {formatTokens(usage.context)} of {formatTokens(contextWindow)}{" "}
-                  · {pct}%
+                  {formatTokens(usage.context)} / {formatTokens(contextWindow)} ·{" "}
+                  {pct}%
                 </div>
               </div>
             ) : usage.context > 0 ? (
               <div className="mb-2.5 text-[11.5px] text-muted tabular-nums">
-                In context now: {formatTokens(usage.context)} tokens
+                {translate("inContextNow", {
+                  count: formatTokens(usage.context),
+                })}
               </div>
             ) : null}
             <div className="text-[10.5px] uppercase tracking-[0.06em] text-faint font-semibold mb-1">
-              Session totals
+              {translate("sessionTotals")}
             </div>
             <div className="flex flex-col gap-1.5">
               {Object.entries(usage.byModel).map(([id, t]) => (
@@ -1365,31 +1368,31 @@ function UsageChip({
                   <div className="mt-0.5 flex flex-col gap-0.5">
                     {t.cache_read + t.cache_write > 0 ? (
                       <>
-                        {stat("Uncached input", t.input)}
-                        {stat("Cache reads", t.cache_read)}
-                        {stat("Cache writes", t.cache_write)}
+                        {stat(translate("uncachedInput"), t.input)}
+                        {stat(translate("cacheReads"), t.cache_read)}
+                        {stat(translate("cacheWrites"), t.cache_write)}
                         {stat(
-                          "Total input",
+                          translate("totalInput"),
                           t.input + t.cache_read + t.cache_write,
                         )}
                       </>
                     ) : (
-                      stat("Input", t.input)
+                      stat(translate("input"), t.input)
                     )}
-                    {stat("Output", t.output)}
+                    {stat(translate("output"), t.output)}
                   </div>
                 </div>
               ))}
             </div>
             <div className="mt-2 pt-2 border-t border-line flex items-baseline justify-between text-[11.5px]">
-              <span className="text-faint">{translate("Total")}</span>
+              <span className="text-faint">{translate("totalInput")}</span>
               <span className="text-ink tabular-nums">
-                {formatTokens(total)} tokens
+                {formatTokens(total)} {translate("tokens")}
               </span>
             </div>
             {model && !modelLabels?.[model] && contextWindow === undefined && (
               <div className="mt-1 text-[10.5px] text-faint leading-snug">
-                Context meter unavailable for custom models.
+                {translate("customModelContextUnavailable")}
               </div>
             )}
           </div>
@@ -1429,7 +1432,7 @@ function ModeMenu({
         onClick={() => setOpen((v) => !v)}
         aria-haspopup="menu"
         aria-expanded={open}
-        aria-label={translate("Mode")}
+        aria-label={translate("mode")}
         title={
           `Mode: ${current?.label || mode}` +
           (unattended ? " · approvals go to the Inbox" : "")
@@ -1475,17 +1478,16 @@ function ModeMenu({
                 <div className="flex items-center gap-2 px-2.5 py-1.5">
                   <span className="flex-1 min-w-0">
                     <span className="block text-[13px] text-ink">
-                      Send approvals to Inbox
+                      {translate("sendApprovalsInbox")}
                     </span>
                     <span className="block text-[11px] text-faint leading-snug">
-                      Approvals &amp; questions go to the Inbox; the agent keeps
-                      working.
+                      {translate("approvalsQuestionsContinue")}
                     </span>
                   </span>
                   <Toggle
                     checked={!!unattended}
                     onChange={onUnattendedChange}
-                    title={translate("Send approvals to the Inbox")}
+                    title={translate("sendApprovalsInbox")}
                   />
                 </div>
               </>
@@ -1496,17 +1498,16 @@ function ModeMenu({
                 <div className="flex items-center gap-2 px-2.5 py-1.5">
                   <span className="flex-1 min-w-0">
                     <span className="block text-[13px] text-ink">
-                      Progressive tool disclosure
+                      {translate("progressiveDisclosure")}
                     </span>
                     <span className="block text-[11px] text-faint leading-snug">
-                      Search the catalog before loading connector and browser
-                      schemas.
+                      {translate("progressiveDisclosureDescription")}
                     </span>
                   </span>
                   <Toggle
                     checked={!!progressiveToolDisclosure}
                     onChange={onProgressiveToolDisclosureChange}
-                    title="Progressive tool disclosure"
+                    title={translate("progressiveDisclosure")}
                   />
                 </div>
               </>
@@ -1548,7 +1549,7 @@ function AttachChip({ a, onRemove }: { a: Attachment; onRemove: () => void }) {
       <button
         className="attach-x"
         onClick={onRemove}
-        title={translate("Remove")}
+        title={translate("remove")}
       >
         ✕
       </button>
