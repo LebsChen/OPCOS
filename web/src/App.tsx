@@ -12789,7 +12789,7 @@ function AppContent() {
                       className="session-title-input"
                       value={sessionTitleDraft}
                       autoFocus
-                      aria-label="Session title"
+                      aria-label={translate("sessionTitle")}
                       onChange={(event) =>
                         setSessionTitleDraft(event.target.value)
                       }
@@ -12903,8 +12903,8 @@ function AppContent() {
                       <button
                         className="transcript-jump-bottom"
                         type="button"
-                        aria-label="Jump to latest conversation"
-                        title="Jump to latest conversation"
+                        aria-label={translate("jumpLatest")}
+                        title={translate("jumpLatest")}
                         onClick={jumpToTranscriptBottom}
                       >
                         <svg
@@ -12953,7 +12953,7 @@ function AppContent() {
                   {pendingQuestion && pendingQuestionCollapsed && (
                     <div className="transcript-question-collapsed">
                       <span className="transcript-question-collapsed-copy">
-                        <strong>Question</strong>
+                        <strong>{translate("question")}</strong>
                         <span>{pendingQuestion.question}</span>
                       </span>
                       <button
@@ -13086,7 +13086,9 @@ function AppContent() {
               </div>
             </>
           ) : (
-            <div className="session-loading">Loading session…</div>
+            <div className="session-loading">
+              {translate("loadingSession")}
+            </div>
           )
         ) : surface === "manage" ? (
           <SettingsView activeTab={settingsTab} onTabChange={setSettingsTab}>
@@ -13151,7 +13153,7 @@ function AppContent() {
                 <div className="composer-card hero">
                   <textarea
                     value={homeInput}
-                    placeholder="告诉 OPCOS 你想完成什么…"
+                    placeholder={translate("askGoal")}
                     onChange={(event) => setHomeInput(event.target.value)}
                     onKeyDown={(event) => {
                       if (
@@ -13198,7 +13200,7 @@ function AppContent() {
                     />
                     <select
                       className="chip"
-                      title="Agent 模板"
+                          title={translate("agentTemplate")}
                       value={homeAgentTemplateId}
                       onChange={(event) => {
                         const id = event.target.value;
@@ -13238,7 +13240,7 @@ function AppContent() {
                         }
                       }}
                     >
-                      <option value="">Agent 模板</option>
+                      <option value="">{translate("agentTemplate")}</option>
                       {homeAgentTemplates.map((template) => (
                         <option key={template.id} value={template.id}>
                           {template.name}
@@ -13247,7 +13249,7 @@ function AppContent() {
                     </select>
                     <input
                       className="chip"
-                      title="角色"
+                      title={translate("role")}
                       value={homeRole}
                       onChange={(event) => setHomeRole(event.target.value)}
                       placeholder="Role"
@@ -13274,11 +13276,11 @@ function AppContent() {
                     </select>
                     <select
                       className="chip"
-                      title="绑定主机"
+                      title={translate("host")}
                       value={homeHostId}
                       onChange={(event) => setHomeHostId(event.target.value)}
                     >
-                      <option value="">未选择</option>
+                      <option value="">{translate("noSelection")}</option>
                       {hosts.map((host) => (
                         <option key={host.id} value={host.id}>
                           {host.name}
@@ -13287,11 +13289,11 @@ function AppContent() {
                     </select>
                     <select
                       className="chip"
-                      title="Provider"
+                      title={translate("provider")}
                       value={homeProvider}
                       onChange={(event) => setHomeProvider(event.target.value)}
                     >
-                      <option value="">默认</option>
+                      <option value="">{translate("defaultValue")}</option>
                       {providers.map((provider) => (
                         <option
                           key={provider.name}
@@ -13305,7 +13307,7 @@ function AppContent() {
                     </select>
                     <select
                       className="chip"
-                      title="模型"
+                      title={translate("modelLabel")}
                       value={homeModel}
                       onChange={(event) => setHomeModel(event.target.value)}
                     >
@@ -13333,19 +13335,21 @@ function AppContent() {
                     )}
                     <select
                       className="chip"
-                      title="模式"
+                      title={translate("modeLabel")}
                       value={homeMode}
                       onChange={(event) => setHomeMode(event.target.value)}
                     >
-                      <option value="Interactive">Interactive</option>
-                      <option value="Auto">Auto</option>
+                      <option value="Interactive">
+                        {translate("interactive")}
+                      </option>
+                      <option value="Auto">{translate("auto")}</option>
                     </select>
                     <input
                       className="chip workspace-chip"
-                      title="留空时使用默认本地 workspace"
+                      title={translate("workspaceDefaultTitle")}
                       value={homeWorkspace}
                       onChange={(event) => setHomeWorkspace(event.target.value)}
-                      placeholder="Workspace (默认 ~/OPCOS/workspaces/<id>)"
+                      placeholder={translate("workspaceDefaultPlaceholder")}
                     />
                     <span className="spacer" />
                     <SendButton
@@ -13353,14 +13357,16 @@ function AppContent() {
                       disabled={!homeInput.trim() || !homeHostId}
                       onSend={() => void submitHome()}
                       onInterrupt={() => undefined}
-                      title="发送并创建会话"
+                      title={translate("sendCreateSession")}
                     />
                   </div>
                 </div>
               </div>
               {sessions.length > 0 && (
                 <div className="recent">
-                  <div className="recent-head">最近会话</div>
+                  <div className="recent-head">
+                    {translate("recentSessions")}
+                  </div>
                   {sessions.slice(0, 8).map((item) => (
                     <button
                       className="recent-item"
