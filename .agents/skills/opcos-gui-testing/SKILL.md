@@ -1343,6 +1343,81 @@ navigating away and back, the backend turn is not stuck; this is a live frontend
 Conversely, if remounting does not clear it, inspect engine state, persisted events, and fixture
 request counts before attributing it to rendering.
 
+## Agent execution surfaces
+
+Use short, isolated turns and record both the user-visible result and persisted evidence. A turn
+containing many tool calls can remain `Working` for minutes; one or two calls usually completes
+quickly. If a turn stalls, interrupt it, then inspect the store before repeating mutations because
+earlier calls may already have committed.
+
+### Bring-up and model controls
+
+1. Kill stale Vite processes before starting the app. A process left on port 1420 can make the new
+   Vite instance move to 1421 while Tauri continues loading the old bundle.
+2. Use a model known to work with the configured gateway (refresh Settings → Provider if needed).
+   Treat a model claiming that a tool is unavailable as a separate model-behavior observation; do
+   not conclude that the tool was unregistered until the actual request tool list is checked.
+3. Record the provider, model, host, workspace, and mode with every scenario.
+
+### SQLite evidence and WAL handling
+
+Rows may be in `opcos.db-wal` rather than the main database file. Never diagnose persistence from
+`cp opcos.db` alone:
+
+```bash
+cp opcos.db /tmp/opcos-check.db
+cp opcos.db-wal /tmp/opcos-check.db-wal
+cp opcos.db-shm /tmp/opcos-check.db-shm 2>/dev/null || true
+```
+
+Alternatively stop the app before copying. Snapshot immediately before and after a mutation, and
+identify which tables the code path actually writes.
+
+### Session rename and desktop surface
+
+- For user rename, hover a sidebar row, open its visible `⋯` menu, choose **Rename**, submit the
+  inline editor, then reload the app and verify the title remains changed. Confirm that opening the
+  menu does not select a different session.
+- For `desktop_show`, verify the persisted `desktop_view_requested` event and the visible right
+  drawer. The event type is on the `WorkingEvent` envelope (`event_type`), not under
+  `payload.event_type`.
+- Test three cases: first request from Info, two requests in one turn, and a request after the
+  drawer was collapsed with `✕`. The frontend request must carry a changing nonce/request ID, so
+  the last case re-opens the same Desktop tab instead of being swallowed as unchanged state.
+
+### Recording and session search
+
+- Recording is a sampled screenshot timeline, not a video. Verify the `recording_manifest` artifact,
+  frame count/slider, and annotation list. Use an unknown `test_start_id` as a fast negative case
+  for assertion annotations.
+- To prove `session_search` redaction, create a fresh short session and make the marker the first
+  tool call, for example `R3PROBE --api-key=LEAKCANARY777`. Search it from another session with
+  `content_scope: "tool_calls"`. The returned snippet must contain the marker while replacing or
+  omitting the secret value. If the marker is absent too, the probe was outside the snippet window
+  and the result is inconclusive. Raw tool-call storage may retain the value; redaction is expected
+  on the search output path.
+
+### Knowledge, playbook, and automation assets
+
+- `config_asset_manage` requires `kind` on every action, including `get` and `rollback`. Only
+  `knowledge` and `playbook` are valid; rejection of `permissions` or `provider` is structural.
+  Verify rollback through both `config_object.current_version_id` /
+  `config_object_version` and Settings → Knowledge → the asset editor body.
+- `automation_manage` schedules use the agent automation path, not the legacy trigger-session path.
+  After **Run now**, compare a work-queue count snapshot and inspect the new `ready` row,
+  `payload.automation_depth`, and `schedules.last_run` / `last_result`.
+  `schedule_runs` belongs to the legacy trigger path and is not evidence for agent automation.
+  Confirm no new session was created and no `session_preferences.unattended != 0` row appeared.
+  Disable live cron schedules or snapshot counts immediately before the run; otherwise background
+  enqueues can make a non-empty queue result meaningless.
+
+### Evidence checklist
+
+For each scenario record: session ID, provider/model/host/workspace/mode, prompt, visible result,
+event or artifact ID, relevant database query, and whether the app was restarted. Distinguish
+“not observed” from “negative”; a missing marker, missing row, or missing tool claim is only useful
+when the observation window and expected write path are known.
+
 ## External-agent bridge checklist
 
 For any bridge test, prove the external process connects to the already-running app rather than
@@ -1352,3 +1427,294 @@ marker paths outside the repository's test material when possible so the agent c
 expected answers by searching parent directories. Restore temporary host URLs and provider
 fixtures before finishing, and record any intentionally changed agent setting without silently
 “fixing” it.
+
+## Local RVM fixture host: test capability gating / MCP / surfaces without a remote box
+
+A remote RVM host is not always usable (expired token, no VNC password, gateway down). A small
+aiohttp "dev-agent" fixture on `127.0.0.1:8899` covers almost every OPCOS host code path and is
+fully controllable, so gating/approval/surface tests stop depending on an external service.
+Endpoints OPCOS actually needs: `/api/health`, `/api/info`, `/api/capabilities`, `/api/exec-sync`,
+`/api/read`, `/api/write`, `/api/ls`, `/api/screenshot`, `/api/computer-use`, `/api/storage/stat`,
+`/api/storage/exists`, `/mcp`, `/pty-ws`, `/vnc-ws`. Wire-shape traps (read the Rust structs in
+`crates/opcos-rvm/src/lib.rs` before guessing): exec-sync takes `cmd` + `timeout` (not
+`command`/`timeout_seconds`), `/api/read` must return `size`, `/api/ls` must return `items`,
+`/api/screenshot` must return a nonempty `image` **plus** `format`, `/api/computer-use` must return
+`ok: true` (not `status`).
+
+Useful fixture knobs (add them; they turn hard-to-stage cases into one curl):
+`POST /fixture/capabilities {"capabilities":[...]}` to add/remove `vnc`/`pty`/`browser`/`cdp`/
+`computer_use`, `POST /fixture/delays {"health_delay":4,"computer_use_delay":60}` to make the
+optimistic-render window and the in-flight computer-use lease observable, `POST /fixture/tools` to
+change host MCP tools. Bridge `/vnc-ws` to a local `x11vnc -display :0 -nopw` and `/pty-ws` to a
+real `bash -i` pty so Desktop/Terminal surfaces are genuinely live.
+
+**Fixture pty pitfall that looks exactly like an OPCOS bug.** If the pty reader uses
+`loop.run_in_executor(None, os.read, master, 4096)`, every connection permanently consumes one
+default-ThreadPoolExecutor thread; after a handful of Terminal opens/pop-outs new pty websockets
+connect but never emit a byte, i.e. **black terminal panels and black pop-out windows**. Before
+blaming OPCOS, connect to `/pty-ws` directly with an aiohttp client and see whether the *host* echoes
+anything; fix the fixture with `loop.add_reader(master, ...)` + an asyncio queue. Also `pkill -f
+"bash -i"` between rounds. Generally: for any black surface, first prove the host side alone.
+
+## Provider / host credential fallbacks
+
+- Gateways expire mid-session: a provider card that validated earlier can start returning
+  `401 Invalid token`, which then surfaces as a mid-turn error and makes submit-failure tests
+  ambiguous. Keep an alternate OpenAI-compatible base URL + key (`LLM_Baseurl` / `LLM_KEY`) and
+  re-run Settings → Provider → Test/Save until it prints `Provider key validated successfully.`
+  Also re-pick the **session model chip** — a session created earlier keeps the old model id
+  (e.g. `glm-5.1`) and will fail with "model not found" even after the provider is fixed.
+- To stage a *submit* failure deterministically, add a host pointing at a dead port
+  (`http://127.0.0.1:9`) and send from a session bound to it; the error text is
+  `rvm request failed …`, no provider involvement.
+- Remote Desktop may be unreachable for a host-side reason. Probe the RFB handshake yourself before
+  calling it an OPCOS bug: connect to `wss://<RVM_URL>/vnc-ws` with the Bearer header, reply
+  `RFB 003.008\n`, and read the security-type list. `[1, 2]` on the wire means count=1, type=2
+  (VncAuth) ⇒ the host really requires a VNC password and OPCOS correctly shows
+  `Remote VNC requires a password; configure the host VNC password.` Ask for the host VNC password
+  as a secret (there is a per-host field); `/api/info` does not expose it.
+
+## Pop-out panes (`#/pane?session=…&tab=…`)
+
+`StandalonePane` re-fetches `list_sessions` and renders the same `SurfaceView`, so a pop-out calls
+`start_surface` again and gets its **own** bridge port. Desktop and Terminal pop-outs do paint live
+VNC/pty content on a healthy host — if a pop-out is black, suspect the host/bridge (see the fixture
+pty pitfall) before the pane route. `ide` pop-out shows only the backend reason when the session has
+no workspace, which is expected, so set a workspace if you need to test the IDE pop-out.
+
+## Capability gating specifics (App.tsx `remoteTabs`)
+
+Desktop is hidden only when **both** `vnc` and `computer_use` are Unavailable; Terminal is hidden
+when `pty` is Unavailable **or** the host is `local`; Browser is hidden when `browser` is
+Unavailable; Editor is hidden when `ide` is Unavailable. All four keep their tab when that pane is
+currently open, and show the backend `reason` text when the open pane's capability is unavailable.
+So: to test the "reason instead of blank" path, open the pane first, then drop the capability and
+force a re-probe by switching session away and back.
+
+## Testing real idle sleep (`OPCOS_IDLE_SLEEP_SECONDS`)
+
+- Launch with `DISPLAY=:0 OPCOS_IDLE_SLEEP_SECONDS=25 OPCOS_DEV_URL=http://127.0.0.1:1420 setsid
+  nohup ./target/debug/opcos &` — the threshold is read **once at process start** and the scan tick
+  is `clamp(threshold/4, 1s, 60s)`, so 20–30 s gives a ~6 s tick. Always use `setsid`: a plain
+  backgrounded `nohup` dies with the exec-tool shell and the window never appears.
+- `sqlite3` CLI is not installed on the box; read state with
+  `python3 -c "import sqlite3; ..."` on `/home/ubuntu/.config/com.opcos.desktop/opcos.db`.
+  Useful columns on `sessions`: `run_state`, `sleep_state`, `slept_at`, `last_active_at`.
+- Sleep candidates require `archived=0 AND run_state='idle' AND sleep_state='awake' AND
+  last_active_at < now-threshold`; `session_can_idle_sleep` additionally refuses when a turn is
+  active or any `pending` row is still `pending`. A session waiting on an approval card has
+  `run_state='idle'`, so that pending guard is the only thing keeping it awake — test it explicitly.
+- These refresh `last_active_at`: `submit_turn`, `steering`, `resolve_approval`, `start_surface`,
+  `ide_url`, `touch_session`/`wake_session`. Since the surface-activity fix, real user input in a
+  panel (xterm `onData`, VNC `pointerdown`/`keydown`/`wheel`) also calls `touch_session`, but it is
+  throttled to **once per 60 s per session**. Consequence for test design: with a 25 s threshold
+  typing can never keep a session awake (the throttle swallows the touches) — use
+  `OPCOS_IDLE_SLEEP_SECONDS=90` and type every ~35–40 s to prove the keep-alive, then stop typing
+  and expect sleep ~threshold later. Merely having a panel open with no input does **not** renew.
+- Verify sleep really released resources from the shell, not the UI: the relay listener disappears
+  from `ss -ltnp | grep opcos` and the fixture log prints `pty-ws close pid=…`. Baseline (no surface
+  open) on this box is 3 opcos listeners; one extra port per open surface.
+- Re-selecting a session calls `touch_session`, but the frontend throttles it to **once per 60 s per
+  session** (`lastTouchedSessionRef`). To test wake-by-reselect, wait >60 s after the last selection
+  of that session, otherwise the click is silently swallowed and the session stays asleep.
+- Sleep/wake lifecycle events arrive only on the single Tauri event `opcos://event` with a `kind`
+  field (`fn emit` in `src-tauri/src/main.rs`); `kind` is `session-sleep` / `session-wake`. Anything
+  that subscribes to `listen("session-sleep")` literally never fires — a past regression. The
+  dispatch must also run *before* the handler's `payload.session_id !== selectedId` early return,
+  otherwise a non-selected session's sidebar dot won't light up. Test both: watch the selected
+  session sleep with zero interaction (subtitle + dot must change within a tick), and keep another
+  session selected while a background session sleeps.
+- After the surface-lifecycle fix a slept panel shows an explicit notice + Reconnect button instead
+  of a stale frame: EN "This panel was disconnected because the session is asleep. Reconnect to wake
+  it." / "Reconnect", ZH "会话休眠后此面板已断开。点击重连以唤醒会话。" / "重连"
+  (`surfaceSleepingDescription` / `reconnectSurface`). Reconnect goes through normal `start_surface`,
+  which wakes the session; verify with a *new* port in `ss -ltnp`, a fresh `pty-ws open pid=…` in the
+  fixture log, `sleep_state='awake'` in sqlite, and a real command echoing in the terminal.
+- `touch_session` throttling is bypassed when the session is already `asleep`, so "switch away and
+  back" wakes reliably even inside the 60 s window.
+- Intermittent first-connect trap seen twice (dev *and* production `vite preview` builds): React
+  Strict Mode or a session/tab transition can invalidate or overlap the first `start_surface`
+  attempt. SurfaceView now self-heals one invalidated/overlapped attempt when the panel is still
+  mounted, awake, and has no port; a genuine `start_surface` error is not retried in a loop. If
+  the panel remains unavailable, it must show the translated "Retry"/"重试" action. Check
+  `ss -ltnp` + fixture log before blaming sleep code, and use that action to trigger a fresh
+  `start_surface`.
+- Denying an approval (or interrupting a turn) does not leave an orphan `pending` row: the session
+  still sleeps ~threshold later. If a session refuses to sleep, query
+  `select state from pending where session_id=… and state='pending'` first — an outstanding approval
+  is the usual, correct reason.
+- Fixture caveat: `/api/exec-sync` in the local fixture times out around 60 s, so a `sleep 60` probe
+  fails host-side. Use `sleep 45` or shorter when you need a long-running turn to hold a session
+  awake.
+
+## Surface start failures: what the UI can and cannot show
+
+`start_surface` (`src-tauri/src/main.rs`, `async fn start_surface`) binds a local `TcpListener` and
+spawns `relay_surface` **before ever contacting the host**, then returns `Ok(port)`. A later relay
+failure emits `surface-ended`; the frontend enters an explicit failed state, keeps the safe reason,
+and stops automatic reconnect attempts until the user presses Retry or otherwise changes context.
+The `shouldShowSurfaceRetry({port, sleeping, failed})` banner (i18n `surfaceUnavailable` /
+`retrySurface`) must remain stable and mutually exclusive with the sleep banner.
+
+- A genuinely unreachable/erroring host (connection refused, HTTP 503, session bound to a dead host)
+  does not make `start_surface` fail synchronously. The relay later emits `surface-ended`; verify
+  that the panel keeps the safe reason and stable Retry action instead of becoming a blank panel or
+  opening another connection automatically.
+- Ways to fake an unavailable host, cheapest first: point the session at a host whose URL is a dead
+  port (a `DeadHost` entry with `http://127.0.0.1:9` is already in the local DB), stop the fixture
+  (`kill` the `python3 agent.py` PID — `pkill -f fixture-agent/agent.py` does **not** match, the
+  cmdline is just `python3 agent.py`), or run a logging stub on :8899 that 503s everything and appends
+  each request to a log file so you can count attempts.
+- Retry-storm check: count host-side requests. Use an untouched window of at least 25 s:
+  `a=$(wc -l < /tmp/stub.log); sleep 25; …`, then compare the line count and inspect `ss -ltnp`
+  for relay churn. A fixed failed state must produce one startup attempt and zero additional
+  requests until the user presses Retry; if the count grows repeatedly or relay ports
+  appear/disappear every second, the retry storm has regressed.
+- If a failure loop is running fast, any "reason" banner it renders can flicker faster than a
+  screenshot can catch — treat "no visible reason/Retry across several seconds of screenshots" as the
+  user-visible truth, and back it up with request counts / port churn.
+- From `70339e8` on, the surface has an explicit **failed state**: a `surface-ended` event or a
+  `start_surface` error freezes the panel on the backend reason (e.g. `RVM websocket failed: HTTP
+  error: 503 Service Unavailable`, `... IO error: Connection refused (os error 111)`, `Remote surface
+  disconnected.`) plus the localized unavailable text + Retry, and auto-connect stops firing. Testing
+  notes: one Retry click = exactly one host attempt; the failed state is cleared by clicking
+  Retry/Reconnect, switching panel tab, switching session, or waking from sleep — so if you need the
+  failed state to persist for measurement, do not touch tabs or the session list while timing.
+- Watch out for the panel spontaneously reverting to a different surface tab (observed once flipping
+  Terminal → Browser during an untouched idle wait). The Browser/CDP surface polls frames
+  continuously, which keeps the session `awake` past the idle threshold and leaves an extra relay
+  listener behind until the panel is closed — so before timing an idle-sleep test, screenshot the
+  panel to confirm it is still on the tab you expect, and treat any unexplained "did not sleep" result
+  as possibly a Browser-tab artifact.
+- Sessions with `run_state='error'` are never slept, no matter how long they idle. Pick a session with
+  `run_state='idle'` for sleep tests, or you will wait forever and mis-report a sleep regression.
+- Right-rail surface icon positions shift depending on which panel is open and which capabilities the
+  host reports (local-host sessions have no Terminal/Desktop icon at all). Always `zoom` the rail
+  (region ~`[995, 25, 1024, 400]`) to locate the monitor (Desktop) and `>_` (Terminal) icons before
+  clicking; clicking the already-active icon toggles the panel closed.
+
+## Direct surface WebSockets (from PR #208, `surface_url`) — how to test without a relay
+
+Terminal/Desktop no longer go through a local relay port: `surface_url(...)` returns
+`{ url, vnc_password }` with `ws(s)://host/{pty,vnc,cdp}-ws?...&token=...` and the **webview** connects
+directly (`new WebSocket(url)` / `new RFB(host, url)`). `start_surface`/`stop_surface`/`relay_surface`/
+`surface-ended` are gone. This changes every piece of evidence you used to collect:
+
+- **No more per-surface loopback listener.** `ss -ltnp | grep -c opcos` must stay at the app baseline
+  (3 on this box) no matter how many surfaces are open. A count that grows by one per panel means the
+  relay is back. Use this as the primary "is it really direct?" assertion.
+- **Count webview sockets instead of listeners:**
+  `ss -tnp | grep <host:port> | grep WebKit` — one ESTAB line per live direct surface, owned by
+  `WebKitNetworkPr`. Note the local ephemeral port: if the same local port survives a UI transition,
+  the socket was never torn down and the panel is reusing a stale connection.
+- **Fixture must accept URL tokens and expose `/api/health`.** `surface_url` health-checks the host
+  *before* returning, so unavailable hosts now fail synchronously (no relay to discover it later) — the
+  reason string is the health error (`error sending request …`, `http 503 …`). Make the fixture's
+  `/pty-ws` / `/vnc-ws` handlers ignore/accept `?token=`, and log `pty-ws open/close pid=` so you can
+  prove the remote shell really died.
+- **Host-side request counting still works** for storm checks, but point the *stub* at the same port and
+  count `/api/health` + `/pty-ws` lines. Verified-good numbers: 0 requests over a 27 s untouched window
+  in the failed state, exactly 1 new request per Retry click. A stronger no-storm proof with direct
+  sockets: restart the host while the panel sits failed and confirm **no** `pty-ws open` appears until
+  Retry is pressed.
+- **Known defect to re-check (PR #208 head `eafaca5`): switching panel tabs does not close the direct
+  socket.** Terminal → Desktop/Browser leaves the PTY socket ESTAB and the remote `/bin/bash -i`
+  running (no `pty-ws close`), and coming back reuses the stale socket (no new `pty-ws open`, old
+  scrollback still there). Panel close (X), session switch and idle sleep *do* close it. Likely cause:
+  the terminal socket effect deps are `[selected.id, surfaceUrl, sleeping]` with `tab` missing, so a tab
+  change never runs its cleanup. Test recipe: note `grep -c 'pty-ws close'` + WebKit conn count, click
+  the other surface icon, wait ~8 s, re-count.
+- **Browser tab no longer opens a CDP WebSocket** — it only polls `capture_remote_browser_frame`, and
+  the polling *stops* after the first failure (measure: host request count flat for ≥24 s, one extra
+  request per Retry). Consequence for sleep tests: the Browser tab no longer keeps a session awake, so
+  a session can now sleep with Browser selected (confirmed: DB `asleep` + audit row while Browser open).
+  The pane still renders "Waiting for a remote browser page target…" underneath the failure banner —
+  cosmetic, but do not read it as "working".
+- **Token exposure check:** the `?token=` query is sanctioned by `AGENTS.md` for surface WebSockets only.
+  Verify the UI never renders it: the Browser footer must read `Remote browser preview (CDP)` (the old
+  `CDP relay for an external client: ws://127.0.0.1:<port>` line is gone), and
+  `grep -i token /tmp/opcos-*.log` must be empty. A fixture/stub access log containing
+  `GET /pty-ws?...&token=...` is expected (that is the host side, not OPCOS UI/logs).
+
+## Frontend i18n verification (zh/en sweeps) — the `{label}` / camelCase leak pattern
+
+Language switching lives in **设置 → 通用 / Settings → General → 语言 / Language**; `setLocale()` writes
+`localStorage["opcos.locale"]` and notifies `subscribeLocale` listeners (`web/src/i18n.ts`). Locale
+survives a full app restart, so remember to reset it between runs or you will start a sweep in the
+wrong language.
+
+**Pick the right bundle first.** `OPCOS_DEV_URL` has no effect on a reused debug binary — the webview
+always connects to `http://localhost:1420`. With several worktrees around it is very easy to test the
+wrong branch. Always confirm before launching:
+
+```bash
+pid=$(ss -ltnp 2>/dev/null | grep ':1420' | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)
+ls -l /proc/$pid/cwd            # must point at the worktree under test
+curl -s http://127.0.0.1:1420/src/i18n.ts | grep -c 'someKeyAddedByThisPR'
+```
+
+Grepping the *served* `src/i18n.ts` for a key the PR just added is the cheapest positive proof that the
+running UI is the branch you think it is.
+
+### The defect pattern that keeps recurring: dictionary keys leaking onto the screen
+
+Fixes usually replace display text with a dictionary key inside a static table, e.g.
+
+```tsx
+const tabs = [["blueprints", "blueprints"], ...];
+...
+{label}                 // BUG: renders the key
+{translate(label)}      // correct
+```
+
+Two consequences you must actively hunt for:
+
+1. **`translate(variable)` escapes the repo's own i18n unit test**, which only scans
+   `translate("literal")`. A green CI says nothing about these call sites. Pre-scan the diff with
+   `rg '\{(label|tab\.label|option\.label|category\.label)\}'` and treat every hit as a GUI target.
+2. **The visible symptom is a camelCase or all-lowercase English word** (`fullAccess`, `skills`,
+   `blueprints`, `sharePromptsInPrs`). This is far more dangerous than leftover English prose because
+   it reads like a normal English label and the eye skips it. **Sweep specifically for camelCase /
+   lowercase single words in the zh UI** — in zh, *any* lowercase English word on a control is almost
+   certainly a leaked key. Note that keys leak in **both** locales, so an en-only sweep will not find
+   them; and the fallback chain (`zh[key] → en[key] → key`) means a missing key silently degrades to
+   English before it degrades to the key itself.
+
+### Verifying "switch is instant": screenshot the frame, not the settled state
+
+Different components subscribe to locale independently (`SettingsView`, `Sidebar`, `AppContent`). A
+component that is *not* subscribed still updates a few seconds later via unrelated background polling,
+so **waiting before you screenshot will hide the bug**. Click the language option and take the
+screenshot in the *same* `computer` action batch with no `wait`, then assert that the global sidebar,
+the settings sub-nav and the body pane are all in one language in that single frame. Test both
+directions (zh→en and en→zh) and from more than one settings section.
+
+### Sweep checklist and scoping rules
+
+- Cover: 19 settings sections, sidebar (incl. the grouping `≡` menu and collapsed state), Composer
+  (collapsed permission chip **and** the expanded menu — the chip and the menu items are separate
+  render paths), the `+` menu, Transcript notices/banners, right-rail panel tabs, project configuration
+  tabs, and archive/delete confirm dialogs (good place to check `{name}` interpolation).
+- Genuine protocol/technical identifiers stay English by agreement: MCP, ACP, IDE, Token, CDP, VNC,
+  stdio, Outposts, Blueprint. Ordinary product words (Knowledge, Playbook, Environment, Skill) do not.
+  If a dictionary deliberately keeps an English zh value, check the project's `zhEnglishKeyAllowlist`
+  before filing it — it may be an intentional decision rather than a bug.
+- Chinese strings that persist in the **en** UI (`本机`, `内置 · v1`, `Rust/TypeScript 项目准则`,
+  `通用工程工作准则`) come from the Rust backend and seeded DB rows, not from `web/`. Report them as
+  out-of-scope for a frontend-only i18n PR.
+- Templated strings: confirm real values are substituted and no bare `{count}` / `{name}` / `{host}` /
+  `{destination}` / `{title}` / `{operation}` appears. When a template's parameter can be missing,
+  check that the whole line is suppressed rather than rendering an empty sentence or a bare
+  placeholder. Also watch for **double rendering** (`Switched to model Switched to model gpt-5.5`),
+  which happens when the parameter falls back to a field (`data.message`) that already holds the full
+  sentence.
+- Session status labels (`sessionStatus.ts`) are a good instant-switch probe because the label must
+  change in place with no reload. Triggering `running` / `idle` / `finished` needs a provider whose
+  model ids match the app's built-in list; on the usual gateway they return `model_not_found`, so
+  budget for marking those `untested` and cover the `error` label instead.
+
+### Devin secrets needed
+
+Nothing beyond the usual GUI bring-up. To cover `running` / `idle` / `finished` status labels you need
+a provider (`LLM_Baseurl` / `LLM_KEY`) that actually serves a model id present in the app's built-in
+model list; otherwise those states are not reachable.
