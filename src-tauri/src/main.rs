@@ -24154,10 +24154,16 @@ fn local_git_file_diff(
         .stdout
         .starts_with(b"?? ");
         if is_untracked {
+            let empty_file = tempfile::NamedTempFile::new_in(cwd)
+                .map_err(|error| format!("failed to create empty diff source: {error}"))?;
+            let empty_path = empty_file.path().to_string_lossy().into_owned();
             let output = local_git_command(
                 cwd,
-                &["diff", &context_arg, "--no-index", "--", "/dev/null", path],
+                &["diff", &context_arg, "--no-index", "--", &empty_path, path],
             )?;
+            if !matches!(output.status.code(), Some(0) | Some(1)) {
+                return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+            }
             return Ok(json!({
                 "diff": String::from_utf8_lossy(&output.stdout),
                 "exit_code": output.status.code().unwrap_or(1),
@@ -30235,6 +30241,22 @@ mod m7_tests {
             normalize_provider_model(Some("   ")).unwrap_err(),
             "provider model id is required"
         );
+    }
+
+    #[test]
+    fn local_git_file_diff_renders_untracked_file_as_additions() {
+        let root = tempfile::tempdir().unwrap();
+        let init = local_git_command(root.path().to_str().unwrap(), &["init", "--quiet"]).unwrap();
+        assert!(init.status.success());
+        std::fs::write(root.path().join("new.txt"), "first line\nsecond line\n").unwrap();
+
+        let result =
+            local_git_file_diff(root.path().to_str().unwrap(), "new.txt", "HEAD", None).unwrap();
+        let diff = result["diff"].as_str().unwrap();
+        assert!(diff.contains("+++"));
+        assert!(diff.contains("+first line"));
+        assert!(diff.contains("+second line"));
+        assert_eq!(result["exit_code"], 1);
     }
 
     #[test]
