@@ -922,7 +922,7 @@ function ProjectDialog({
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!name.trim() || !hostId) {
-      setError("项目名称和主机不能为空");
+      setError(translate("projectNameRequired"));
       return;
     }
     setSaving(true);
@@ -948,25 +948,27 @@ function ProjectDialog({
         onSubmit={submit}
       >
         <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-ink">新建项目</h2>
+          <h2 className="text-lg font-semibold text-ink">
+            {translate("newProjectTitle")}
+          </h2>
           <button type="button" className="btn" onClick={onClose}>
-            关闭
+            {translate("close")}
           </button>
         </div>
         <div className="mt-5 min-h-0 flex-1 overflow-y-auto pr-1">
           <div className="grid gap-3">
             <label className="field-label">
-              名称
+              {translate("name")}
               <input
                 autoFocus
                 className="input"
                 value={name}
                 onChange={(event) => setName(event.target.value)}
-                placeholder="项目名称"
+                placeholder={translate("projectName")}
               />
             </label>
             <label className="field-label">
-              主机
+              {translate("host")}
               <select
                 className="input"
                 value={hostId}
@@ -980,7 +982,7 @@ function ProjectDialog({
               </select>
             </label>
             <label className="field-label">
-              仓库 URL（可留空）
+              {translate("repositoryUrlOptional")}
               <input
                 className="input"
                 value={repoUrl}
@@ -989,16 +991,16 @@ function ProjectDialog({
               />
             </label>
             <label className="field-label">
-              仓库路径（可留空）
+              {translate("repositoryPathOptional")}
               <input
                 className="input"
                 value={repoRoot}
                 onChange={(event) => setRepoRoot(event.target.value)}
-                placeholder="按后端默认路径"
+                placeholder={translate("repositoryPathDefault")}
               />
             </label>
             <label className="field-label">
-              默认分支
+              {translate("defaultBranch")}
               <input
                 className="input"
                 value={defaultBranch}
@@ -1006,34 +1008,37 @@ function ProjectDialog({
               />
             </label>
             <label className="field-label">
-              从 Team 模板创建（可选）
+              {translate("teamTemplateOptional")}
               <select
                 className="input"
                 value={teamTemplateId}
                 onChange={(event) => setTeamTemplateId(event.target.value)}
               >
-                <option value="">不使用 Team 模板</option>
+                <option value="">{translate("noTeamTemplate")}</option>
                 {teamTemplates.map((template) => (
                   <option key={template.id} value={template.id}>
                     {template.name} ·{" "}
-                    {template.status === "builtin" ? "内置" : "自定义"}
+                    {template.status === "builtin"
+                      ? translate("builtIn")
+                      : translate("custom")}
                   </option>
                 ))}
               </select>
             </label>
             {selectedTeamContent && (
               <div className="rounded-lg border border-line p-3 text-sm">
-                <strong>将创建的成员</strong>
+                <strong>{translate("membersToCreate")}</strong>
                 <div className="mt-1">
                   {(selectedTeamContent.agents || [])
                     .map(
                       (agent) =>
-                        `${agent.name || "成员"}（${agent.role || "Worker"}）`,
+                        `${agent.name || translate("member")}（${agent.role || translate("worker")}）`,
                     )
                     .join("、")}
                 </div>
                 <small className="text-muted">
-                  Workflow：{JSON.stringify(selectedTeamContent.workflow)}
+                  {translate("workflow")}：{" "}
+                  {JSON.stringify(selectedTeamContent.workflow)}
                 </small>
               </div>
             )}
@@ -1042,14 +1047,16 @@ function ProjectDialog({
         {error && <p className="mt-3 text-sm text-danger">{error}</p>}
         <div className="sticky bottom-0 mt-6 flex justify-end gap-2 bg-panel pt-1">
           <button type="button" className="btn" onClick={onClose}>
-            取消
+            {translate("cancel")}
           </button>
           <button
             type="submit"
             className="btn approval-primary"
             disabled={saving}
           >
-            {saving ? "创建中…" : "创建项目"}
+            {saving
+              ? translate("creating")
+              : translate("createProject")}
           </button>
         </div>
       </form>
@@ -1097,7 +1104,7 @@ function MemberDialog({
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!name.trim() || !role.trim()) {
-      setError("成员名称和角色不能为空");
+      setError(translate("memberNameRoleRequired"));
       return;
     }
     setError("");
@@ -1124,15 +1131,17 @@ function MemberDialog({
       >
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold text-ink">
-            {mode === "add" ? "添加成员" : "编辑成员"}
+            {mode === "add"
+              ? translate("addingMember")
+              : translate("editingMember")}
           </h2>
           <button type="button" className="btn" onClick={onClose}>
-            关闭
+            {translate("close")}
           </button>
         </div>
         <div className="mt-5 grid gap-3">
           <label className="field-label">
-            名称
+            {translate("name")}
             <input
               autoFocus
               className="input"
@@ -1141,7 +1150,7 @@ function MemberDialog({
             />
           </label>
           <label className="field-label">
-            角色
+            {translate("role")}
             <input
               className="input"
               list="project-agent-roles"
@@ -1163,7 +1172,7 @@ function MemberDialog({
                   value={provider}
                   onChange={(event) => setProvider(event.target.value)}
                 >
-                  <option value="">默认</option>
+                  <option value="">{translate("defaultValue")}</option>
                   {providers.map((item) => (
                     <option
                       key={item.name}
@@ -1176,13 +1185,13 @@ function MemberDialog({
                 </select>
               </label>
               <label className="field-label">
-                Model
+                {translate("modelLabel")}
                 <select
                   className="input"
                   value={model}
                   onChange={(event) => setModel(event.target.value)}
                 >
-                  <option value="auto">Auto</option>
+                  <option value="auto">{translate("auto")}</option>
                   {models.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.label}
@@ -1212,37 +1221,39 @@ function MemberDialog({
                 </select>
               </label>
               <label className="field-label">
-                Mode
+                {translate("modeLabel")}
                 <select
                   className="input"
                   value={sessionMode}
                   onChange={(event) => setSessionMode(event.target.value)}
                 >
-                  <option value="Interactive">Interactive</option>
-                  <option value="Auto">Auto</option>
+                  <option value="Interactive">
+                    {translate("interactive")}
+                  </option>
+                  <option value="Auto">{translate("auto")}</option>
                 </select>
               </label>
               <label className="field-label">
-                分支（可留空）
+                {translate("branchOptional")}
                 <input
                   className="input"
                   value={branch}
                   onChange={(event) => setBranch(event.target.value)}
-                  placeholder="按角色自动命名"
+                  placeholder={translate("autoNameByRole")}
                 />
               </label>
             </>
           ) : (
             <label className="field-label">
-              状态
+              {translate("state")}
               <select
                 className="input"
                 value={state}
                 onChange={(event) => setState(event.target.value)}
               >
-                <option value="Active">Active</option>
-                <option value="Sleep">Sleep</option>
-                <option value="Paused">Paused</option>
+                <option value="Active">{translate("active")}</option>
+                <option value="Sleep">{translate("sleep")}</option>
+                <option value="Paused">{translate("paused")}</option>
               </select>
             </label>
           )}
@@ -1250,14 +1261,14 @@ function MemberDialog({
         {error && <p className="mt-3 text-sm text-danger">{error}</p>}
         <div className="mt-6 flex justify-end gap-2">
           <button type="button" className="btn" onClick={onClose}>
-            取消
+            {translate("cancel")}
           </button>
           <button
             type="submit"
             className="btn approval-primary"
             disabled={saving}
           >
-            {saving ? "保存中…" : "保存"}
+            {saving ? translate("saving") : translate("save")}
           </button>
         </div>
       </form>
