@@ -7401,6 +7401,7 @@ mod tests {
         let sources = [
             "../../crates/opcos-engine/src/lib.rs",
             "../../crates/opcos-engine/src/acp.rs",
+            "../../crates/opcos-trace/src/lib.rs",
             "../../src-tauri/src/main.rs",
         ];
         let markers = [
