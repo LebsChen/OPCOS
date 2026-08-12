@@ -18689,19 +18689,14 @@ async fn current_session_provider(
 }
 
 async fn validate_session_model(
-    state: &DesktopState,
-    session: &SessionRecord,
+    _state: &DesktopState,
+    _session: &SessionRecord,
     model: &str,
 ) -> Result<(), String> {
-    let provider = current_session_provider(state, session).await?;
-    let discovery = provider_models_for_state(state, provider.clone(), Some(false), None).await?;
-    if discovery.models.iter().any(|item| item.id == model) {
-        Ok(())
-    } else {
-        Err(format!(
-            "model {model} is not available for provider {provider}"
-        ))
+    if model.trim().is_empty() {
+        return Err("provider model id is required".to_owned());
     }
+    Ok(())
 }
 
 #[tauri::command]
@@ -29451,23 +29446,34 @@ fn save_provider_model_settings(
     provider: &str,
     model: Option<&str>,
 ) -> Result<(), String> {
-    let Some(model) = model.filter(|v| !v.trim().is_empty()) else {
+    let Some(model) = normalize_provider_model(model)? else {
         return Ok(());
     };
     connection
         .execute(
             "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.model',?1)",
-            [model],
+            [&model],
         )
         .map_err(|e| e.to_string())?;
     let scoped_key = format!("provider.model.{provider}");
     connection
         .execute(
             "INSERT OR REPLACE INTO settings(key,value) VALUES (?1,?2)",
-            [&scoped_key, model],
+            [&scoped_key, &model],
         )
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn normalize_provider_model(model: Option<&str>) -> Result<Option<String>, String> {
+    let Some(model) = model else {
+        return Ok(None);
+    };
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("provider model id is required".to_owned());
+    }
+    Ok(Some(model.to_owned()))
 }
 
 fn provider_base_url(
@@ -30146,6 +30152,23 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn provider_model_ids_accept_custom_values_and_reject_blank_values() {
+        assert_eq!(
+            normalize_provider_model(Some(" deepseek-v4-flash ")).unwrap(),
+            Some("deepseek-v4-flash".to_owned())
+        );
+        assert_eq!(normalize_provider_model(None).unwrap(), None);
+        assert_eq!(
+            normalize_provider_model(Some("")).unwrap_err(),
+            "provider model id is required"
+        );
+        assert_eq!(
+            normalize_provider_model(Some("   ")).unwrap_err(),
+            "provider model id is required"
+        );
+    }
 
     #[test]
     fn computer_use_arguments_accept_flat_nested_and_report_missing_action() {

@@ -207,6 +207,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     chooseHost: "Choose a bound host and create an OPCOS workspace.",
     workbenchError: "The workbench could not render this view.",
     customModel: "Custom model ID",
+    providerModelRequired: "Enter a model ID before saving provider settings.",
     recent: "Recent",
     noMatchingConversations: "No matching conversations.",
     showLess: "Show less",
@@ -1027,6 +1028,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     providerRequestFailed: "Provider request failed{status}",
     providerKeyNotConfigured:
       "Provider key is not configured; open Provider settings first.",
+    providerValidationFailed: "Provider validation failed: {error}",
     policyDenied: "Policy denied",
     contextExhausted: "Context exhausted",
     internalError: "Internal error",
@@ -1342,6 +1344,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     chooseHost: "选择已绑定的主机并创建 OPCOS 工作区。",
     workbenchError: "工作台无法渲染此页面。",
     customModel: "自定义模型 ID",
+    providerModelRequired: "保存供应商设置前请输入模型 ID。",
     recent: "最近",
     noMatchingConversations: "没有匹配的会话。",
     showLess: "收起",
@@ -2135,6 +2138,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     providerError: "模型服务错误",
     providerRequestFailed: "提供商请求失败{status}",
     providerKeyNotConfigured: "未配置提供商密钥；请先打开提供商设置。",
+    providerValidationFailed: "提供商校验失败：{error}",
     policyDenied: "策略拒绝",
     contextExhausted: "上下文已耗尽",
     internalError: "内部错误",
@@ -2328,6 +2332,7 @@ const backendErrorKeys: Record<string, string> = {
     "providerKeyNotConfigured",
   "the local host does not provide remote mcp tools; bind a remote host.":
     "mcpToolsUnavailable",
+  "provider model id is required": "providerModelRequired",
 };
 
 export function translateBackendError(value: unknown): string {
