@@ -1,4 +1,4 @@
-name: Windows release
+name: Release bundles
 
 on:
   workflow_dispatch:
@@ -10,7 +10,65 @@ permissions:
   contents: write
 
 jobs:
+  linux-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Tauri Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libsoup-3.0-dev \
+            libjavascriptcoregtk-4.1-dev
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build frontend
+        working-directory: web
+        run: npm run build
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build unsigned Linux bundles
+        run: cargo tauri build --bundles appimage,deb,rpm
+
+      - name: Collect unsigned Linux bundles
+        run: |
+          mkdir -p artifacts
+          cp target/release/bundle/appimage/*.AppImage artifacts/OPCOS-unsigned-linux.AppImage
+          cp target/release/bundle/deb/*.deb artifacts/OPCOS-unsigned-linux.deb
+          cp target/release/bundle/rpm/*.rpm artifacts/OPCOS-unsigned-linux.rpm
+
+      - name: Upload unsigned Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: OPCOS-unsigned-linux
+          path: artifacts/*
+          if-no-files-found: error
+
   windows-bundle:
+    needs: linux-bundle
     runs-on: windows-latest
     steps:
       - name: Check out repository
@@ -60,14 +118,21 @@ jobs:
           path: artifacts/*
           if-no-files-found: error
 
+      - name: Download unsigned Linux artifacts for release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/download-artifact@v4
+        with:
+          name: OPCOS-unsigned-linux
+          path: artifacts/linux
+
       - name: Publish unsigned Windows release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: artifacts/*
+          files: artifacts/**/*
           name: OPCOS ${{ github.ref_name }}
           body: |
-            Unsigned Windows installers for OPCOS ${{ github.ref_name }}.
+            Unsigned Windows and Linux bundles for OPCOS ${{ github.ref_name }}.
 
             Windows SmartScreen may warn because these installers are not
             Authenticode-signed. Signing will be added when a release
