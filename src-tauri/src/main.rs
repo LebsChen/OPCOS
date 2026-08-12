@@ -18667,27 +18667,6 @@ async fn provider_models(
     provider_models_for_state(&state, provider, refresh, None).await
 }
 
-async fn current_session_provider(
-    state: &DesktopState,
-    session: &SessionRecord,
-) -> Result<String, String> {
-    if let Some(provider) = session.provider.clone() {
-        return Ok(provider);
-    }
-    let connection = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?;
-    connection
-        .query_row(
-            "SELECT value FROM settings WHERE key='provider.id'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .or_else(|_| Ok::<String, rusqlite::Error>("openai".into()))
-        .map_err(|error| error.to_string())
-}
-
 async fn validate_session_model(
     _state: &DesktopState,
     _session: &SessionRecord,

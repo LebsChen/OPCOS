@@ -392,6 +392,28 @@ describe("i18n source coverage", () => {
     );
   });
 
+  it("persists custom model IDs and keeps built-in suggestions deduplicated", () => {
+    const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
+    const backendSource = readFileSync(
+      `${sourceRoot}../../src-tauri/src/main.rs`,
+      "utf8",
+    );
+    expect(appSource).toContain("config.model");
+    expect(appSource).toContain("setProviderModels(");
+    expect(appSource).toContain("providerModels[descriptor.name]");
+    expect(appSource).toContain("<datalist");
+    expect(appSource).toContain('command("save_provider_settings"');
+    expect(appSource).not.toMatch(
+      /translate(?:BackendValue)?\(\s*providerModels\[descriptor\.name\]/,
+    );
+    expect(appSource).toMatch(/translate\(\s*"providerValidationFailed"/);
+    expect(backendSource).toContain('format!("provider.model.{provider}")');
+    expect(backendSource).toContain(
+      'format!("provider.model.{}", descriptor.name)',
+    );
+    expect(backendSource).toContain("normalize_provider_model");
+  });
+
   it("renders insight fields individually with formatted token usage", () => {
     const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
     expect(appSource).toContain("function formatInsightValue");
