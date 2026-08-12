@@ -4720,7 +4720,7 @@ function ManageSections({
                       .catch(onError)
                   }
                 >
-                  Reset system
+                        {translate("resetSystem")}
                 </Button>
               </div>
               <div className="space-y-2">
@@ -7397,7 +7397,7 @@ function ManageSections({
                   <div className="manage-row px-4">
                     <div className="form-grid w-full">
                       <label className="field-label">
-                        Name
+                  {translate("name")}
                         <input
                           value={secretName}
                           onChange={(event) =>
@@ -7406,7 +7406,7 @@ function ManageSections({
                         />
                       </label>
                       <label className="field-label">
-                        Scope
+                  {translate("scope")}
                         <input
                           value={secretScope}
                           onChange={(event) =>
@@ -7537,7 +7537,7 @@ function ManageSections({
                     .catch(onError)
                 }
               >
-                Run remote command
+                    {translate("runRemoteCommand")}
               </Button>
               <Button
                 disabled={!selected}
@@ -7903,7 +7903,7 @@ function McpManage({
               checked={serverEnabled}
               onChange={(event) => setServerEnabled(event.target.checked)}
             />
-            Enabled
+                        {translate("enabled")}
           </label>
           <label className="flex items-center gap-2">
             <input
@@ -7970,10 +7970,10 @@ function McpManage({
                         {isUserMcpServer(server) && (
                           <>
                             <Button onClick={() => editServer(server)}>
-                              Edit
+                            {translate("edit")}
                             </Button>
                             <Button onClick={() => removeServer(server)}>
-                              Delete
+                            {translate("delete")}
                             </Button>
                           </>
                         )}
@@ -8188,7 +8188,7 @@ function McpManage({
                       .catch(onError)
                   }
                 >
-                  Remove
+                        {translate("remove")}
                 </Button>
               </div>
             ))}
@@ -8796,7 +8796,7 @@ function Activity({
                                       .catch(onError)
                                   }
                                 >
-                                  approve
+                {translate("approve")}
                                 </button>
                               )}
                             </small>
@@ -8941,7 +8941,7 @@ function Activity({
                 </div>
                 <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
                   <h2 className="text-[15px] font-semibold">
-                    Account host bindings
+                {translate("accountHostBindings")}
                   </h2>
                   <div className="grid grid-cols-2 gap-3">
                     <input
@@ -8973,7 +8973,7 @@ function Activity({
                     }
                     disabled={!accountId.trim() || !accountHostId.trim()}
                   >
-                    Bind account to host
+                    {translate("bindAccountHost")}
                   </Button>
                   <CollectionPage
                     search=""
@@ -9158,7 +9158,7 @@ function Activity({
                                   }).catch(onError)
                                 }
                               >
-                                Restore
+                    {translate("restore")}
                               </Button>
                             </div>
                           ))}
@@ -9304,7 +9304,7 @@ function Activity({
                   <div className="rounded-xl2 border border-line bg-panel p-5 space-y-4">
                     <div>
                       <label className="field-label">
-                        Coordination task ID
+                      {translate("coordinationTaskId")}
                       </label>
                       <input
                         value={taskId}
@@ -9312,7 +9312,7 @@ function Activity({
                         placeholder={translate("taskIdExample")}
                       />
                       <p className="field-help">
-                        The durable coordination board to observe or update.
+                      {translate("coordinationDescription")}
                       </p>
                     </div>
                     <div>
@@ -9347,13 +9347,13 @@ function Activity({
                         }
                       }}
                     >
-                      Start board
+                        {translate("startBoard")}
                     </Button>
                     <Button className="bordered" onClick={load}>
-                      Observe
+                      {translate("observe")}
                     </Button>
                     <label className="field-label">
-                      Role ID
+                      {translate("roleId")}
                       <input
                         value={roleId}
                         onChange={(event) => setRoleId(event.target.value)}
@@ -9381,7 +9381,7 @@ function Activity({
                           .catch(onError)
                       }
                     >
-                      Set role
+                            {translate("setRole")}
                     </Button>
                   </div>
                 )}
@@ -10761,7 +10761,7 @@ function AgentRosterPane({
                         className="btn approval-primary"
                         onClick={() => onOpenSession(session)}
                       >
-                        Open session
+                      {translate("openSession")}
                       </button>
                     ) : (
                       <button

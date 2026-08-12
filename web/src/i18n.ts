@@ -1,10 +1,12 @@
 export type Locale = "en" | "zh";
 
 const storageKey = "opcos.locale";
-let locale: Locale = localStorage.getItem(storageKey) === "zh" ? "zh" : "en";
+const storedLocale =
+  typeof localStorage === "undefined" ? null : localStorage.getItem(storageKey);
+let locale: Locale = storedLocale === "zh" ? "zh" : "en";
 const listeners = new Set<() => void>();
 
-const messages: Record<Locale, Record<string, string>> = {
+export const messages: Record<Locale, Record<string, string>> = {
   en: {
     general: "General",
     appearanceDescription:
@@ -115,7 +117,6 @@ const messages: Record<Locale, Record<string, string>> = {
     customModel: "Custom model ID",
     recent: "Recent",
     noMatchingConversations: "No matching conversations.",
-    noConversations: "No conversations yet.",
     showLess: "Show less",
     showMore: "Show more",
     artifactOpen: "Open",
@@ -488,7 +489,6 @@ const messages: Record<Locale, Record<string, string>> = {
     forceDeleteWorktree: "Force delete and reclaim worktree",
     projectNameLabel: "Project name",
     save: "Save",
-    openSession: "Open session",
     saveAgent: "Save Agent",
     forceDelete: "Force delete",
     branchLabelText: "Branch: ",
@@ -652,6 +652,33 @@ const messages: Record<Locale, Record<string, string>> = {
     loadComposer: "Load into composer",
     pollInterval: "Poll interval",
     connected: "Connected",
+    approve: "Approve",
+    accountHostBindings: "Account host bindings",
+    bindAccountHost: "Bind account to host",
+    restore: "Restore",
+    coordinationTaskId: "Coordination task ID",
+    coordinationDescription: "The durable coordination board to observe or update.",
+    resetSystem: "Reset system",
+    openSession: "Open session",
+    minorActions: "minor actions",
+    exitCode: "exit",
+    startBoard: "Start board",
+    observe: "Observe",
+    roleId: "Role ID",
+    setRole: "Set role",
+    pinned: "Pinned",
+    scheduled: "Scheduled",
+    groupBy: "Group by",
+    filterWorkspace: "Filter by workspace",
+    clear: "Clear",
+    noneChecked: "None checked shows all.",
+    projects: "Projects",
+    noProjects: "No projects yet — start one with the + above.",
+    noProjectConversations: "No conversations in this project yet.",
+    noConversations: "No conversations yet.",
+    rename: "Rename",
+    startSessionAs: "Start a session as",
+    managePersonas: "Manage personas…",
     externalEventSources: "External event sources",
     ingressDisabledNotice: "Sources are disabled when created. Polling never exposes a public listener.",
     feedUrl: "Feed URL",
@@ -836,7 +863,6 @@ const messages: Record<Locale, Record<string, string>> = {
     customModel: "自定义模型 ID",
     recent: "最近",
     noMatchingConversations: "没有匹配的会话。",
-    noConversations: "暂无会话。",
     showLess: "收起",
     showMore: "显示更多",
     artifactOpen: "打开",
@@ -1202,7 +1228,6 @@ const messages: Record<Locale, Record<string, string>> = {
     forceDeleteWorktree: "强制删除并回收 worktree",
     projectNameLabel: "项目名称",
     save: "保存",
-    openSession: "打开会话",
     saveAgent: "另存 Agent",
     forceDelete: "强制删除",
     branchLabelText: "分支：",
@@ -1366,6 +1391,33 @@ const messages: Record<Locale, Record<string, string>> = {
     loadComposer: "加载到编辑器",
     pollInterval: "轮询间隔",
     connected: "已连接",
+    approve: "批准",
+    accountHostBindings: "账号主机绑定",
+    bindAccountHost: "将账号绑定到主机",
+    restore: "恢复",
+    coordinationTaskId: "协同任务 ID",
+    coordinationDescription: "用于查看或更新持久化协同看板。",
+    resetSystem: "重置系统",
+    openSession: "打开会话",
+    minorActions: "次要操作",
+    exitCode: "退出",
+    startBoard: "启动看板",
+    observe: "查看",
+    roleId: "角色 ID",
+    setRole: "设置角色",
+    pinned: "已置顶",
+    scheduled: "已计划",
+    groupBy: "分组方式",
+    filterWorkspace: "按工作区筛选",
+    clear: "清除",
+    noneChecked: "未勾选时显示全部。",
+    projects: "项目",
+    noProjects: "暂无项目，可点击上方 + 开始。",
+    noProjectConversations: "此项目中暂无会话。",
+    noConversations: "暂无会话。",
+    rename: "重命名",
+    startSessionAs: "以此身份开始会话",
+    managePersonas: "管理 Persona…",
     externalEventSources: "外部事件源",
     ingressDisabledNotice: "来源创建后默认停用。轮询不会暴露公共监听器。",
     feedUrl: "Feed URL",
@@ -1452,8 +1504,12 @@ export function getLocale(): Locale {
 
 export function setLocale(next: Locale): void {
   locale = next;
-  localStorage.setItem(storageKey, next);
-  document.documentElement.lang = next;
+  if (typeof localStorage !== "undefined") {
+    localStorage.setItem(storageKey, next);
+  }
+  if (typeof document !== "undefined") {
+    document.documentElement.lang = next;
+  }
   listeners.forEach((listener) => listener());
 }
 

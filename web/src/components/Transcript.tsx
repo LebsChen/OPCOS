@@ -757,7 +757,7 @@ export function Transcript({
                   key={`minor-${start}`}
                 >
                   <summary className="transcript-minor-summary">
-                    {minorRows.length} minor actions
+                    {minorRows.length} {translate("minorActions")}
                   </summary>
                   <div className="mt-2 flex flex-col gap-2">
                     {minorRows.map((row, offset) =>
