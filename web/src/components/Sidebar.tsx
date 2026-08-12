@@ -461,7 +461,7 @@ export function Sidebar(props: SidebarProps) {
     <button
       className="w-6 h-6 grid place-items-center rounded text-faint hover:text-ink hover:bg-paper opacity-0 group-hover:opacity-100 focus:opacity-100 shrink-0"
       aria-label={`Actions for ${title}`}
-      title="Session actions"
+      title={translate("sessionActions")}
       onClick={(event) => {
         event.stopPropagation();
         openRowMenu(s.session_id, event.currentTarget);
@@ -986,8 +986,8 @@ export function Sidebar(props: SidebarProps) {
         <div className="sidebar-header collapsed-header">
           <button
             className="nav-item-icon"
-            title="展开侧栏 (⌘B)"
-            aria-label="展开侧栏"
+            title={`${translate("expandSidebar")} (⌘B)`}
+            aria-label={translate("expandSidebar")}
             onClick={props.onCollapse}
           >
             <Icon name="sidebar" size={16} />
@@ -995,7 +995,7 @@ export function Sidebar(props: SidebarProps) {
         </div>
         <button
           className="nav-item-icon"
-          title="新建会话"
+          title={translate("newSession")}
           onClick={() => onNewSession(agent)}
         >
           <Icon name="plus" size={18} />
@@ -1060,7 +1060,7 @@ export function Sidebar(props: SidebarProps) {
       >
         <div className="brand-wordmark text-[15px] flex-1">
           <span className="brand-logo" aria-hidden="true" />
-          OPCOS<span className="beta-tag">BETA</span>
+          OPCOS<span className="beta-tag">{translate("beta")}</span>
         </div>
         {/* Collapse (dock) / pin the sidebar. ⌘B mirrors this. */}
         {props.onCollapse && (
@@ -1130,7 +1130,7 @@ export function Sidebar(props: SidebarProps) {
               </span>
               <button
                 className="w-6 h-6 grid place-items-center rounded-md text-faint hover:text-ink hover:bg-paper"
-                title="新建项目"
+                title={translate("newProject")}
                 onClick={onCreateProject}
               >
                 <Icon name="plus" size={14} />
@@ -1272,7 +1272,7 @@ export function Sidebar(props: SidebarProps) {
         <>
           <button
             className="fixed inset-0 z-40 cursor-default"
-            aria-label="Close session actions"
+            aria-label={translate("closeSessionActions")}
             onClick={closeRowMenu}
           />
           <div

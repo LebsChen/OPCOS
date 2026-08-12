@@ -11,6 +11,7 @@ import {
   type TimelineEvent,
   type TimelineNode,
 } from "../timeline";
+import { translate } from "../i18n";
 import { Markdown } from "./Markdown";
 
 const CHEVRON_PATH =
@@ -171,7 +172,7 @@ function QuestionCard({
   return (
     <div className="approval transcript-question-card">
       <div className="transcript-question-head">
-        <strong>Question</strong>
+        <strong>{translate("question")}</strong>
         <span className="approval-with">{text}</span>
       </div>
       {options && options.length > 0 && (
@@ -193,7 +194,7 @@ function QuestionCard({
         <input
           className="input"
           value={answer}
-          placeholder="Type an answer"
+          placeholder={translate("typeAnswer")}
           onChange={(event) => setAnswer(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "Enter" && answer.trim()) {
@@ -333,7 +334,7 @@ function PlanCard({
             strokeLinecap="round"
           />
         </svg>
-        <span>OPCOS execution plan</span>
+        <span>{translate("opcosExecutionPlan")}</span>
       </div>
       <div className="transcript-plan-steps">
         {steps.map((step, index) => {
@@ -478,7 +479,7 @@ function ArtifactRow({
           <img
             className="max-w-full max-h-64 cursor-zoom-in"
             src={image}
-            alt="Screenshot artifact"
+            alt={translate("screenshotArtifact")}
             onClick={() => setLightboxOpen(true)}
           />
         ) : content ? (
@@ -486,7 +487,7 @@ function ArtifactRow({
             {diff ?? String(content.content ?? "")}
           </pre>
         ) : (
-          <span className="text-muted">Loading…</span>
+          <span className="text-muted">{translate("loading")}</span>
         )}
       </TranscriptDisclosure>
       {lightboxOpen && image && (
@@ -498,7 +499,7 @@ function ArtifactRow({
           <img
             className="max-h-full max-w-full"
             src={image}
-            alt="Screenshot artifact enlarged"
+            alt={translate("screenshotArtifactEnlarged")}
             onClick={(event) => event.stopPropagation()}
           />
         </div>
@@ -823,7 +824,7 @@ export function Transcript({
       {running && (
         <div className="current-activity" data-testid="current-activity">
           <span className="spinner" />
-          <span>Working</span>
+          <span>{translate("working")}</span>
         </div>
       )}
     </div>
