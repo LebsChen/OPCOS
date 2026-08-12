@@ -979,6 +979,71 @@ export const messages: Record<Locale, Record<string, string>> = {
     playbooks: "Playbooks",
     workingForMinutes: "Worked for {minutes}m {seconds}s",
     switchedToModel: "Switched to model {model}",
+    connectorTelegramDescription: "Two-way messaging with a Telegram bot.",
+    connectorSlackDescription:
+      "Two-way messaging through a Slack app or managed workspace connection.",
+    connectorEmailImapDescription:
+      "Read, search, and send mail from an IMAP account.",
+    connectorGmailDescription: "Search, summarize, draft, and send email.",
+    connectorGoogleCalendarDescription:
+      "Read availability, summarize schedules, and create events.",
+    connectorBrowserDescription:
+      "Navigate, read, and act on websites with approval.",
+    connectorGitHubDescription:
+      "Work with issues, pull requests, files, and CI status.",
+    connectorOutlookDescription: "Manage Microsoft 365 mail and calendar.",
+    connectorJiraDescription: "Search, summarize, create, and update issues.",
+    connectorMondayDescription:
+      "Read boards and items, track work, and post updates.",
+    connectorConfluenceDescription:
+      "Search spaces, read pages, and draft documentation.",
+    connectorZendeskDescription:
+      "Search tickets, summarize customer context, and draft replies.",
+    connectorLinearDescription: "Search, read, and create Linear issues.",
+    connectorGitLabDescription: "Work with issues and merge requests.",
+    connectorDiscordDescription:
+      "Read channels and send messages through a Discord bot.",
+    connectorStripeDescription: "Read customers, charges, and invoices.",
+    connectorAsanaDescription:
+      "Search, read, create, update, and comment on tasks.",
+    connectorHubSpotDescription:
+      "Search CRM records and update notes and tasks.",
+    connectorDropboxDescription: "Search, browse, and read files in Dropbox.",
+    connectorBoxDescription: "Search, browse, and read files in Box.",
+    connectorWhatsAppDescription:
+      "Send WhatsApp messages through the official Cloud API.",
+    connectorQuickBooksDescription:
+      "Read customers, invoices, and financial reports.",
+    connectorDatadogDescription:
+      "Pull firing alerts, monitors, and incident timelines.",
+    connectorSalesforceDescription:
+      "Read and update cases, accounts, and opportunities.",
+    connectorDocusignDescription:
+      "Track agreements and send documents for signature.",
+    connectorClickUpDescription:
+      "Search tasks and docs; create and update items.",
+    connectorGoogleDriveDescription:
+      "Search, browse, and read files in Google Drive.",
+    connectorCanvaDescription: "Browse, create, and export designs.",
+    connectorFigmaDescription: "Read design files and comments; export assets.",
+    connectorDescriptDescription:
+      "Read and edit audio and video projects through transcripts.",
+    connectorClayDescription:
+      "Enrich people and companies for research workflows.",
+    connectorCloseDescription:
+      "Read and update leads, contacts, and opportunities.",
+    connectorNotionDescription:
+      "Search pages, read content, query databases, and create pages.",
+    connectorAttioDescription: "Read CRM objects, records, and notes.",
+    connectorPostHogDescription:
+      "Query product analytics, events, funnels, and insights.",
+    connectorMixpanelDescription: "Query events and segmentation data.",
+    connectorAmplitudeDescription: "Query product analytics and chart data.",
+    connectorApolloDescription:
+      "Enrich people and companies and search the B2B database.",
+    connectorHunterDescription: "Find and verify professional email addresses.",
+    connectorPagerDutyDescription:
+      "See on-call schedules and review active incidents.",
     alreadyRunning: "Already running",
     maxIterations: "Maximum iterations reached",
     runError: "Run failed",
@@ -1961,6 +2026,47 @@ export const messages: Record<Locale, Record<string, string>> = {
     workingFor: "已运行 {seconds} 秒",
     workingForMinutes: "已运行 {minutes} 分 {seconds} 秒",
     switchedToModel: "已切换到模型 {model}",
+    connectorTelegramDescription: "通过 Telegram 机器人进行双向消息传递。",
+    connectorSlackDescription:
+      "通过 Slack 应用或托管工作区连接进行双向消息传递。",
+    connectorEmailImapDescription: "从 IMAP 账户读取、搜索和发送邮件。",
+    connectorGmailDescription: "搜索、总结、起草和发送邮件。",
+    connectorGoogleCalendarDescription: "读取可用时间、总结日程并创建事件。",
+    connectorBrowserDescription: "在获得批准后浏览、读取和操作网站。",
+    connectorGitHubDescription: "处理 Issue、Pull Request、文件和 CI 状态。",
+    connectorOutlookDescription: "管理 Microsoft 365 邮件和日历。",
+    connectorJiraDescription: "搜索、总结、创建和更新 Issue。",
+    connectorMondayDescription: "读取看板和条目、跟踪工作并发布更新。",
+    connectorConfluenceDescription: "搜索空间、阅读页面并起草文档。",
+    connectorZendeskDescription: "搜索工单、总结客户背景并起草回复。",
+    connectorLinearDescription: "搜索、读取和创建 Linear Issue。",
+    connectorGitLabDescription: "处理 Issue 和合并请求。",
+    connectorDiscordDescription: "读取频道并通过 Discord 机器人发送消息。",
+    connectorStripeDescription: "读取客户、收费记录和发票。",
+    connectorAsanaDescription: "搜索、读取、创建、更新任务并发表评论。",
+    connectorHubSpotDescription: "搜索 CRM 记录并更新备注和任务。",
+    connectorDropboxDescription: "搜索、浏览和读取 Dropbox 文件。",
+    connectorBoxDescription: "搜索、浏览和读取 Box 文件。",
+    connectorWhatsAppDescription: "通过官方 Cloud API 发送 WhatsApp 消息。",
+    connectorQuickBooksDescription: "读取客户、发票和财务报告。",
+    connectorDatadogDescription: "获取触发的告警、监控和事件时间线。",
+    connectorSalesforceDescription: "读取和更新案例、账户及商机。",
+    connectorDocusignDescription: "跟踪协议并发送文件供签署。",
+    connectorClickUpDescription: "搜索任务和文档，创建和更新条目。",
+    connectorGoogleDriveDescription: "搜索、浏览和读取 Google Drive 文件。",
+    connectorCanvaDescription: "浏览、创建和导出设计。",
+    connectorFigmaDescription: "读取设计文件和评论，并导出资源。",
+    connectorDescriptDescription: "通过文字稿读取和编辑音频、视频项目。",
+    connectorClayDescription: "为研究工作流丰富人员和公司信息。",
+    connectorCloseDescription: "读取和更新潜在客户、联系人及商机。",
+    connectorNotionDescription: "搜索页面、读取内容、查询数据库并创建页面。",
+    connectorAttioDescription: "读取 CRM 对象、记录和备注。",
+    connectorPostHogDescription: "查询产品分析、事件、漏斗和洞察。",
+    connectorMixpanelDescription: "查询事件和细分数据。",
+    connectorAmplitudeDescription: "查询产品分析和图表数据。",
+    connectorApolloDescription: "丰富人员和公司信息并搜索 B2B 数据库。",
+    connectorHunterDescription: "查找并验证工作邮箱地址。",
+    connectorPagerDutyDescription: "查看值班日程并检查活跃事件。",
     alreadyRunning: "正在运行",
     maxIterations: "达到最大轮次",
     runError: "运行出错",

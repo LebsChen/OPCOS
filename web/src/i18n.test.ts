@@ -144,6 +144,10 @@ describe("i18n source coverage", () => {
       "utf8",
     );
     const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
+    const connectorBlock =
+      appSource.match(
+        /const OPENWORKER_CONNECTORS:[\s\S]*?\n\];\n\nfunction relativeTime/,
+      )?.[0] ?? "";
     const toolVerbBlock =
       approvalSource.match(
         /const TOOL_VERBS[\s\S]*?=\s*\{([\s\S]*?)\};/,
@@ -154,6 +158,7 @@ describe("i18n source coverage", () => {
         /\["(?:agents|experts|teams|command|knowledge|playbook|mcp|acp-agent|connectors|blueprint|blueprints|snapshots|advanced|outposts)",\s*"([^"]+)"\]/g,
       ),
       ...toolVerbBlock.matchAll(/:\s*"([^"]+)"/g),
+      ...connectorBlock.matchAll(/description:\s*"([^"]+)"/g),
     ].map((match) => match[1]);
     staticLabels.push("light", "dark", "auto");
     expect(staticLabels.filter((key) => !keys.has(key))).toEqual([]);

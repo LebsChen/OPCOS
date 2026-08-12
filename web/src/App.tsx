@@ -491,162 +491,159 @@ type PendingApproval = {
 };
 
 const OPENWORKER_CONNECTORS: ConnectorCatalogEntry[] = [
-  { name: "Telegram", description: "Two-way messaging with a Telegram bot." },
+  { name: "Telegram", description: "connectorTelegramDescription" },
   {
     name: "Slack",
-    description:
-      "Two-way messaging through a Slack app or managed workspace connection.",
+    description: "connectorSlackDescription",
   },
   {
     name: "Email (IMAP)",
-    description: "Read, search, and send mail from an IMAP account.",
+    description: "connectorEmailImapDescription",
   },
-  { name: "Gmail", description: "Search, summarize, draft, and send email." },
+  { name: "Gmail", description: "connectorGmailDescription" },
   {
     name: "Google Calendar",
-    description: "Read availability, summarize schedules, and create events.",
+    description: "connectorGoogleCalendarDescription",
   },
   {
     name: "Browser",
-    description: "Navigate, read, and act on websites with approval.",
+    description: "connectorBrowserDescription",
   },
   {
     name: "GitHub",
-    description: "Work with issues, pull requests, files, and CI status.",
+    description: "connectorGitHubDescription",
   },
   {
     name: "Outlook",
-    description: "Manage Microsoft 365 mail and calendar.",
+    description: "connectorOutlookDescription",
   },
   {
     name: "Jira",
-    description: "Search, summarize, create, and update issues.",
+    description: "connectorJiraDescription",
   },
   {
     name: "monday.com",
-    description: "Read boards and items, track work, and post updates.",
+    description: "connectorMondayDescription",
   },
   {
     name: "Confluence",
-    description: "Search spaces, read pages, and draft documentation.",
+    description: "connectorConfluenceDescription",
   },
   {
     name: "Zendesk",
-    description:
-      "Search tickets, summarize customer context, and draft replies.",
+    description: "connectorZendeskDescription",
   },
   {
     name: "Linear",
-    description: "Search, read, and create Linear issues.",
+    description: "connectorLinearDescription",
   },
   {
     name: "GitLab",
-    description: "Work with issues and merge requests.",
+    description: "connectorGitLabDescription",
   },
   {
     name: "Discord",
-    description: "Read channels and send messages through a Discord bot.",
+    description: "connectorDiscordDescription",
   },
   {
     name: "Stripe",
-    description: "Read customers, charges, and invoices.",
+    description: "connectorStripeDescription",
   },
   {
     name: "Asana",
-    description: "Search, read, create, update, and comment on tasks.",
+    description: "connectorAsanaDescription",
   },
   {
     name: "HubSpot",
-    description: "Search CRM records and update notes and tasks.",
+    description: "connectorHubSpotDescription",
   },
   {
     name: "Dropbox",
-    description: "Search, browse, and read files in Dropbox.",
+    description: "connectorDropboxDescription",
   },
   {
     name: "Box",
-    description: "Search, browse, and read files in Box.",
+    description: "connectorBoxDescription",
   },
   {
     name: "WhatsApp",
-    description: "Send WhatsApp messages through the official Cloud API.",
+    description: "connectorWhatsAppDescription",
   },
   {
     name: "QuickBooks",
-    description: "Read customers, invoices, and financial reports.",
+    description: "connectorQuickBooksDescription",
   },
   {
     name: "Datadog",
-    description: "Pull firing alerts, monitors, and incident timelines.",
+    description: "connectorDatadogDescription",
   },
   {
     name: "Salesforce",
-    description: "Read and update cases, accounts, and opportunities.",
+    description: "connectorSalesforceDescription",
   },
   {
     name: "Docusign",
-    description: "Track agreements and send documents for signature.",
+    description: "connectorDocusignDescription",
   },
   {
     name: "ClickUp",
-    description: "Search tasks and docs; create and update items.",
+    description: "connectorClickUpDescription",
   },
   {
     name: "Google Drive",
-    description: "Search, browse, and read files in Google Drive.",
+    description: "connectorGoogleDriveDescription",
   },
   {
     name: "Canva",
-    description: "Browse, create, and export designs.",
+    description: "connectorCanvaDescription",
   },
   {
     name: "Figma",
-    description: "Read design files and comments; export assets.",
+    description: "connectorFigmaDescription",
   },
   {
     name: "Descript",
-    description: "Read and edit audio and video projects through transcripts.",
+    description: "connectorDescriptDescription",
   },
   {
     name: "Clay",
-    description: "Enrich people and companies for research workflows.",
+    description: "connectorClayDescription",
   },
   {
     name: "Close",
-    description: "Read and update leads, contacts, and opportunities.",
+    description: "connectorCloseDescription",
   },
   {
     name: "Notion",
-    description:
-      "Search pages, read content, query databases, and create pages.",
+    description: "connectorNotionDescription",
   },
   {
     name: "Attio",
-    description: "Read CRM objects, records, and notes.",
+    description: "connectorAttioDescription",
   },
   {
     name: "PostHog",
-    description: "Query product analytics, events, funnels, and insights.",
+    description: "connectorPostHogDescription",
   },
   {
     name: "Mixpanel",
-    description: "Query events and segmentation data.",
+    description: "connectorMixpanelDescription",
   },
   {
     name: "Amplitude",
-    description: "Query product analytics and chart data.",
+    description: "connectorAmplitudeDescription",
   },
   {
     name: "Apollo.io",
-    description: "Enrich people and companies and search the B2B database.",
+    description: "connectorApolloDescription",
   },
   {
     name: "Hunter",
-    description: "Find and verify professional email addresses.",
+    description: "connectorHunterDescription",
   },
   {
     name: "PagerDuty",
-    description: "See on-call schedules and review active incidents.",
+    description: "connectorPagerDutyDescription",
   },
 ];
 
@@ -7036,7 +7033,7 @@ function ManageSections({
                                 ? "info"
                                 : "neutral",
                         }}
-                        description={connector.description}
+                        description={translate(connector.description)}
                         disabled={!configurable}
                         onClick={
                           configurable
