@@ -262,7 +262,8 @@ export const messages: Record<Locale, Record<string, string>> = {
     remoteReview: "Remote review",
     refresh: "Refresh",
     changedFiles: "Changed files",
-    loadRemoteChanges: "Load the remote status and changes from the bound host.",
+    loadRemoteChanges:
+      "Load the remote status and changes from the bound host.",
     gitWorkflowPullRequests: "Git workflow and pull requests",
     runOperation: "Run {operation}",
     gitWorkflow: "Git workflow",
@@ -319,18 +320,19 @@ export const messages: Record<Locale, Record<string, string>> = {
       "When disabled, remote desktop and browser control cannot be opened.",
     newSessionDefaults: "Used for new sessions without an explicit override.",
     batchLimit: "Batch limit",
-    batchLimitDescription:
-      "Maximum sessions created per minute (1–500).",
+    batchLimitDescription: "Maximum sessions created per minute (1–500).",
     messageUsageLimit: "Message usage limit",
     messageUsageLimitDescription:
       "Tokens a single message may consume; 0 means unlimited.",
     pullRequestWorkflow: "Applied to later Pull request workflows.",
     reviewer: "Reviewer",
-    reviewerDescription: "GitHub username used when adding a reviewer automatically.",
+    reviewerDescription:
+      "GitHub username used when adding a reviewer automatically.",
     openPrsAs: "Open PRs as",
     openPrsAsDescription: "Initial state when creating a Pull request.",
     respondingToBots: "Responding to bots",
-    respondingToBotsDescription: "Whether to respond to messages triggered by bots.",
+    respondingToBotsDescription:
+      "Whether to respond to messages triggered by bots.",
     manageCommands: "Manage commands",
     addCommand: "Add Command",
     systemOverride: "System override",
@@ -517,7 +519,8 @@ export const messages: Record<Locale, Record<string, string>> = {
     repositoryIndexDescription:
       "Build a host-backed path and symbol index before asking the agent to change code.",
     secretsSection: "Secrets",
-    secretsDescription: "Inspect secret metadata without exposing secret values.",
+    secretsDescription:
+      "Inspect secret metadata without exposing secret values.",
     blueprintSection: "Blueprint",
     blueprintDescription: "Read and manage the selected host blueprint.",
     agentDefaults: "Agent defaults",
@@ -583,9 +586,12 @@ export const messages: Record<Locale, Record<string, string>> = {
     currentContextResources: "Current context resources ({count})",
     activity: "Activity",
     reviewSecurityEvents: "Review durable security and configuration events.",
-    reviewExternalActions: "Review cross-session records of OPCOS external actions.",
-    reviewWorkQueue: "Review durable work items, retries, and dead-letter records.",
-    reviewEventRules: "Review durable events, causal chains, and bounded effect rules.",
+    reviewExternalActions:
+      "Review cross-session records of OPCOS external actions.",
+    reviewWorkQueue:
+      "Review durable work items, retries, and dead-letter records.",
+    reviewEventRules:
+      "Review durable events, causal chains, and bounded effect rules.",
     reviewRoles: "Review board roles and their current state.",
     reviewInsights: "Review cross-session activity insights.",
     filterAudit: "Filter audit events",
@@ -657,7 +663,8 @@ export const messages: Record<Locale, Record<string, string>> = {
     bindAccountHost: "Bind account to host",
     restore: "Restore",
     coordinationTaskId: "Coordination task ID",
-    coordinationDescription: "The durable coordination board to observe or update.",
+    coordinationDescription:
+      "The durable coordination board to observe or update.",
     resetSystem: "Reset system",
     openSession: "Open session",
     minorActions: "minor actions",
@@ -680,7 +687,8 @@ export const messages: Record<Locale, Record<string, string>> = {
     startSessionAs: "Start a session as",
     managePersonas: "Manage personas…",
     externalEventSources: "External event sources",
-    ingressDisabledNotice: "Sources are disabled when created. Polling never exposes a public listener.",
+    ingressDisabledNotice:
+      "Sources are disabled when created. Polling never exposes a public listener.",
     feedUrl: "Feed URL",
     addSource: "Add source",
     noIngressSources: "No external event sources configured.",
@@ -1012,8 +1020,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     gitWorkflow: "Git 工作流",
     createGithubPr: "创建 GitHub PR",
     createPr: "创建 PR",
-    githubSecretNotice:
-      "已配置的 GitHub Secret 仅由 Rust 读取，界面不会显示。",
+    githubSecretNotice: "已配置的 GitHub Secret 仅由 Rust 读取，界面不会显示。",
     processPrComments: "处理 GitHub PR 评论",
     fetchAndProcessComments: "拉取并处理评论",
     botCommentNotice:

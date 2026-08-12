@@ -91,8 +91,7 @@ export function scopeNote(
     };
     return {
       text: translate("leavesRemoteHost", {
-        destination:
-          names[platform] || platform || translate("connectedChat"),
+        destination: names[platform] || platform || translate("connectedChat"),
       }),
       external: true,
     };

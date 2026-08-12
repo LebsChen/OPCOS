@@ -814,9 +814,7 @@ export function Composer(props: Props) {
                 data-testid="models-loading"
                 title={translate("fetchingModelList")}
               >
-                <span className="pill-label">
-                  {translate("loadingModels")}
-                </span>
+                <span className="pill-label">{translate("loadingModels")}</span>
               </button>
             ))}
 
@@ -1338,8 +1336,8 @@ function UsageChip({
                   />
                 </div>
                 <div className="mt-1 text-[11.5px] text-muted tabular-nums">
-                  {formatTokens(usage.context)} / {formatTokens(contextWindow)} ·{" "}
-                  {pct}%
+                  {formatTokens(usage.context)} / {formatTokens(contextWindow)}{" "}
+                  · {pct}%
                 </div>
               </div>
             ) : usage.context > 0 ? (

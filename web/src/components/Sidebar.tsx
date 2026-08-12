@@ -928,7 +928,7 @@ export function Sidebar(props: SidebarProps) {
               <div className="px-2 py-1.5 text-[12px] text-faint leading-snug">
                 {normalizedQuery
                   ? "No matching conversations."
-                      : translate("noConversations")}
+                  : translate("noConversations")}
               </div>
             ) : (
               <>
@@ -1516,7 +1516,7 @@ function NewSessionSplit({
                     onManage();
                   }}
                 >
-              {translate("managePersonas")}
+                  {translate("managePersonas")}
                 </button>
               </div>
             )}

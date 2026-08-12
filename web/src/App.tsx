@@ -1054,9 +1054,7 @@ function ProjectDialog({
             className="btn approval-primary"
             disabled={saving}
           >
-            {saving
-              ? translate("creating")
-              : translate("createProject")}
+            {saving ? translate("creating") : translate("createProject")}
           </button>
         </div>
       </form>
@@ -1378,9 +1376,7 @@ function ProjectConfigPanel({
     }
     if (
       !enabled &&
-      !window.confirm(
-        `${translate("excludeGlobalPreset")}：${template.name}。`,
-      )
+      !window.confirm(`${translate("excludeGlobalPreset")}：${template.name}。`)
     ) {
       return;
     }
@@ -1488,7 +1484,9 @@ function ProjectConfigPanel({
                       {template.modified
                         ? ` · ${translate("locallyModified")}`
                         : ""}
-                      {template.overridden ? ` · ${translate("editBelow")}` : ""}
+                      {template.overridden
+                        ? ` · ${translate("editBelow")}`
+                        : ""}
                     </small>
                   </div>
                   <div className="flex shrink-0 gap-2">
@@ -1618,9 +1616,7 @@ function ProjectConfigPanel({
             </label>
             <div>
               <button className="btn approval-primary" onClick={save}>
-                {editingId
-                  ? translate("saveChanges")
-                  : translate("addConfig")}
+                {editingId ? translate("saveChanges") : translate("addConfig")}
               </button>
               {editingId && (
                 <button className="btn ml-2" onClick={reset}>
@@ -1735,7 +1731,9 @@ function ProjectConfigPanel({
         </p>
         <div className="grid gap-3 md:grid-cols-2">
           <div className="grid gap-2 rounded-lg border border-line p-3">
-            <strong className="text-sm text-ink">{translate("providerKey")}</strong>
+            <strong className="text-sm text-ink">
+              {translate("providerKey")}
+            </strong>
             <input
               value={providerName}
               onChange={(event) => setProviderName(event.target.value)}
@@ -1764,7 +1762,9 @@ function ProjectConfigPanel({
             </button>
           </div>
           <div className="grid gap-2 rounded-lg border border-line p-3">
-            <strong className="text-sm text-ink">{translate("mcpCredential")}</strong>
+            <strong className="text-sm text-ink">
+              {translate("mcpCredential")}
+            </strong>
             <input
               value={mcpServerId}
               onChange={(event) => setMcpServerId(event.target.value)}
@@ -1793,7 +1793,9 @@ function ProjectConfigPanel({
             </button>
           </div>
           <div className="grid gap-2 rounded-lg border border-line p-3">
-            <strong className="text-sm text-ink">{translate("connectorToken")}</strong>
+            <strong className="text-sm text-ink">
+              {translate("connectorToken")}
+            </strong>
             <input
               value={connectorKind}
               onChange={(event) => setConnectorKind(event.target.value)}
@@ -2169,7 +2171,8 @@ function ProjectBoard({
                   className="mt-2 text-xs text-faint truncate"
                   title={agent.branch}
                 >
-                  {translate("branchLabelText")}{agent.branch}
+                  {translate("branchLabelText")}
+                  {agent.branch}
                 </p>
                 <p
                   className="mt-1 text-xs text-faint truncate"
@@ -3070,9 +3073,7 @@ function ReviewView({
   if (!selected.workspace) {
     return (
       <div className="surface-panel">
-        <div className="warning">
-          {translate("noWorkspaceReview")}
-        </div>
+        <div className="warning">{translate("noWorkspaceReview")}</div>
       </div>
     );
   }
@@ -3167,9 +3168,7 @@ function ReviewView({
         </div>
       ) : (
         <div className="empty-surface">
-          <p>
-            {translate("loadRemoteChanges")}
-          </p>
+          <p>{translate("loadRemoteChanges")}</p>
         </div>
       )}
     </div>
@@ -3277,9 +3276,7 @@ function GitActions({
         >
           {translate("createPr")}
         </Button>
-        <p className="muted small">
-          {translate("githubSecretNotice")}
-        </p>
+        <p className="muted small">{translate("githubSecretNotice")}</p>
       </details>
       <CiMonitorPanel selected={selected} onError={onError} />
       <RunnerPanel selected={selected} onError={onError} />
@@ -3303,9 +3300,7 @@ function GitActions({
         >
           {translate("fetchAndProcessComments")}
         </Button>
-        <p className="muted small">
-          {translate("botCommentNotice")}
-        </p>
+        <p className="muted small">{translate("botCommentNotice")}</p>
       </details>
     </div>
   );
@@ -3411,9 +3406,7 @@ function CiMonitorPanel({
         </Button>
       ) : null}
       <Button onClick={refresh}>{translate("refreshStatus")}</Button>
-      <p className="muted small">
-        {translate("ciAuthorizationNotice")}
-      </p>
+      <p className="muted small">{translate("ciAuthorizationNotice")}</p>
       {repairItems.length > 0 ? (
         <div className="stack">
           {repairItems.map((item) => {
@@ -3447,8 +3440,12 @@ function CiMonitorPanel({
             return (
               <article key={record.queue_id ?? JSON.stringify(item)}>
                 <strong>{record.queue_id ?? "ci_repair_loop"}</strong>
-                <div>{translate("status")}: {record.status ?? "unknown"}</div>
-                <div>{translate("phase")}: {state.phase ?? "queued"}</div>
+                <div>
+                  {translate("status")}: {record.status ?? "unknown"}
+                </div>
+                <div>
+                  {translate("phase")}: {state.phase ?? "queued"}
+                </div>
                 <div>
                   {translate("attempts")}: {state.repair_attempts ?? 0} /{" "}
                   {state.max_repair_attempts ?? 3}
@@ -3457,12 +3454,19 @@ function CiMonitorPanel({
                   {translate("polls")}: {state.poll_count ?? 0} /{" "}
                   {state.max_polls ?? 20}
                 </div>
-                <div>{translate("deadline")}: {state.deadline ?? "not set"}</div>
-                <div>{translate("currentSha")}: {state.head_sha ?? "not set"}</div>
                 <div>
-                  {translate("expectedSha")}: {state.expected_head_sha ?? "not set"}
+                  {translate("deadline")}: {state.deadline ?? "not set"}
                 </div>
-                <div>{translate("stopReason")}: {state.stop_reason ?? "none"}</div>
+                <div>
+                  {translate("currentSha")}: {state.head_sha ?? "not set"}
+                </div>
+                <div>
+                  {translate("expectedSha")}:{" "}
+                  {state.expected_head_sha ?? "not set"}
+                </div>
+                <div>
+                  {translate("stopReason")}: {state.stop_reason ?? "none"}
+                </div>
                 <div>
                   {translate("signatures")}:{" "}
                   {signatures.length > 0 ? signatures.join(" → ") : "none"}
@@ -3538,9 +3542,7 @@ function RunnerPanel({
   return (
     <details>
       <summary>{translate("autonomousRunnerProfile")}</summary>
-      <p className="muted small">
-        {translate("runnerDescription")}
-      </p>
+      <p className="muted small">{translate("runnerDescription")}</p>
       <input
         value={hostId}
         onChange={(event) => setHostId(event.target.value)}
@@ -4036,24 +4038,21 @@ function ManageSections({
       .catch(onError);
   }, [tab, selected, onError]);
   const sectionCopy: Record<SettingsSection, [string, string]> = {
-    provider: [
-      "Provider",
-      translate("chooseProvider"),
-    ],
+    provider: ["Provider", translate("chooseProvider")],
     hosts: [translate("hosts"), translate("hostsDescription")],
     agents: [translate("rulesSection"), translate("rulesDescription")],
     instructions: [
       translate("instructionsSection"),
       translate("instructionsDescription"),
     ],
-    knowledge: [translate("knowledgeSection"), translate("knowledgeDescription")],
+    knowledge: [
+      translate("knowledgeSection"),
+      translate("knowledgeDescription"),
+    ],
     playbook: [translate("playbookSection"), translate("playbookDescription")],
     skill: [translate("skillSection"), translate("skillDescription")],
     mcp: ["MCP", translate("mcpDescription")],
-    connectors: [
-      "Connectors",
-      translate("connectorsDescription"),
-    ],
+    connectors: ["Connectors", translate("connectorsDescription")],
     ingress: [
       translate("externalEvents"),
       translate("externalEventsDescription"),
@@ -4062,16 +4061,13 @@ function ManageSections({
       translate("repositoryIndex"),
       translate("repositoryIndexDescription"),
     ],
-    secrets: [
-      translate("secretsSection"),
-      translate("secretsDescription"),
+    secrets: [translate("secretsSection"), translate("secretsDescription")],
+    blueprint: [
+      translate("blueprintSection"),
+      translate("blueprintDescription"),
     ],
-    blueprint: [translate("blueprintSection"), translate("blueprintDescription")],
     appearance: [translate("general"), translate("appearanceDescription")],
-    agent: [
-      translate("agentDefaults"),
-      translate("agentDefaultsDescription"),
-    ],
+    agent: [translate("agentDefaults"), translate("agentDefaultsDescription")],
     environment: [
       translate("environmentSection"),
       translate("environmentDescription"),
@@ -4280,7 +4276,7 @@ function ManageSections({
             {environmentTab === "blueprints" && (
               <section className="rounded-lg border border-line p-4 space-y-3">
                 <div>
-                <strong>{translate("blueprints")}</strong>
+                  <strong>{translate("blueprints")}</strong>
                   <small className="block">
                     当前生效来源：
                     {blueprintStatus?.source === "project"
@@ -4466,7 +4462,9 @@ function ManageSections({
                         projectId: settingsProjectId,
                         repositories: environmentRepositories,
                       })
-                        .then(() => setEnvironmentStatus(translate("savedOrder")))
+                        .then(() =>
+                          setEnvironmentStatus(translate("savedOrder")),
+                        )
                         .catch(onError)
                     }
                   >
@@ -4720,7 +4718,7 @@ function ManageSections({
                       .catch(onError)
                   }
                 >
-                        {translate("resetSystem")}
+                  {translate("resetSystem")}
                 </Button>
               </div>
               <div className="space-y-2">
@@ -4827,7 +4825,9 @@ function ManageSections({
                     }
                   >
                     <option value="custom">{translate("custom")}</option>
-                    <option value="system">{translate("systemOverride")}</option>
+                    <option value="system">
+                      {translate("systemOverride")}
+                    </option>
                   </select>
                   <textarea
                     placeholder={translate("commandPromptTemplate")}
@@ -5045,7 +5045,7 @@ function ManageSections({
                     )}
                     {descriptor.needs_key && (
                       <label>
-                              {translate("providerKey")}
+                        {translate("providerKey")}
                         <input
                           type="password"
                           value={providerKeys[descriptor.name] || ""}
@@ -5062,7 +5062,7 @@ function ManageSections({
                       </label>
                     )}
                     <label>
-                              {translate("model")}
+                      {translate("model")}
                       <SelectMenu
                         value={
                           providerModels[descriptor.name] ||
@@ -5184,7 +5184,7 @@ function ManageSections({
                           )
                       }
                     >
-                            {translate("testSave")}
+                      {translate("testSave")}
                     </Button>
                     {config?.configured && (
                       <Button
@@ -5204,7 +5204,7 @@ function ManageSections({
                             .catch(onError)
                         }
                       >
-                            {translate("clearKey")}
+                        {translate("clearKey")}
                       </Button>
                     )}
                   </div>
@@ -5228,9 +5228,7 @@ function ManageSections({
             <div className="settings-row">
               <div>
                 <strong>{translate("provider")}</strong>
-                <small>
-                  {translate("providerDescription")}
-                </small>
+                <small>{translate("providerDescription")}</small>
               </div>
               <SelectMenu
                 value={provider}
@@ -5246,9 +5244,7 @@ function ManageSections({
             <div className="settings-row">
               <div>
                 <strong>{translate("baseUrl")}</strong>
-                <small>
-                  {translate("optionalProviderEndpoint")}
-                </small>
+                <small>{translate("optionalProviderEndpoint")}</small>
               </div>
               <input
                 type="url"
@@ -5259,9 +5255,7 @@ function ManageSections({
             <div className="settings-row">
               <div>
                 <strong>{translate("providerKey")}</strong>
-                <small>
-                  {translate("secureProviderKeyNotice")}
-                </small>
+                <small>{translate("secureProviderKeyNotice")}</small>
               </div>
               <input
                 type="password"
@@ -5303,7 +5297,7 @@ function ManageSections({
                     })
                 }
               >
-                        {translate("saveAndValidate")}
+                {translate("saveAndValidate")}
               </Button>
             </div>
             {providerStatus && (
@@ -5363,7 +5357,9 @@ function ManageSections({
                     <option value="openai-compatible">
                       {translate("openaiCompatible")}
                     </option>
-                    <option value="cloudflare">{translate("cloudflare")}</option>
+                    <option value="cloudflare">
+                      {translate("cloudflare")}
+                    </option>
                   </select>
                 </label>
                 <label>
@@ -5490,7 +5486,7 @@ function ManageSections({
                   setHostFormOpen(true);
                 }}
               >
-                    {translate("addHost")}
+                {translate("addHost")}
               </Button>
             }
             bare
@@ -5523,7 +5519,7 @@ function ManageSections({
                                   .catch(onError);
                               }}
                             >
-                        {translate("edit")}
+                              {translate("edit")}
                             </Button>
                           )}
                           <Button
@@ -5598,7 +5594,7 @@ function ManageSections({
                   <input
                     value={vncPassword}
                     onChange={(event) => setVncPassword(event.target.value)}
-                      placeholder={translate("optionalVncPassword")}
+                    placeholder={translate("optionalVncPassword")}
                     type="password"
                   />
                   <Button type="submit" className="primary">
@@ -5615,7 +5611,7 @@ function ManageSections({
                       setHostFormOpen(false);
                     }}
                   >
-                      {translate("cancel")}
+                    {translate("cancel")}
                   </Button>
                 </form>
               ) : undefined
@@ -5632,7 +5628,8 @@ function ManageSections({
                 command("save_asset", {
                   id: instructions?.id || "global-instructions",
                   kind: "instructions",
-                      title: instructions?.title || translate("instructionsSection"),
+                  title:
+                    instructions?.title || translate("instructionsSection"),
                   body: instructionsDraft,
                   trigger: null,
                   scope: null,
@@ -5759,7 +5756,9 @@ function ManageSections({
                     void command("import_repository_templates", {
                       projectId: libraryProjectId,
                     })
-                      .then(() => setTemplateDraftStatus(translate("importedExpert")))
+                      .then(() =>
+                        setTemplateDraftStatus(translate("importedExpert")),
+                      )
                       .then(() =>
                         command<LibraryEntry[]>("list_configured_library").then(
                           setLibraryEntries,
@@ -5779,7 +5778,9 @@ function ManageSections({
                   value={libraryProjectId}
                   onChange={(event) => setLibraryProjectId(event.target.value)}
                 >
-                  <option value="">{translate("importExportTeamProject")}</option>
+                  <option value="">
+                    {translate("importExportTeamProject")}
+                  </option>
                   {projects.map((project) => (
                     <option key={project.id} value={project.id}>
                       {project.name}
@@ -5895,7 +5896,7 @@ function ManageSections({
                           content: templateDraftContent,
                         })
                           .then(() => {
-                              setTemplateDraftStatus(translate("saved"));
+                            setTemplateDraftStatus(translate("saved"));
                             setTemplateDraftName("");
                             setTemplateDraftId(null);
                             setTemplateEditorOpen(false);
@@ -5978,7 +5979,9 @@ function ManageSections({
                               projectId: libraryProjectId,
                             })
                               .then(() =>
-                                setTemplateDraftStatus(translate("exportedRepository")),
+                                setTemplateDraftStatus(
+                                  translate("exportedRepository"),
+                                ),
                               )
                               .catch((reason) => {
                                 const message = errorMessage(reason);
@@ -5996,7 +5999,9 @@ function ManageSections({
                                       overwrite: true,
                                     },
                                   ).then(() =>
-                                    setTemplateDraftStatus(translate("overwrittenRepository")),
+                                    setTemplateDraftStatus(
+                                      translate("overwrittenRepository"),
+                                    ),
                                   );
                                 }
                                 onError(reason);
@@ -6484,7 +6489,7 @@ function ManageSections({
                                     .catch(onError);
                                 }}
                               >
-                    {translate("history")}
+                                {translate("history")}
                               </Button>
                               <Button
                                 className="bordered"
@@ -6555,7 +6560,7 @@ function ManageSections({
                       setCompareVersionId(null);
                     }}
                   >
-                      {translate("close")}
+                    {translate("close")}
                   </Button>
                 </div>
                 {assetVersions.map((version) => {
@@ -6623,9 +6628,9 @@ function ManageSections({
               <div className="rounded-xl2 border border-line bg-panel p-5">
                 <h2 className="text-[15px] font-semibold text-ink">
                   {assetTabKind === "agents"
-                      ? editingAssetId
-                        ? translate("editRule")
-                        : translate("newRule")
+                    ? editingAssetId
+                      ? translate("editRule")
+                      : translate("newRule")
                     : assetTabKind === "instructions"
                       ? editingAssetId
                         ? translate("editGlobalInstructions")
@@ -6677,13 +6682,13 @@ function ManageSections({
                         )
                       }
                     >
-                    <option value="global">{translate("global")}</option>
-                    <option value="repo">{translate("repository")}</option>
+                      <option value="global">{translate("global")}</option>
+                      <option value="repo">{translate("repository")}</option>
                     </select>
                     <input
                       value={assetScope}
                       onChange={(event) => setAssetScope(event.target.value)}
-                    placeholder={translate("workspacePathAbsolute")}
+                      placeholder={translate("workspacePathAbsolute")}
                       disabled={
                         assetScopeKind === "global" ||
                         assetTabKind === "instructions"
@@ -6745,9 +6750,7 @@ function ManageSections({
               <h2 className="text-[15px] font-semibold text-ink">
                 {translate("externalEventSources")}
               </h2>
-              <p className="muted mt-1">
-                {translate("ingressDisabledNotice")}
-              </p>
+              <p className="muted mt-1">{translate("ingressDisabledNotice")}</p>
               <p className="muted mt-1">
                 GitHub repository events are best-effort polling: GitHub
                 documents up to 300 events from the last 30 days and may delay
@@ -6877,8 +6880,7 @@ function ManageSections({
                           : translate("disabled")}{" "}
                         · {translate("lastSuccess")}{" "}
                         {source.last_success_at || translate("never")} ·{" "}
-                        {translate("failures")}{" "}
-                        {source.consecutive_failures}
+                        {translate("failures")} {source.consecutive_failures}
                       </small>
                       {circuitOpen && (
                         <div className="failure">
@@ -6942,9 +6944,7 @@ function ManageSections({
                         className="bordered"
                         onClick={() => {
                           if (
-                            !window.confirm(
-                              translate("deleteIngressConfirm"),
-                            )
+                            !window.confirm(translate("deleteIngressConfirm"))
                           )
                             return;
                           void command("delete_external_ingress_source", {
@@ -7081,7 +7081,7 @@ function ManageSections({
                       </div>
                       {connectorStatuses[openConnector]?.connected && (
                         <span className="status-success ml-auto">
-                  {translate("connected")}
+                          {translate("connected")}
                         </span>
                       )}
                     </div>
@@ -7243,7 +7243,7 @@ function ManageSections({
                         .catch(onError)
                     }
                   >
-                  {translate("saveKey")}
+                    {translate("saveKey")}
                   </Button>
                   <Button
                     className="bordered"
@@ -7264,7 +7264,7 @@ function ManageSections({
                         })
                     }
                   >
-                  {translate("testConnection")}
+                    {translate("testConnection")}
                   </Button>
                 </div>
               </div>
@@ -7272,7 +7272,7 @@ function ManageSections({
             </div>
             <div className="rounded-xl2 border border-line bg-panel p-5">
               <h3 className="text-[14px] font-semibold text-ink">
-                  {translate("issueTools")}
+                {translate("issueTools")}
               </h3>
               <div className="flex gap-2 mt-3">
                 <input
@@ -7290,7 +7290,7 @@ function ManageSections({
                       .catch(onError)
                   }
                 >
-                    {translate("readIssue")}
+                  {translate("readIssue")}
                 </Button>
                 <Button
                   className="bordered"
@@ -7303,7 +7303,7 @@ function ManageSections({
                       .catch(onError)
                   }
                 >
-                    {translate("listMine")}
+                  {translate("listMine")}
                 </Button>
               </div>
               {linearIssue && (
@@ -7397,7 +7397,7 @@ function ManageSections({
                   <div className="manage-row px-4">
                     <div className="form-grid w-full">
                       <label className="field-label">
-                  {translate("name")}
+                        {translate("name")}
                         <input
                           value={secretName}
                           onChange={(event) =>
@@ -7406,7 +7406,7 @@ function ManageSections({
                         />
                       </label>
                       <label className="field-label">
-                  {translate("scope")}
+                        {translate("scope")}
                         <input
                           value={secretScope}
                           onChange={(event) =>
@@ -7415,7 +7415,7 @@ function ManageSections({
                         />
                       </label>
                       <label className="field-label">
-                  {translate("purpose")}
+                        {translate("purpose")}
                         <input
                           value={secretPurpose}
                           onChange={(event) =>
@@ -7424,7 +7424,7 @@ function ManageSections({
                         />
                       </label>
                       <label className="field-label">
-                  {translate("value")}
+                        {translate("value")}
                         <input
                           type="password"
                           value={secretValue}
@@ -7457,7 +7457,7 @@ function ManageSections({
                           !secretValue
                         }
                       >
-                  {translate("saveSecret")}
+                        {translate("saveSecret")}
                       </Button>
                     </div>
                   </div>
@@ -7510,7 +7510,7 @@ function ManageSections({
                   .catch(onError)
               }
             >
-                  {translate("readBlueprint")}
+              {translate("readBlueprint")}
             </Button>
             {blueprint && (
               <pre className="code-block">
@@ -7537,7 +7537,7 @@ function ManageSections({
                     .catch(onError)
                 }
               >
-                    {translate("runRemoteCommand")}
+                {translate("runRemoteCommand")}
               </Button>
               <Button
                 disabled={!selected}
@@ -7550,7 +7550,7 @@ function ManageSections({
                     .catch(onError)
                 }
               >
-                  {translate("runBlueprint")}
+                {translate("runBlueprint")}
               </Button>
             </div>
           </div>
@@ -7856,7 +7856,9 @@ function McpManage({
               )
             }
           >
-            <option value="streamable-http">{translate("streamableHttp")}</option>
+            <option value="streamable-http">
+              {translate("streamableHttp")}
+            </option>
             <option value="http-sse">{translate("httpSse")}</option>
             <option value="stdio">{translate("stdio")}</option>
           </select>
@@ -7903,7 +7905,7 @@ function McpManage({
               checked={serverEnabled}
               onChange={(event) => setServerEnabled(event.target.checked)}
             />
-                        {translate("enabled")}
+            {translate("enabled")}
           </label>
           <label className="flex items-center gap-2">
             <input
@@ -7970,10 +7972,10 @@ function McpManage({
                         {isUserMcpServer(server) && (
                           <>
                             <Button onClick={() => editServer(server)}>
-                            {translate("edit")}
+                              {translate("edit")}
                             </Button>
                             <Button onClick={() => removeServer(server)}>
-                            {translate("delete")}
+                              {translate("delete")}
                             </Button>
                           </>
                         )}
@@ -7988,11 +7990,11 @@ function McpManage({
                               }).catch(onError)
                             }
                           >
-                              {translate("authorize")}
+                            {translate("authorize")}
                           </Button>
                         )}
                         <Button onClick={() => loadServerCatalog(server)}>
-                        {translate("resourcesPrompts")}
+                          {translate("resourcesPrompts")}
                         </Button>
                         <Button
                           onClick={() =>
@@ -8008,7 +8010,7 @@ function McpManage({
                               .catch(onError)
                           }
                         >
-                            {translate("retry")}
+                          {translate("retry")}
                         </Button>
                       </div>
                     }
@@ -8073,7 +8075,7 @@ function McpManage({
                 <small>{mcpResourceSummary(resource)}</small>
                 <div className="inline-actions">
                   <Button onClick={() => previewResource(resource)}>
-                        {translate("preview")}
+                    {translate("preview")}
                   </Button>
                   <Button
                     disabled={!selected}
@@ -8095,7 +8097,7 @@ function McpManage({
                         .catch(onError)
                     }
                   >
-                        {translate("addCurrentContext")}
+                    {translate("addCurrentContext")}
                   </Button>
                 </div>
               </div>
@@ -8149,7 +8151,7 @@ function McpManage({
                       .catch(onError)
                   }
                 >
-                        {translate("loadComposer")}
+                  {translate("loadComposer")}
                 </Button>
               </div>
             ))}
@@ -8188,7 +8190,7 @@ function McpManage({
                       .catch(onError)
                   }
                 >
-                        {translate("remove")}
+                  {translate("remove")}
                 </Button>
               </div>
             ))}
@@ -8416,7 +8418,8 @@ function Automations({
                           <span>
                             <strong>{schedule.name}</strong>
                             <small>
-                                {schedule.last_result || translate("noRunRecorded")}
+                              {schedule.last_result ||
+                                translate("noRunRecorded")}
                             </small>
                           </span>
                         </div>
@@ -8796,7 +8799,7 @@ function Activity({
                                       .catch(onError)
                                   }
                                 >
-                {translate("approve")}
+                                  {translate("approve")}
                                 </button>
                               )}
                             </small>
@@ -8941,7 +8944,7 @@ function Activity({
                 </div>
                 <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
                   <h2 className="text-[15px] font-semibold">
-                {translate("accountHostBindings")}
+                    {translate("accountHostBindings")}
                   </h2>
                   <div className="grid grid-cols-2 gap-3">
                     <input
@@ -9158,7 +9161,7 @@ function Activity({
                                   }).catch(onError)
                                 }
                               >
-                    {translate("restore")}
+                                {translate("restore")}
                               </Button>
                             </div>
                           ))}
@@ -9304,7 +9307,7 @@ function Activity({
                   <div className="rounded-xl2 border border-line bg-panel p-5 space-y-4">
                     <div>
                       <label className="field-label">
-                      {translate("coordinationTaskId")}
+                        {translate("coordinationTaskId")}
                       </label>
                       <input
                         value={taskId}
@@ -9312,7 +9315,7 @@ function Activity({
                         placeholder={translate("taskIdExample")}
                       />
                       <p className="field-help">
-                      {translate("coordinationDescription")}
+                        {translate("coordinationDescription")}
                       </p>
                     </div>
                     <div>
@@ -9347,7 +9350,7 @@ function Activity({
                         }
                       }}
                     >
-                        {translate("startBoard")}
+                      {translate("startBoard")}
                     </Button>
                     <Button className="bordered" onClick={load}>
                       {translate("observe")}
@@ -9381,7 +9384,7 @@ function Activity({
                           .catch(onError)
                       }
                     >
-                            {translate("setRole")}
+                      {translate("setRole")}
                     </Button>
                   </div>
                 )}
@@ -9638,7 +9641,7 @@ function Activity({
                               .catch(onError)
                           }
                         >
-                              {translate("create")}
+                          {translate("create")}
                         </Button>
                       </div>
                     )}
@@ -9682,9 +9685,7 @@ function Activity({
                               className="bordered"
                               onClick={() => {
                                 if (!task.verified_pr_url && !task.pr) {
-                                  onError(
-                                    translate("verifiedPrRequired"),
-                                  );
+                                  onError(translate("verifiedPrRequired"));
                                   return;
                                 }
                                 void command("coordination_accept_task", {
@@ -9700,9 +9701,7 @@ function Activity({
                         </div>
                       ))
                     ) : (
-                      <p className="empty-state">
-                        {translate("noTasks")}
-                      </p>
+                      <p className="empty-state">{translate("noTasks")}</p>
                     )}
                   </section>
                   <section className="hidden">
@@ -10511,9 +10510,7 @@ function ChangesPane({ selected }: { selected: Session }) {
           </details>
         )}
         {!gitDiff && selected.workspace && (
-          <div className="rail-muted">
-            {translate("gitDiffUnavailable")}
-          </div>
+          <div className="rail-muted">{translate("gitDiffUnavailable")}</div>
         )}
       </div>
     </section>
@@ -10574,7 +10571,9 @@ function ProgressPane({ selected }: { selected: Session }) {
                 key={`${event.sequence}-${event.event_type}`}
               >
                 <div className="rail-event-head">
-                  <strong>{event.event_type || translate("workingEvent")}</strong>
+                  <strong>
+                    {event.event_type || translate("workingEvent")}
+                  </strong>
                   <span className="rail-muted">{event.category}</span>
                 </div>
                 <div className="rail-event-meta">
@@ -10761,7 +10760,7 @@ function AgentRosterPane({
                         className="btn approval-primary"
                         onClick={() => onOpenSession(session)}
                       >
-                      {translate("openSession")}
+                        {translate("openSession")}
                       </button>
                     ) : (
                       <button
@@ -11031,9 +11030,7 @@ function SessionRightPanel({
             <strong className="drawer-title">
               {tabs.find((item) => item.id === panelTab)?.label}
             </strong>
-            {running && (
-              <span className="live-pill">{translate("live")}</span>
-            )}
+            {running && <span className="live-pill">{translate("live")}</span>}
             <div className="drawer-actions">
               {isWorkspaceTab && (
                 <button
@@ -13137,9 +13134,7 @@ function AppContent() {
               </div>
             </>
           ) : (
-            <div className="session-loading">
-              {translate("loadingSession")}
-            </div>
+            <div className="session-loading">{translate("loadingSession")}</div>
           )
         ) : surface === "manage" ? (
           <SettingsView activeTab={settingsTab} onTabChange={setSettingsTab}>
@@ -13223,7 +13218,7 @@ function AppContent() {
                         <button
                           className="pill-x"
                           type="button"
-                    title={translate("removeAttachment")}
+                          title={translate("removeAttachment")}
                           onClick={() => setHomeAttachment(null)}
                         >
                           ×
@@ -13251,7 +13246,7 @@ function AppContent() {
                     />
                     <select
                       className="chip"
-                          title={translate("agentTemplate")}
+                      title={translate("agentTemplate")}
                       value={homeAgentTemplateId}
                       onChange={(event) => {
                         const id = event.target.value;
@@ -13303,7 +13298,7 @@ function AppContent() {
                       title={translate("role")}
                       value={homeRole}
                       onChange={(event) => setHomeRole(event.target.value)}
-                    placeholder={translate("role")}
+                      placeholder={translate("role")}
                     />
                     <select
                       className="chip"
