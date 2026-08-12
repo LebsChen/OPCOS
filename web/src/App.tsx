@@ -4102,7 +4102,7 @@ function ManageSections({
           : libraryKind;
   const assetLabel =
     assetTabKind === "agents"
-      ? "规则"
+      ? translate("rulesSection")
       : assetTabKind[0].toUpperCase() + assetTabKind.slice(1);
   useEffect(() => {
     if (tab !== "instructions") return;
@@ -4284,12 +4284,12 @@ function ManageSections({
                   <small className="block">
                     当前生效来源：
                     {blueprintStatus?.source === "project"
-                      ? "项目 Blueprint"
+                      ? translate("projectBlueprint")
                       : blueprintStatus?.source === "global"
-                        ? "全局 Blueprint"
+                        ? translate("globalBlueprint")
                         : blueprintStatus?.source === "repository"
-                          ? "仓库 .devin/blueprint.yaml"
-                          : "未读取"}
+                          ? translate("repositoryBlueprint")
+                          : translate("notRead")}
                   </small>
                 </div>
                 {!selected ? (
@@ -4466,7 +4466,7 @@ function ManageSections({
                         projectId: settingsProjectId,
                         repositories: environmentRepositories,
                       })
-                        .then(() => setEnvironmentStatus("顺序与设置已保存"))
+                        .then(() => setEnvironmentStatus(translate("savedOrder")))
                         .catch(onError)
                     }
                   >
@@ -4498,7 +4498,10 @@ function ManageSections({
                       >
                         <span>{host.name}</span>
                         <span className="text-xs text-muted">
-                          {host.id} · {host.online === false ? "离线" : "在线"}
+                          {host.id} ·{" "}
+                          {host.online === false
+                            ? translate("offline")
+                            : translate("online")}
                         </span>
                       </div>
                     ))
@@ -4519,7 +4522,7 @@ function ManageSections({
                 value={settingsProjectId || ""}
                 onChange={(value) => setSettingsProjectId(value || null)}
                 options={[
-                  { value: "", label: "全局" },
+                  { value: "", label: translate("global") },
                   ...projects.map((project) => ({
                     value: project.id,
                     label: project.name,
@@ -4687,7 +4690,7 @@ function ManageSections({
                     projectId: settingsProjectId,
                     value: agentSettings,
                   })
-                    .then(() => setAgentSettingsStatus("已保存"))
+                    .then(() => setAgentSettingsStatus(translate("saved")))
                     .catch(onError)
                 }
               >
@@ -5093,7 +5096,7 @@ function ManageSections({
                         来源：
                         {providerModelOptions[descriptor.name].source === "live"
                           ? "API 实时发现"
-                          : `内置回退（${providerModelOptions[descriptor.name].fallback_reason || "未知原因"}）`}
+                          : `${translate("builtIn")} (${providerModelOptions[descriptor.name].fallback_reason || translate("unknownReason")})`}
                         ，上次刷新：
                         {providerModelOptions[descriptor.name].discovered_at}
                       </span>
@@ -5109,8 +5112,8 @@ function ManageSections({
                           }
                         >
                           {showAllProviderModels[descriptor.name]
-                            ? "收起非对话模型"
-                            : "显示全部模型"}
+                            ? translate("collapseNonChat")
+                            : translate("showAllModels")}
                         </Button>
                       )}
                       <Button
@@ -5326,8 +5329,8 @@ function ManageSections({
               <div className="flex items-center justify-between">
                 <strong>
                   {customProviderId
-                    ? "编辑自定义 Provider"
-                    : "添加自定义 Provider"}
+                    ? translate("editCustomProvider")
+                    : translate("addCustomProvider")}
                 </strong>
                 <button
                   className="text-muted hover:text-ink"
@@ -5586,7 +5589,7 @@ function ManageSections({
                     onChange={(event) => setHostToken(event.target.value)}
                     placeholder={
                       editingHostId
-                        ? "留空保持原 token"
+                        ? translate("keepExistingToken")
                         : translate("bearerToken")
                     }
                     type="password"
@@ -5629,7 +5632,7 @@ function ManageSections({
                 command("save_asset", {
                   id: instructions?.id || "global-instructions",
                   kind: "instructions",
-                  title: instructions?.title || "全局指令",
+                      title: instructions?.title || translate("instructionsSection"),
                   body: instructionsDraft,
                   trigger: null,
                   scope: null,
@@ -5756,7 +5759,7 @@ function ManageSections({
                     void command("import_repository_templates", {
                       projectId: libraryProjectId,
                     })
-                      .then(() => setTemplateDraftStatus("已从仓库导入专家"))
+                      .then(() => setTemplateDraftStatus(translate("importedExpert")))
                       .then(() =>
                         command<LibraryEntry[]>("list_configured_library").then(
                           setLibraryEntries,
@@ -5792,7 +5795,7 @@ function ManageSections({
                       projectId: libraryProjectId,
                     })
                       .then(() =>
-                        setTemplateDraftStatus("当前项目已另存为 Team 模板"),
+                        setTemplateDraftStatus(translate("savedAsTeam")),
                       )
                       .then(() =>
                         command<LibraryEntry[]>("list_configured_library").then(
@@ -5892,7 +5895,7 @@ function ManageSections({
                           content: templateDraftContent,
                         })
                           .then(() => {
-                            setTemplateDraftStatus("已保存");
+                              setTemplateDraftStatus(translate("saved"));
                             setTemplateDraftName("");
                             setTemplateDraftId(null);
                             setTemplateEditorOpen(false);
@@ -5926,8 +5929,8 @@ function ManageSections({
                         <small className="block text-muted">
                           {template.source ||
                             (template.status === "builtin"
-                              ? "内置"
-                              : "自定义")}{" "}
+                              ? translate("builtIn")
+                              : translate("custom"))}{" "}
                           · v{template.version}
                         </small>
                       </div>
@@ -5936,7 +5939,7 @@ function ManageSections({
                       </span>
                     </div>
                     <p className="mt-2 break-words text-sm text-muted">
-                      {template.description || "无描述"}
+                      {template.description || translate("noDescription")}
                     </p>
                     <pre className="mt-2 max-h-28 max-w-full overflow-auto whitespace-pre-wrap break-words text-xs text-muted">
                       {template.content}
@@ -5975,7 +5978,7 @@ function ManageSections({
                               projectId: libraryProjectId,
                             })
                               .then(() =>
-                                setTemplateDraftStatus("已导出到仓库"),
+                                setTemplateDraftStatus(translate("exportedRepository")),
                               )
                               .catch((reason) => {
                                 const message = errorMessage(reason);
@@ -5993,7 +5996,7 @@ function ManageSections({
                                       overwrite: true,
                                     },
                                   ).then(() =>
-                                    setTemplateDraftStatus("已覆盖导出到仓库"),
+                                    setTemplateDraftStatus(translate("overwrittenRepository")),
                                   );
                                 }
                                 onError(reason);
@@ -6069,7 +6072,7 @@ function ManageSections({
                 value={settingsProjectId || ""}
                 onChange={(value) => setSettingsProjectId(value || null)}
                 options={[
-                  { value: "", label: "全局" },
+                  { value: "", label: translate("global") },
                   ...projects.map((project) => ({
                     value: project.id,
                     label: project.name,
@@ -6223,10 +6226,14 @@ function ManageSections({
               [
                 [
                   "agents",
-                  "规则",
-                  "仓库级运行规则（对应仓库中的 AGENTS.md 文件）。",
+                  translate("rulesSection"),
+                  translate("rulesDescription"),
                 ],
-                ["instructions", "全局指令", "应用于所有新会话的全局指令。"],
+                [
+                  "instructions",
+                  translate("instructionsSection"),
+                  translate("instructionsDescription"),
+                ],
                 [
                   "knowledge",
                   "Knowledge",
@@ -6253,7 +6260,9 @@ function ManageSections({
                   search={assetSearch}
                   onSearch={setAssetSearch}
                   searchPlaceholder={
-                    kind === "agents" ? "搜索规则" : `Search ${label}`
+                    kind === "agents"
+                      ? translate("searchRules")
+                      : `Search ${label}`
                   }
                   actions={
                     tab === "knowledge" || tab === "playbook" ? (
@@ -6331,7 +6340,12 @@ function ManageSections({
                   }
                   columns={
                     kind === "agents"
-                      ? ["标题", "触发条件", "范围", "状态"]
+                      ? [
+                          translate("titleLabel"),
+                          translate("triggerCondition"),
+                          translate("scopeLabel"),
+                          translate("statusLabel"),
+                        ]
                       : ["Title", "Trigger", "Scope", "Status"]
                   }
                   renderCard={() => (
@@ -6357,8 +6371,8 @@ function ManageSections({
                               <span className="text-[11px] text-muted">
                                 {kind === "agents"
                                   ? asset.enabled
-                                    ? "已启用"
-                                    : "已禁用"
+                                    ? translate("enabled")
+                                    : translate("disabled")
                                   : asset.enabled
                                     ? "Enabled"
                                     : "Disabled"}
@@ -6370,7 +6384,7 @@ function ManageSections({
                             <small className="mt-3 block text-muted">
                               {asset.trigger ||
                                 (kind === "agents"
-                                  ? "未设置触发条件"
+                                  ? translate("noTrigger")
                                   : "No trigger")}
                             </small>
                           </div>
@@ -6388,7 +6402,9 @@ function ManageSections({
                         setAssetFormOpen(true);
                       }}
                     >
-                      {kind === "agents" ? "新建规则" : `New ${label}`}
+                      {kind === "agents"
+                        ? translate("newRule")
+                        : `New ${label}`}
                     </Button>
                   }
                   rows={
@@ -6411,8 +6427,8 @@ function ManageSections({
                               <small>
                                 {kind === "agents"
                                   ? asset.enabled
-                                    ? "已启用"
-                                    : "已禁用"
+                                    ? translate("enabled")
+                                    : translate("disabled")
                                   : asset.enabled
                                     ? "Enabled"
                                     : "Disabled"}
@@ -6443,14 +6459,14 @@ function ManageSections({
                               >
                                 {assetPending === asset.id
                                   ? kind === "agents"
-                                    ? "保存中…"
+                                    ? translate("saving")
                                     : "Saving…"
                                   : asset.enabled
                                     ? kind === "agents"
-                                      ? "停用"
+                                      ? translate("disable")
                                       : "Disable"
                                     : kind === "agents"
-                                      ? "启用"
+                                      ? translate("enable")
                                       : "Enable"}
                               </Button>
                               <Button
@@ -6487,7 +6503,9 @@ function ManageSections({
                                   );
                                 }}
                               >
-                                {kind === "agents" ? "编辑" : "Edit"}
+                                {kind === "agents"
+                                  ? translate("editLabel")
+                                  : translate("edit")}
                               </Button>
                               <Button
                                 className="danger"
@@ -6502,7 +6520,9 @@ function ManageSections({
                                     .finally(() => setAssetPending(null));
                                 }}
                               >
-                                {kind === "agents" ? "删除" : "Delete"}
+                                {kind === "agents"
+                                  ? translate("deleteLabel")
+                                  : translate("delete")}
                               </Button>
                             </span>
                           </div>
@@ -6510,8 +6530,8 @@ function ManageSections({
                       {!assets.some((asset) => asset.kind === kind) && (
                         <p className="px-4 py-6 text-[13px] text-muted">
                           {kind === "agents"
-                            ? "暂无规则。"
-                            : `No ${label} assets yet.`}
+                            ? translate("noRules")
+                            : translate("noAssetsForLabel", { label })}
                         </p>
                       )}
                     </>
@@ -6573,7 +6593,7 @@ function ManageSections({
                             }
                           }}
                         >
-                          Compare
+                          {translate("compare")}
                         </Button>
                         <Button
                           className="bordered"
@@ -6586,7 +6606,7 @@ function ManageSections({
                               .catch(onError)
                           }
                         >
-                          Roll back
+                          {translate("rollback")}
                         </Button>
                       </span>
                     </div>
@@ -6601,20 +6621,20 @@ function ManageSections({
               <div className="rounded-xl2 border border-line bg-panel p-5">
                 <h2 className="text-[15px] font-semibold text-ink">
                   {assetTabKind === "agents"
-                    ? editingAssetId
-                      ? "编辑规则"
-                      : "新建规则"
+                      ? editingAssetId
+                        ? translate("editRule")
+                        : translate("newRule")
                     : assetTabKind === "instructions"
                       ? editingAssetId
-                        ? "编辑全局指令"
-                        : "新建全局指令"
+                        ? translate("editGlobalInstructions")
+                        : translate("newGlobalInstructions")
                       : editingAssetId
-                        ? "Edit asset"
-                        : "New asset"}
+                        ? translate("editAsset")
+                        : translate("newAsset")}
                 </h2>
                 <div className="form-grid mt-4">
                   <label className="field-label">
-                    {assetTabKind === "agents" ? "标题" : "Title"}
+                    {translate("titleLabel")}
                     <input
                       value={assetTitle}
                       onChange={(event) => setAssetTitle(event.target.value)}
@@ -6622,7 +6642,7 @@ function ManageSections({
                     />
                   </label>
                   <label className="field-label">
-                    {assetTabKind === "agents" ? "内容" : "Body"}
+                    {translate("contentLabel")}
                     <textarea
                       value={assetBody}
                       onChange={(event) => setAssetBody(event.target.value)}
@@ -6632,7 +6652,7 @@ function ManageSections({
                   {(assetTabKind === "knowledge" ||
                     assetTabKind === "skill") && (
                     <label className="field-label">
-                      Trigger
+                      {translate("triggerLabel")}
                       <input
                         value={assetTrigger}
                         onChange={(event) =>
@@ -6645,8 +6665,8 @@ function ManageSections({
                   <label className="field-label">
                     {assetTabKind === "agents" ||
                     assetTabKind === "instructions"
-                      ? "适用范围"
-                      : "Scope"}
+                      ? translate("applyScope")
+                      : translate("scopeLabel")}
                     <select
                       value={assetScopeKind}
                       onChange={(event) =>
