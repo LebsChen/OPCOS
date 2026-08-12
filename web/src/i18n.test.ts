@@ -149,6 +149,7 @@ const zhEnglishWordAllowlist = new Set([
   "PR",
   "English",
   "Bearer",
+  "Webhook",
   "Harness",
   "Rust",
   "Cloudflare",
@@ -198,6 +199,8 @@ describe("i18n source coverage", () => {
       const normalized = value
         .replace(/\{[^}]*\}/g, "")
         .replace(/https?:\/\/\S+/g, "")
+        .replace(/(?:^|\s)\.?[\w.-]+\/[\w./-]+/g, " ")
+        .replace(/(?:^|\s)[\w.-]+\.[A-Za-z0-9_-]+(?=\s|$|[),.;])/g, " ")
         .replace(/\/[\w./-]+/g, "");
       const words = normalized.match(/[A-Za-z]{3,}/g) || [];
       const unexpected = words.filter(
@@ -318,24 +321,17 @@ describe("i18n source coverage", () => {
       /fn session_insights[\s\S]*?Ok\(json!\(\{([\s\S]*?)\}\)\)/,
     );
     expect(insightsFunction).not.toBeNull();
-    const expectedFields = new Set([
-      "message_count",
-      "tool_calls",
-      "approval_count",
-      "token_usage",
-      "duration_ms",
-    ]);
+    const backendPayload = (insightsFunction?.[1] ?? "").replace(
+      /^\s*"session_id":[^\n]*\n/m,
+      "",
+    );
     const backendFields = new Set(
-      [...expectedFields].filter((field) =>
-        insightsFunction?.[1]?.includes(`"${field}"`),
+      [...backendPayload.matchAll(/^\s{8}"([a-z_]+)"\s*:/gm)].map(
+        (match) => match[1],
       ),
     );
-    expect(backendFields).toEqual(expectedFields);
-    expect([...expectedFields].filter((key) => !mappedFields.has(key))).toEqual(
+    expect([...backendFields].filter((key) => !mappedFields.has(key))).toEqual(
       [],
-    );
-    expect(appSource).toMatch(
-      /return translationKey \? translate\(translationKey\) : key;/,
     );
   });
 

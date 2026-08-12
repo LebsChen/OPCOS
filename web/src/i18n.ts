@@ -1724,7 +1724,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     currentSource: "当前生效来源：",
     projectBlueprint: "项目 Blueprint",
     globalBlueprint: "全局 Blueprint",
-    repositoryBlueprint: "仓库蓝图文件",
+    repositoryBlueprint: "仓库 .devin/blueprint.yaml",
     notRead: "未读取",
     openProjectSessionBlueprint: "请先打开一个项目会话查看 Blueprint",
     saveAgentSettings: "保存 Agent 设置",
@@ -1938,7 +1938,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     allProviders: "所有供应商",
     worklogWindowLost: "请求的工作日志窗口已失效，已从当前窗口重新加载。",
     githubEventsDescription:
-      "GitHub 仓库事件采用尽力而为的轮询：GitHub 仅记录最近 30 天内最多 300 个事件，投递也可能延迟。拉取请求、评论和问题会被映射；事件 API 不提供检查运行状态，CI 状态触发请使用后续的网络钩子/Checks 集成。",
+      "GitHub 仓库事件采用尽力而为的轮询：GitHub 仅记录最近 30 天内最多 300 个事件，投递也可能延迟。拉取请求、评论和问题会被映射；事件 API 不提供检查运行状态，CI 状态触发请使用后续的 webhook/Checks 集成。",
     fifteenMinutes: "15 分钟",
     connectorCatalogDescription:
       "OpenWorker 提供的默认连接器目录。OPCOS 只启用本地已实现的集成。",
