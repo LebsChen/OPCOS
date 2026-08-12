@@ -1573,6 +1573,19 @@ The `shouldShowSurfaceRetry({port, sleeping, failed})` banner (i18n `surfaceUnav
 - If a failure loop is running fast, any "reason" banner it renders can flicker faster than a
   screenshot can catch — treat "no visible reason/Retry across several seconds of screenshots" as the
   user-visible truth, and back it up with request counts / port churn.
+- From `70339e8` on, the surface has an explicit **failed state**: a `surface-ended` event or a
+  `start_surface` error freezes the panel on the backend reason (e.g. `RVM websocket failed: HTTP
+  error: 503 Service Unavailable`, `... IO error: Connection refused (os error 111)`, `Remote surface
+  disconnected.`) plus the localized unavailable text + Retry, and auto-connect stops firing. Testing
+  notes: one Retry click = exactly one host attempt; the failed state is cleared by clicking
+  Retry/Reconnect, switching panel tab, switching session, or waking from sleep — so if you need the
+  failed state to persist for measurement, do not touch tabs or the session list while timing.
+- Watch out for the panel spontaneously reverting to a different surface tab (observed once flipping
+  Terminal → Browser during an untouched idle wait). The Browser/CDP surface polls frames
+  continuously, which keeps the session `awake` past the idle threshold and leaves an extra relay
+  listener behind until the panel is closed — so before timing an idle-sleep test, screenshot the
+  panel to confirm it is still on the tab you expect, and treat any unexplained "did not sleep" result
+  as possibly a Browser-tab artifact.
 - Sessions with `run_state='error'` are never slept, no matter how long they idle. Pick a session with
   `run_state='idle'` for sleep tests, or you will wait forever and mis-report a sleep regression.
 - Right-rail surface icon positions shift depending on which panel is open and which capabilities the
