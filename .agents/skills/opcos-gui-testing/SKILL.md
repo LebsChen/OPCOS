@@ -1550,23 +1550,29 @@ force a re-probe by switching session away and back.
 ## Surface start failures: what the UI can and cannot show
 
 `start_surface` (`src-tauri/src/main.rs`, `async fn start_surface`) binds a local `TcpListener` and
-spawns `relay_surface` **before ever contacting the host**, then returns `Ok(port)`. Consequences for
-testing:
+spawns `relay_surface` **before ever contacting the host**, then returns `Ok(port)`. A later relay
+failure emits `surface-ended`; the frontend enters an explicit failed state, keeps the safe reason,
+and stops automatic reconnect attempts until the user presses Retry or otherwise changes context.
+The `shouldShowSurfaceRetry({port, sleeping, failed})` banner (i18n `surfaceUnavailable` /
+`retrySurface`) must remain stable and mutually exclusive with the sleep banner.
 
 - A genuinely unreachable/erroring host (connection refused, HTTP 503, session bound to a dead host)
-  does **not** make `start_surface` fail. The frontend gets a port, so `port !== null` and the
-  `shouldShowSurfaceRetry({busy, port, sleeping})` banner (i18n `surfaceUnavailable` / `retrySurface`)
-  can never render for that case — you only get a transient toast (`rvm request failed: …`) and a
-  blank black panel. If you are asked to verify a "reason + Retry" affordance, prove it with a case
-  where `start_surface` itself returns `Err` (e.g. `host_id == "local"`, or computer-use disabled for
-  vnc/cdp), and report the unreachable-host case separately.
+  does not make `start_surface` fail synchronously. The relay later emits `surface-ended`; verify
+  that the panel keeps the safe reason and stable Retry action instead of becoming a blank panel or
+  opening another connection automatically.
 - Ways to fake an unavailable host, cheapest first: point the session at a host whose URL is a dead
   port (a `DeadHost` entry with `http://127.0.0.1:9` is already in the local DB), stop the fixture
   (`kill` the `python3 agent.py` PID — `pkill -f fixture-agent/agent.py` does **not** match, the
   cmdline is just `python3 agent.py`), or run a logging stub on :8899 that 503s everything and appends
   each request to a log file so you can count attempts.
-- Retry-storm check: count host-side requests. One panel mount = exactly one `GET /pty-ws?...`
-  attempt; an untouched failed panel produced zero further requests over 90 s.
+- Retry-storm check: count host-side requests. Use an untouched window of at least 25 s:
+  `a=$(wc -l < /tmp/stub.log); sleep 25; …`, then compare the line count and inspect `ss -ltnp`
+  for relay churn. A fixed failed state must produce one startup attempt and zero additional
+  requests until the user presses Retry; if the count grows repeatedly or relay ports
+  appear/disappear every second, the retry storm has regressed.
+- If a failure loop is running fast, any "reason" banner it renders can flicker faster than a
+  screenshot can catch — treat "no visible reason/Retry across several seconds of screenshots" as the
+  user-visible truth, and back it up with request counts / port churn.
 - Sessions with `run_state='error'` are never slept, no matter how long they idle. Pick a session with
   `run_state='idle'` for sleep tests, or you will wait forever and mis-report a sleep regression.
 - Right-rail surface icon positions shift depending on which panel is open and which capabilities the

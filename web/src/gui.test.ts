@@ -53,6 +53,7 @@ describe("GUI boundary behavior", () => {
     expect(surfaceNeedsConnection("terminal", null, false)).toBe(true);
     expect(surfaceNeedsConnection("terminal", 1234, false)).toBe(false);
     expect(surfaceNeedsConnection("terminal", null, true)).toBe(false);
+    expect(surfaceNeedsConnection("terminal", null, false, true)).toBe(false);
     expect(
       shouldRetrySurfaceStart({
         invalidated: true,
@@ -63,17 +64,21 @@ describe("GUI boundary behavior", () => {
     ).toBe(true);
     expect(
       shouldRetrySurfaceStart({
-        invalidated: false,
+        invalidated: true,
         port: null,
         sleeping: false,
         tab: "terminal",
+        failed: true,
       }),
     ).toBe(false);
     expect(
-      shouldShowSurfaceRetry({ busy: false, port: null, sleeping: false }),
+      shouldShowSurfaceRetry({ port: null, sleeping: false, failed: true }),
     ).toBe(true);
     expect(
-      shouldShowSurfaceRetry({ busy: false, port: null, sleeping: true }),
+      shouldShowSurfaceRetry({ port: null, sleeping: true, failed: true }),
+    ).toBe(false);
+    expect(
+      shouldShowSurfaceRetry({ port: null, sleeping: false, failed: false }),
     ).toBe(false);
     expect(preserveSurfaceTabWhileSleeping("asleep")).toBe(true);
     expect(preserveSurfaceTabWhileSleeping("awake")).toBe(false);

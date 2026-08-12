@@ -2534,6 +2534,8 @@ function SurfaceView({
   const surfaceGenerationRef = useRef(0);
   const [vncPassword, setVncPassword] = useState<string | null>(null);
   const [surfaceError, setSurfaceError] = useState("");
+  const [surfaceFailed, setSurfaceFailed] = useState(false);
+  const surfaceFailedRef = useRef(false);
   const selectedSleepStateRef = useRef(selected.sleep_state);
   const [browserFrame, setBrowserFrame] = useState<{
     image: string;
@@ -2554,6 +2556,16 @@ function SurfaceView({
   const sleepingRef = useRef(sleeping);
   const surfaceTabRef = useRef(tab);
   const [surfaceRetryToken, setSurfaceRetryToken] = useState(0);
+  const markSurfaceFailed = (reason: string) => {
+    surfaceFailedRef.current = true;
+    setSurfaceFailed(true);
+    setSurfaceError(reason);
+  };
+  const clearSurfaceFailure = () => {
+    surfaceFailedRef.current = false;
+    setSurfaceFailed(false);
+    setSurfaceError("");
+  };
   const lastTouchRef = useRef(0);
   sleepingRef.current = sleeping;
   surfaceTabRef.current = tab;
@@ -2568,6 +2580,7 @@ function SurfaceView({
     void command("touch_session", { sessionId: selected.id }).catch(onError);
   };
   const start = async (surface: string) => {
+    if (surfaceFailedRef.current) return;
     if (startInFlightRef.current) {
       retryAfterStartRef.current = true;
       return;
@@ -2577,7 +2590,7 @@ function SurfaceView({
     try {
       startInFlightRef.current = true;
       setBusy(true);
-      setSurfaceError("");
+      clearSurfaceFailure();
       const nextPort = await command<number>("start_surface", {
         sessionId: selected.id,
         hostId: selected.host_id,
@@ -2602,7 +2615,7 @@ function SurfaceView({
         );
       }
     } catch (error) {
-      setSurfaceError(errorMessage(error));
+      markSurfaceFailed(errorMessage(error));
       onError(error);
     } finally {
       startInFlightRef.current = false;
@@ -2613,6 +2626,7 @@ function SurfaceView({
         port: portRef.current,
         sleeping: sleepingRef.current,
         tab: surfaceTabRef.current,
+        failed: surfaceFailedRef.current,
       });
       retryAfterStartRef.current = false;
       if (shouldRetry) setSurfaceRetryToken((token) => token + 1);
@@ -2629,10 +2643,10 @@ function SurfaceView({
       if (activePort !== null)
         void command("stop_surface", { port: activePort });
       setSleeping(true);
-      setSurfaceError("");
+      clearSurfaceFailure();
     } else if (!shouldShowSurfaceReconnect(selected.sleep_state) && sleeping) {
       setSleeping(false);
-      setSurfaceError("");
+      clearSurfaceFailure();
     }
   }, [selected.sleep_state, sleeping]);
   useEffect(() => {
@@ -2656,7 +2670,7 @@ function SurfaceView({
       portRef.current = null;
       setPort(null);
       setBusy(false);
-      setSurfaceError(
+      markSurfaceFailed(
         typeof surfacePayload.reason === "string"
           ? surfacePayload.reason
           : translate("surfaceUnavailable"),
@@ -2681,6 +2695,8 @@ function SurfaceView({
     portRef.current = null;
     setPort(null);
     setVncPassword(null);
+    surfaceFailedRef.current = false;
+    setSurfaceFailed(false);
     setSurfaceError("");
     setBrowserFrame(null);
     setIdeUrl("");
@@ -2692,8 +2708,11 @@ function SurfaceView({
     selectedSleepStateRef.current = selected.sleep_state;
   }, [selected.id]);
   useEffect(() => {
+    clearSurfaceFailure();
+  }, [tab]);
+  useEffect(() => {
     if (tab === "terminal" || tab === "desktop" || tab === "browser") {
-      if (!port && !sleeping) {
+      if (surfaceNeedsConnection(tab, port, sleeping, surfaceFailed)) {
         void start(
           tab === "terminal" ? "pty" : tab === "desktop" ? "vnc" : "cdp",
         );
@@ -2725,6 +2744,7 @@ function SurfaceView({
     ideUrl,
     ideError,
     sleeping,
+    surfaceFailed,
     surfaceRetryToken,
   ]);
   useEffect(() => {
@@ -2740,7 +2760,7 @@ function SurfaceView({
         }>("capture_remote_browser_frame", { sessionId: selected.id });
         if (!cancelled) {
           setBrowserFrame(frame);
-          setSurfaceError("");
+          if (!surfaceFailedRef.current) setSurfaceError("");
         }
       } catch (error) {
         if (!cancelled) setSurfaceError(errorMessage(error));
@@ -2852,14 +2872,14 @@ function SurfaceView({
   }, [selected.id, port, tab, vncPassword, sleeping]);
   const reconnect = () => {
     setSleeping(false);
-    setSurfaceError("");
+    clearSurfaceFailure();
     if (tab === "terminal" || tab === "desktop" || tab === "browser")
       void start(
         tab === "terminal" ? "pty" : tab === "desktop" ? "vnc" : "cdp",
       );
   };
   const retrySurface = () => {
-    setSurfaceError("");
+    clearSurfaceFailure();
     setSurfaceRetryToken((token) => token + 1);
   };
   if (tab === "terminal" || tab === "desktop" || tab === "browser")
@@ -2879,7 +2899,7 @@ function SurfaceView({
         {surfaceError && (
           <div className="surface-status error">{surfaceError}</div>
         )}
-        {shouldShowSurfaceRetry({ busy, port, sleeping }) && (
+        {shouldShowSurfaceRetry({ port, sleeping, failed: surfaceFailed }) && (
           <div className="surface-status warning">
             <p>{translate("surfaceUnavailable")}</p>
             <Button onClick={retrySurface}>{translate("retrySurface")}</Button>

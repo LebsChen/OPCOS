@@ -136,11 +136,13 @@ export function surfaceNeedsConnection(
   tab: SurfaceTab | "pr",
   port: number | null,
   sleeping: boolean,
+  failed = false,
 ): boolean {
   return (
     (tab === "terminal" || tab === "desktop" || tab === "browser") &&
     port === null &&
-    !sleeping
+    !sleeping &&
+    !failed
   );
 }
 
@@ -149,25 +151,27 @@ export function shouldRetrySurfaceStart({
   port,
   sleeping,
   tab,
+  failed = false,
 }: {
   invalidated: boolean;
   port: number | null;
   sleeping: boolean;
   tab: SurfaceTab | "pr";
+  failed?: boolean;
 }): boolean {
-  return invalidated && surfaceNeedsConnection(tab, port, sleeping);
+  return invalidated && surfaceNeedsConnection(tab, port, sleeping, failed);
 }
 
 export function shouldShowSurfaceRetry({
-  busy,
   port,
   sleeping,
+  failed,
 }: {
-  busy: boolean;
   port: number | null;
   sleeping: boolean;
+  failed: boolean;
 }): boolean {
-  return !sleeping && !busy && port === null;
+  return !sleeping && failed && port === null;
 }
 
 export function preserveSurfaceTabWhileSleeping(
