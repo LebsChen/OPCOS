@@ -9258,7 +9258,7 @@ function Activity({
                       <input
                         value={taskId}
                         onChange={(event) => setTaskId(event.target.value)}
-                        placeholder={translate("e.g. task-123")}
+                        placeholder={translate("taskIdExample")}
                       />
                       <p className="field-help">
                         The durable coordination board to observe or update.
@@ -9266,7 +9266,7 @@ function Activity({
                     </div>
                     <div>
                       <label className="field-label">
-                        {translate("Initial roles")}
+                        {translate("initialRoles")}
                       </label>
                       <textarea
                         value={rolesText}
@@ -9434,21 +9434,21 @@ function Activity({
                                 onChange={(event) =>
                                   setTaskTitle(event.target.value)
                                 }
-                                placeholder={translate("New task")}
+                                placeholder={translate("newTask")}
                               />
                               <input
                                 value={worker}
                                 onChange={(event) =>
                                   setWorker(event.target.value)
                                 }
-                                placeholder={translate("Worker / assignee")}
+                                placeholder={translate("workerAssignee")}
                               />
                               <input
                                 value={prUrl}
                                 onChange={(event) =>
                                   setPrUrl(event.target.value)
                                 }
-                                placeholder={translate("Verified PR URL")}
+                                placeholder={translate("verifiedPrUrl")}
                               />
                               <Button
                                 className="primary"
@@ -9549,7 +9549,7 @@ function Activity({
                   )}
                   <section className="hidden">
                     <div className="inline-actions mb-3">
-                      <input placeholder={translate("Search tasks")} />
+                      <input placeholder={translate("searchTasksInput")} />
                       <Button
                         className="primary"
                         onClick={() => setTaskFormOpen(true)}
@@ -9562,17 +9562,17 @@ function Activity({
                         <input
                           value={taskTitle}
                           onChange={(event) => setTaskTitle(event.target.value)}
-                          placeholder={translate("New task")}
+                          placeholder={translate("newTask")}
                         />
                         <input
                           value={worker}
                           onChange={(event) => setWorker(event.target.value)}
-                          placeholder={translate("Worker / assignee")}
+                          placeholder={translate("workerAssignee")}
                         />
                         <input
                           value={prUrl}
                           onChange={(event) => setPrUrl(event.target.value)}
-                          placeholder={translate("Verified PR URL")}
+                          placeholder={translate("verifiedPrUrl")}
                         />
                         <Button
                           className="primary"
