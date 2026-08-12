@@ -337,6 +337,10 @@ const messages: Record<Locale, Record<string, string>> = {
     openPrsAsDescription: "Initial state when creating a Pull request.",
     respondingToBots: "Responding to bots",
     respondingToBotsDescription: "Whether to respond to messages triggered by bots.",
+    manageCommands: "Manage commands",
+    addCommand: "Add Command",
+    systemOverride: "System override",
+    commandPromptTemplate: "Command prompt template",
     projectConfig: "Project configuration",
     projectConfigDescription:
       "Project configuration is inherited by project member sessions; global configuration remains available as a fallback.",
@@ -701,6 +705,10 @@ const messages: Record<Locale, Record<string, string>> = {
     openPrsAsDescription: "创建 Pull request 时的初始状态。",
     respondingToBots: "Responding to bots",
     respondingToBotsDescription: "是否响应机器人触发的消息。",
+    manageCommands: "管理命令",
+    addCommand: "添加命令",
+    systemOverride: "系统覆盖",
+    commandPromptTemplate: "命令提示模板",
     projectConfig: "项目配置",
     projectConfigDescription:
       "项目配置会继承到项目成员会话，全局配置仍可回退使用。",

@@ -4687,7 +4687,7 @@ function ManageSections({
             <div className="pt-5">
               <div className="flex items-center justify-between mb-3">
                 <div>
-                  <strong>Manage commands</strong>
+                  <strong>{translate("manageCommands")}</strong>
                   <small className="block">
                     System 命令可覆盖或 Reset；Custom 命令可添加、编辑和删除。
                   </small>
@@ -4796,7 +4796,7 @@ function ManageSections({
                 ))}
               </div>
               <div className="mt-4 rounded-lg border border-dashed border-line p-3">
-                <strong>Add Command</strong>
+                <strong>{translate("addCommand")}</strong>
                 <div className="mt-2 grid gap-2">
                   <input
                     placeholder="/command"
@@ -4813,11 +4813,11 @@ function ManageSections({
                       )
                     }
                   >
-                    <option value="custom">Custom</option>
-                    <option value="system">System override</option>
+                    <option value="custom">{translate("custom")}</option>
+                    <option value="system">{translate("systemOverride")}</option>
                   </select>
                   <textarea
-                    placeholder="命令提示模板"
+                    placeholder={translate("commandPromptTemplate")}
                     value={slashCommandBody}
                     onChange={(event) =>
                       setSlashCommandBody(event.target.value)
