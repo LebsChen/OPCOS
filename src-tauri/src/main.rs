@@ -24088,7 +24088,7 @@ fn local_git_changes(cwd: &str, base: &str) -> Result<Value, String> {
     let branch = String::from_utf8_lossy(&branch_output.stdout)
         .trim()
         .to_owned();
-    let files = String::from_utf8_lossy(&output.stdout)
+    let mut files = String::from_utf8_lossy(&output.stdout)
         .lines()
         .enumerate()
         .filter_map(|line| {
@@ -24105,6 +24105,29 @@ fn local_git_changes(cwd: &str, base: &str) -> Result<Value, String> {
             }))
         })
         .collect::<Vec<_>>();
+    let status_output =
+        local_git_command(cwd, &["status", "--short", "--untracked-files=all", "--"])?;
+    for line in String::from_utf8_lossy(&status_output.stdout).lines() {
+        if !line.starts_with("?? ") {
+            continue;
+        }
+        let path = line[3..].to_owned();
+        if files
+            .iter()
+            .any(|file| file.get("path").and_then(Value::as_str) == Some(&path))
+        {
+            continue;
+        }
+        let additions = std::fs::read_to_string(std::path::Path::new(cwd).join(&path))
+            .map(|content| content.lines().count() as i64)
+            .unwrap_or(0);
+        files.push(json!({
+            "path": path,
+            "changeType": "untracked",
+            "additions": additions,
+            "deletions": 0,
+        }));
+    }
     Ok(json!({
         "base": base,
         "branch": branch,
@@ -24112,11 +24135,41 @@ fn local_git_changes(cwd: &str, base: &str) -> Result<Value, String> {
     }))
 }
 
-fn local_git_file_diff(cwd: &str, path: &str, base: &str) -> Result<Value, String> {
+fn local_git_file_diff(
+    cwd: &str,
+    path: &str,
+    base: &str,
+    context: Option<u32>,
+) -> Result<Value, String> {
     if path.is_empty() || path.contains(['\0', '\n', '\r']) {
         return Err("git file path is invalid".into());
     }
-    let output = local_git_command(cwd, &["diff", base, "--", path])?;
+    let context_arg = format!("-U{}", context.unwrap_or(100).min(1000));
+    let output = local_git_command(cwd, &["diff", &context_arg, base, "--", path])?;
+    if output.stdout.is_empty() {
+        let is_untracked = local_git_command(
+            cwd,
+            &["status", "--short", "--untracked-files=all", "--", path],
+        )?
+        .stdout
+        .starts_with(b"?? ");
+        if is_untracked {
+            let empty_file = tempfile::NamedTempFile::new_in(cwd)
+                .map_err(|error| format!("failed to create empty diff source: {error}"))?;
+            let empty_path = empty_file.path().to_string_lossy().into_owned();
+            let output = local_git_command(
+                cwd,
+                &["diff", &context_arg, "--no-index", "--", &empty_path, path],
+            )?;
+            if !matches!(output.status.code(), Some(0) | Some(1)) {
+                return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+            }
+            return Ok(json!({
+                "diff": String::from_utf8_lossy(&output.stdout),
+                "exit_code": output.status.code().unwrap_or(1),
+            }));
+        }
+    }
     Ok(json!({
         "diff": String::from_utf8_lossy(&output.stdout),
         "exit_code": output.status.code().unwrap_or(1),
@@ -24155,14 +24208,15 @@ async fn review_file_diff(
     cwd: String,
     path: String,
     base: String,
+    context: Option<u32>,
 ) -> Result<Value, String> {
     let host_id = session_host_id(&state, &session_id)?;
     if host_id == "local" {
-        return local_git_file_diff(&cwd, &path, &base);
+        return local_git_file_diff(&cwd, &path, &base, context);
     }
     client_for(&state, &host_id)?
         .with_workspace(cwd.clone())
-        .git_file_diff(&cwd, &path, &base)
+        .git_file_diff(&cwd, &path, &base, context)
         .await
         .map_err(|error| error.to_string())
 }
@@ -30187,6 +30241,22 @@ mod m7_tests {
             normalize_provider_model(Some("   ")).unwrap_err(),
             "provider model id is required"
         );
+    }
+
+    #[test]
+    fn local_git_file_diff_renders_untracked_file_as_additions() {
+        let root = tempfile::tempdir().unwrap();
+        let init = local_git_command(root.path().to_str().unwrap(), &["init", "--quiet"]).unwrap();
+        assert!(init.status.success());
+        std::fs::write(root.path().join("new.txt"), "first line\nsecond line\n").unwrap();
+
+        let result =
+            local_git_file_diff(root.path().to_str().unwrap(), "new.txt", "HEAD", None).unwrap();
+        let diff = result["diff"].as_str().unwrap();
+        assert!(diff.contains("+++"));
+        assert!(diff.contains("+first line"));
+        assert!(diff.contains("+second line"));
+        assert_eq!(result["exit_code"], 1);
     }
 
     #[test]

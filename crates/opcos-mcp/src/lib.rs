@@ -2975,7 +2975,13 @@ mod tests {
         async fn git_changes(&self, _: &str, _: &str) -> Result<opcos_rvm::GitChanges, RvmError> {
             unreachable!()
         }
-        async fn git_file_diff(&self, _: &str, _: &str, _: &str) -> Result<Value, RvmError> {
+        async fn git_file_diff(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Option<u32>,
+        ) -> Result<Value, RvmError> {
             unreachable!()
         }
         async fn git_status(&self, _: &str) -> Result<opcos_rvm::GitStatus, RvmError> {
