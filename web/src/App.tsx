@@ -9829,8 +9829,8 @@ function StandalonePane({ route }: { route: PaneRoute }) {
         <strong className="drawer-title">{route.tab}</strong>
         <button
           className="drawer-action"
-          title="关闭窗口"
-          aria-label="关闭窗口"
+          title={translate("closeWindow")}
+          aria-label={translate("closeWindow")}
           onClick={close}
         >
           <Icon name="x" />
@@ -9838,7 +9838,9 @@ function StandalonePane({ route }: { route: PaneRoute }) {
       </header>
       <div className="tab-body">
         {error && <div className="error-banner">{error}</div>}
-        {!error && !selected && <div className="muted">Loading…</div>}
+        {!error && !selected && (
+          <div className="muted">{translate("loading")}</div>
+        )}
         {selected && route.tab === "info" && (
           <div className="info">
             <Field k={translate("Session ID")} v={selected.id} />
@@ -9850,13 +9852,13 @@ function StandalonePane({ route }: { route: PaneRoute }) {
             />
             <Field k={translate("Model")} v={selected.model} />
             <div className="field">
-              <label>Provider</label>
+              <label>{translate("provider")}</label>
               <select
                 value={selected.provider || ""}
                 onChange={() => undefined}
-                aria-label="Provider"
+                aria-label={translate("provider")}
               >
-                <option value="">Global default</option>
+                <option value="">{translate("globalDefault")}</option>
                 {providers.map((provider) => (
                   <option key={provider.name} value={provider.name}>
                     {provider.title}
@@ -9908,7 +9910,7 @@ function StandaloneInsights({
       .then(setInsights)
       .catch(onError);
   }, [selected.id, onError]);
-  if (!insights) return <div className="muted">Loading…</div>;
+  if (!insights) return <div className="muted">{translate("loading")}</div>;
   return (
     <div className="info">
       {Object.entries(insights)
@@ -10049,14 +10051,14 @@ function ArtifactsPane({ selected }: { selected: Session }) {
           <button
             className="artifact-icon-btn"
             onClick={() => setOpened(null)}
-            aria-label="Back to artifacts"
-            title="Back"
+            aria-label={translate("backToArtifacts")}
+            title={translate("back")}
           >
             <RailIcon name="back" size={16} />
           </button>
           <div className="artifact-heading">
             <div className="artifact-title">
-              <span>Artifacts</span>
+              <span>{translate("artifacts")}</span>
               <span className="artifact-sep">/</span>
               <span>{opened.path.split(/[\\/]/).pop()}</span>
             </div>
@@ -10065,7 +10067,7 @@ function ArtifactsPane({ selected }: { selected: Session }) {
         </div>
         <div className="artifact-preview">
           {!content ? (
-            <div className="rail-muted">Loading…</div>
+            <div className="rail-muted">{translate("loading")}</div>
           ) : content.error ? (
             <div className="rail-error">{String(content.error)}</div>
           ) : typeof content.content_base64 === "string" ? (
@@ -10077,7 +10079,7 @@ function ArtifactsPane({ selected }: { selected: Session }) {
           ) : opened.kind === "recording_manifest" && manifest ? (
             <div className="grid gap-3">
               <div className="flex items-center justify-between text-sm">
-                <strong>Sampled screenshot timeline</strong>
+                <strong>{translate("sampledScreenshotTimeline")}</strong>
                 <span>
                   {manifest.frames?.length ?? 0} frames
                   {manifest.truncated ? " · truncated at limit" : ""}
@@ -10137,7 +10139,7 @@ function ArtifactsPane({ selected }: { selected: Session }) {
         <button
           className="rail-mini-btn"
           onClick={refresh}
-          title="Refresh artifacts"
+          title={translate("refreshArtifacts")}
         >
           <RailIcon name="refresh" size={16} />
         </button>
@@ -10146,7 +10148,7 @@ function ArtifactsPane({ selected }: { selected: Session }) {
         {loadError ? (
           <div className="rail-error">{loadError}</div>
         ) : artifacts.length === 0 ? (
-          <div className="rail-muted">No artifacts yet.</div>
+          <div className="rail-muted">{translate("noArtifacts")}</div>
         ) : (
           <div className="artifact-list">
             {artifacts.slice(0, 16).map((artifact) => (
@@ -10167,7 +10169,7 @@ function ArtifactsPane({ selected }: { selected: Session }) {
                     {new Date(artifact.created_at).toLocaleString()}
                   </span>
                 </span>
-                <span className="artifact-open">Open</span>
+                <span className="artifact-open">{translate("open")}</span>
               </button>
             ))}
           </div>
@@ -10202,11 +10204,11 @@ function ShellHistoryPane({ selected }: { selected: Session }) {
   return (
     <section className="rail-section">
       <div className="rail-section-head">
-        <strong>Shell</strong>
+        <strong>{translate("shell")}</strong>
         <button
           className="rail-mini-btn"
           onClick={refresh}
-          title="Refresh shell history"
+          title={translate("refreshShellHistory")}
         >
           <RailIcon name="refresh" size={16} />
         </button>
@@ -10215,7 +10217,7 @@ function ShellHistoryPane({ selected }: { selected: Session }) {
         {error ? (
           <div className="rail-error">{error}</div>
         ) : items.length === 0 ? (
-          <div className="rail-muted">No shell commands recorded yet.</div>
+          <div className="rail-muted">{translate("noShellCommands")}</div>
         ) : (
           <div className="rail-event-list">
             {items.map((item) => (
@@ -10262,7 +10264,9 @@ function IterationStatsPane({ events }: { events: TimelineEvent[] }) {
   const summary = summarizeIterationStats(events);
   return (
     <section className="mt-4 rounded-lg border border-line p-3">
-      <h3 className="text-sm font-semibold text-ink">Iteration stats</h3>
+      <h3 className="text-sm font-semibold text-ink">
+        {translate("iterationStats")}
+      </h3>
       <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
         <Field k="Iterations" v={String(summary.iterations.length)} />
         <Field k="Input tokens" v={formatStat(summary.totalInputTokens)} />
@@ -10415,11 +10419,11 @@ function ChangesPane({ selected }: { selected: Session }) {
   return (
     <section className="rail-section">
       <div className="rail-section-head">
-        <strong>Changes</strong>
+        <strong>{translate("changes")}</strong>
         <button
           className="rail-mini-btn"
           onClick={refresh}
-          title="Refresh changes"
+          title={translate("refreshChanges")}
         >
           <RailIcon name="refresh" size={16} />
         </button>
@@ -10427,7 +10431,7 @@ function ChangesPane({ selected }: { selected: Session }) {
       <div className="rail-section-body">
         {error && <div className="rail-error">{error}</div>}
         {items.length === 0 ? (
-          <div className="rail-muted">No file edits recorded yet.</div>
+          <div className="rail-muted">{translate("noFileEdits")}</div>
         ) : (
           <div className="rail-event-list">
             {items.map((item) => (
@@ -10451,7 +10455,7 @@ function ChangesPane({ selected }: { selected: Session }) {
         )}
         {Array.isArray(changes) && changes.length > 0 && (
           <details className="rail-git-diff">
-            <summary>Current git diff</summary>
+            <summary>{translate("currentGitDiff")}</summary>
             <pre>{JSON.stringify(changes, null, 2)}</pre>
           </details>
         )}
@@ -10493,12 +10497,12 @@ function ProgressPane({ selected }: { selected: Session }) {
   return (
     <section className="rail-section">
       <div className="rail-section-head">
-        <strong>Progress</strong>
+        <strong>{translate("progress")}</strong>
         <select
           value={category}
           onChange={(event) => setCategory(event.target.value)}
         >
-          <option value="">All</option>
+          <option value="">{translate("all")}</option>
           {categories.map((item) => (
             <option key={item} value={item}>
               {item}
@@ -10510,7 +10514,7 @@ function ProgressPane({ selected }: { selected: Session }) {
         {error ? (
           <div className="rail-error">{error}</div>
         ) : events.length === 0 ? (
-          <div className="rail-muted">No progress events recorded yet.</div>
+          <div className="rail-muted">{translate("noProgressEvents")}</div>
         ) : (
           <div className="rail-event-list">
             {events.map((event) => (
@@ -10519,7 +10523,7 @@ function ProgressPane({ selected }: { selected: Session }) {
                 key={`${event.sequence}-${event.event_type}`}
               >
                 <div className="rail-event-head">
-                  <strong>{event.event_type || "working_event"}</strong>
+                  <strong>{event.event_type || translate("workingEvent")}</strong>
                   <span className="rail-muted">{event.category}</span>
                 </div>
                 <div className="rail-event-meta">
@@ -10592,7 +10596,7 @@ function AgentRosterPane({
     return (
       <section className="rail-section">
         <div className="rail-section-head">
-          <strong>Agents</strong>
+          <strong>{translate("agents")}</strong>
         </div>
         <div className="rail-section-body">
           <div className="rail-muted">
@@ -10630,12 +10634,12 @@ function AgentRosterPane({
   return (
     <section className="rail-section">
       <div className="rail-section-head">
-        <strong>Agents</strong>
+        <strong>{translate("agents")}</strong>
         <button
           className="rail-mini-btn"
           onClick={refresh}
-          title="Refresh agents"
-          aria-label="Refresh agents"
+          title={translate("refreshAgents")}
+          aria-label={translate("refreshAgents")}
         >
           <Icon name="refresh" size={16} />
         </button>
@@ -10654,7 +10658,7 @@ function AgentRosterPane({
           </div>
         )}
         {rows.length === 0 ? (
-          <div className="rail-muted">This project has no agents.</div>
+          <div className="rail-muted">{translate("noAgents")}</div>
         ) : (
           <div className="rail-event-list">
             {rows.map(({ agent, session }) => {
@@ -10668,35 +10672,35 @@ function AgentRosterPane({
                   </div>
                   <dl className="agent-roster-details">
                     <div>
-                      <dt>Role</dt>
+                      <dt>{translate("roleLabel")}</dt>
                       <dd>{projectAgentRosterValue(agent.role)}</dd>
                     </div>
                     <div>
-                      <dt>Host</dt>
+                      <dt>{translate("hostLabel")}</dt>
                       <dd>{projectAgentRosterHost(session)}</dd>
                     </div>
                     <div>
-                      <dt>Branch</dt>
+                      <dt>{translate("branchLabel")}</dt>
                       <dd title={agent.branch}>
                         {projectAgentRosterValue(agent.branch)}
                       </dd>
                     </div>
                     <div>
-                      <dt>Worktree</dt>
+                      <dt>{translate("worktreeLabel")}</dt>
                       <dd title={agent.worktree_path}>
                         {projectAgentRosterValue(agent.worktree_path)}
                       </dd>
                     </div>
                     <div>
-                      <dt>Session</dt>
+                      <dt>{translate("sessionLabel")}</dt>
                       <dd>{session ? "Exists" : "None"}</dd>
                     </div>
                     <div>
-                      <dt>Run state</dt>
+                      <dt>{translate("runStateLabel")}</dt>
                       <dd>{projectAgentRosterValue(session?.run_state)}</dd>
                     </div>
                     <div>
-                      <dt>Stop reason</dt>
+                      <dt>{translate("stopReasonLabel")}</dt>
                       <dd>{projectAgentRosterValue(session?.stop_reason)}</dd>
                     </div>
                   </dl>
