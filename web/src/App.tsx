@@ -2057,11 +2057,14 @@ function ProjectBoard({
           <div>
             <h1 className="text-2xl font-semibold text-ink">{project.name}</h1>
             <p className="text-sm text-faint mt-2">
-              {project.host_name} · {project.online === false ? "离线" : "在线"}{" "}
+              {project.host_name} ·{" "}
+              {project.online === false
+                ? translate("offline")
+                : translate("online")}{" "}
               · {project.repo_root}
             </p>
             <p className="text-sm text-faint mt-1">
-              默认分支：{project.default_branch}
+              {translate("defaultBranchLabel")}：{project.default_branch}
             </p>
           </div>
           <button
@@ -2072,7 +2075,7 @@ function ProjectBoard({
               })
             }
           >
-            添加成员
+            {translate("addMember")}
           </button>
           <button
             className="btn"
@@ -2083,21 +2086,21 @@ function ProjectBoard({
               setProjectEditing((value) => !value);
             }}
           >
-            编辑项目
+            {translate("editProject")}
           </button>
           <button
             className="btn"
             disabled={projectActionBusy}
             onClick={archiveProject}
           >
-            归档项目
+            {translate("archiveProject")}
           </button>
           <button
             className="btn quiet-deny"
             disabled={projectActionBusy}
             onClick={() => void deleteProject()}
           >
-            删除项目
+            {translate("deleteProject")}
           </button>
         </div>
         {projectActionError && (
@@ -2107,21 +2110,21 @@ function ProjectBoard({
               className="btn mt-2"
               onClick={() => void deleteProject(true)}
             >
-              强制删除并回收 worktree
+              {translate("forceDeleteWorktree")}
             </button>
           </div>
         )}
         {projectEditing && (
           <div className="mt-4 grid gap-3 rounded-lg border border-line bg-panel p-4 md:grid-cols-[1fr_1fr_auto]">
             <label className="field-label">
-              项目名称
+              {translate("projectNameLabel")}
               <input
                 value={projectName}
                 onChange={(event) => setProjectName(event.target.value)}
               />
             </label>
             <label className="field-label">
-              默认分支
+              {translate("defaultBranchLabel")}
               <input
                 value={projectBranch}
                 onChange={(event) => setProjectBranch(event.target.value)}
@@ -2137,10 +2140,10 @@ function ProjectBoard({
                 }
                 onClick={() => void saveProjectDetails()}
               >
-                保存
+                {translate("save")}
               </button>
               <button className="btn" onClick={() => setProjectEditing(false)}>
-                取消
+                {translate("cancel")}
               </button>
             </div>
           </div>
@@ -2166,13 +2169,15 @@ function ProjectBoard({
                   className="mt-2 text-xs text-faint truncate"
                   title={agent.branch}
                 >
-                  分支：{agent.branch}
+                  {translate("branchLabelText")}{agent.branch}
                 </p>
                 <p
                   className="mt-1 text-xs text-faint truncate"
                   title={agent.worktree_path}
                 >
-                  {agent.sort_order === 0 ? "主检出：" : "Worktree："}
+                  {agent.sort_order === 0
+                    ? translate("mainCheckout")
+                    : translate("worktree")}
                   {agent.worktree_path}
                 </p>
                 <div className="mt-4 flex items-center gap-2">
@@ -2181,7 +2186,7 @@ function ProjectBoard({
                       className="btn approval-primary"
                       onClick={() => onOpenSession(session.id)}
                     >
-                      打开会话
+                      {translate("openSession")}
                     </button>
                   ) : (
                     <button
@@ -2203,14 +2208,14 @@ function ProjectBoard({
                           .catch(onError)
                       }
                     >
-                      启动会话
+                      {translate("startSession")}
                     </button>
                   )}
                   <button
                     className="btn"
                     onClick={() => setMemberForm({ mode: "edit", agent })}
                   >
-                    编辑
+                    {translate("edit")}
                   </button>
                   <button
                     className="btn"
@@ -2221,14 +2226,14 @@ function ProjectBoard({
                       }).catch(onError)
                     }
                   >
-                    另存 Agent
+                    {translate("saveAgent")}
                   </button>
                   {agent.sort_order !== 0 && (
                     <button
                       className="btn"
                       onClick={() => void deleteMember(agent)}
                     >
-                      删除
+                      {translate("delete")}
                     </button>
                   )}
                 </div>
@@ -2239,7 +2244,7 @@ function ProjectBoard({
                       className="btn mt-2"
                       onClick={() => void deleteMember(agent, true)}
                     >
-                      强制删除
+                      {translate("forceDelete")}
                     </button>
                   </div>
                 )}
