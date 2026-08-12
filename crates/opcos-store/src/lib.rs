@@ -1334,6 +1334,18 @@ pub trait SessionStore {
         call_id: &str,
         result: &serde_json::Value,
     ) -> Result<(), StoreError>;
+    fn mark_tool_call_dispatch_attempted(
+        &self,
+        session_id: &str,
+        message_sequence: i64,
+        call_id: &str,
+    ) -> Result<(), StoreError>;
+    fn tool_call_dispatch_attempted(
+        &self,
+        session_id: &str,
+        message_sequence: i64,
+        call_id: &str,
+    ) -> Result<bool, StoreError>;
     fn save_pending(&self, pending: &PendingRecord) -> Result<(), StoreError>;
     fn load_pending(&self, session_id: &str) -> Result<Vec<PendingRecord>, StoreError>;
     fn delete_pending(&self, session_id: &str, call_id: &str) -> Result<(), StoreError>;
@@ -4334,6 +4346,7 @@ impl SqliteStore {
                name TEXT NOT NULL,
                arguments TEXT NOT NULL,
                result TEXT,
+               dispatch_attempted INTEGER NOT NULL DEFAULT 0,
                PRIMARY KEY(session_id, message_sequence, call_id)
              );
              CREATE TABLE IF NOT EXISTS grants (
@@ -4884,6 +4897,15 @@ impl SqliteStore {
                 .any(|column| column == "expires_at")
             {
                 connection.execute("ALTER TABLE grants ADD COLUMN expires_at TEXT", [])?;
+            }
+            if !table_columns(&connection, "tool_calls")?
+                .iter()
+                .any(|column| column == "dispatch_attempted")
+            {
+                connection.execute(
+                    "ALTER TABLE tool_calls ADD COLUMN dispatch_attempted INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )?;
             }
             connection.execute(
                 "UPDATE pending SET created_at=?1 WHERE created_at=''",
@@ -6243,11 +6265,25 @@ impl SessionStore for SqliteStore {
     }
 
     fn append_tool_call(&self, call: &ToolCallRecord) -> Result<(), StoreError> {
-        self.connection.lock().expect("sqlite mutex poisoned").execute(
-            "INSERT INTO tool_calls(session_id,message_sequence,call_id,name,arguments,result) VALUES (?1,?2,?3,?4,?5,?6)",
-            params![call.session_id, call.message_sequence, call.call_id, call.name,
-                serde_json::to_string(&call.arguments)?, call.result.as_ref().map(serde_json::to_string).transpose()?],
-        )?;
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "INSERT OR IGNORE INTO tool_calls(
+                session_id,message_sequence,call_id,name,arguments,result
+             ) VALUES (?1,?2,?3,?4,?5,?6)",
+                params![
+                    call.session_id,
+                    call.message_sequence,
+                    call.call_id,
+                    call.name,
+                    serde_json::to_string(&call.arguments)?,
+                    call.result
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?
+                ],
+            )?;
         Ok(())
     }
 
@@ -6263,6 +6299,43 @@ impl SessionStore for SqliteStore {
             params![session_id, message_sequence, call_id, serde_json::to_string(result)?],
         )?;
         Ok(())
+    }
+
+    fn mark_tool_call_dispatch_attempted(
+        &self,
+        session_id: &str,
+        message_sequence: i64,
+        call_id: &str,
+    ) -> Result<(), StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .execute(
+                "UPDATE tool_calls SET dispatch_attempted=1
+             WHERE session_id=?1 AND message_sequence=?2 AND call_id=?3",
+                params![session_id, message_sequence, call_id],
+            )?;
+        Ok(())
+    }
+
+    fn tool_call_dispatch_attempted(
+        &self,
+        session_id: &str,
+        message_sequence: i64,
+        call_id: &str,
+    ) -> Result<bool, StoreError> {
+        self.connection
+            .lock()
+            .expect("sqlite mutex poisoned")
+            .query_row(
+                "SELECT dispatch_attempted FROM tool_calls
+                 WHERE session_id=?1 AND message_sequence=?2 AND call_id=?3",
+                params![session_id, message_sequence, call_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|value| value.map(|value| value != 0).unwrap_or(false))
+            .map_err(StoreError::from)
     }
 
     fn save_pending(&self, pending: &PendingRecord) -> Result<(), StoreError> {

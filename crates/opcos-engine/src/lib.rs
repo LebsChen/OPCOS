@@ -139,6 +139,7 @@ pub enum ToolErrorCode {
     CapabilityUnknown,
     ToolNotDescribed,
     RepeatedFailedCall,
+    RecoveryRequired,
     Unclassified,
 }
 
@@ -1117,6 +1118,26 @@ where
             .map_err(|error| EngineError::Store(error.to_string()))
     }
 
+    pub fn mark_tool_call_dispatch_attempted(
+        &self,
+        message_sequence: i64,
+        call_id: &str,
+    ) -> Result<(), EngineError> {
+        self.store
+            .mark_tool_call_dispatch_attempted(&self.session_id, message_sequence, call_id)
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
+    pub fn tool_call_dispatch_attempted(
+        &self,
+        message_sequence: i64,
+        call_id: &str,
+    ) -> Result<bool, EngineError> {
+        self.store
+            .tool_call_dispatch_attempted(&self.session_id, message_sequence, call_id)
+            .map_err(|error| EngineError::Store(error.to_string()))
+    }
+
     pub fn set_external_session_id(
         &self,
         external_session_id: Option<&str>,
@@ -1190,6 +1211,7 @@ pub struct TurnEngine<P, S, E> {
     resolved_caps: Mutex<Option<Caps>>,
     limit_identity: Mutex<Option<(String, String, String)>>,
     interrupted: AtomicBool,
+    provider_silent: AtomicBool,
     steering: std::sync::Mutex<Vec<String>>,
     last_incoming_event_id: Mutex<Option<String>>,
     steering_waiters: SteeringWaiters,
@@ -1471,6 +1493,7 @@ where
             resolved_caps: Mutex::new(None),
             limit_identity: Mutex::new(None),
             interrupted: AtomicBool::new(false),
+            provider_silent: AtomicBool::new(false),
             steering: std::sync::Mutex::new(Vec::new()),
             last_incoming_event_id: Mutex::new(None),
             steering_waiters: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1954,7 +1977,16 @@ has failed {} times and the last error code was {}",
         record.count += 1;
         record.last_error_code = error_code;
     }
+    #[cfg(test)]
     async fn execute_tool_with_hooks(&self, call: &ToolCall) -> Value {
+        self.execute_tool_with_hooks_for_sequence(0, call).await
+    }
+
+    async fn execute_tool_with_hooks_for_sequence(
+        &self,
+        assistant_sequence: i64,
+        call: &ToolCall,
+    ) -> Value {
         let pre = self
             .lifecycle_hooks(
                 "PreToolUse",
@@ -1972,7 +2004,9 @@ has failed {} times and the last error code was {}",
         } else if matches!(call.name.as_str(), "send_user_message" | "report_blocker") {
             self.execute_user_communication(call).await
         } else {
-            let result = self.execute_tool_streaming(call).await;
+            let result = self
+                .execute_tool_streaming_for_sequence(assistant_sequence, call)
+                .await;
             self.remember_tool_result(call, &result).await;
             result
         };
@@ -2008,12 +2042,16 @@ has failed {} times and the last error code was {}",
         result
     }
 
-    async fn execute_tool_interruptible(&self, call: &ToolCall) -> Value {
+    async fn execute_tool_interruptible_for_sequence(
+        &self,
+        assistant_sequence: i64,
+        call: &ToolCall,
+    ) -> Value {
         if self.interrupted.load(Ordering::SeqCst) {
             return classify_tool_error(call, "tool call interrupted");
         }
         tokio::select! {
-            result = self.execute_tool_with_hooks(call) => result,
+            result = self.execute_tool_with_hooks_for_sequence(assistant_sequence, call) => result,
             _ = self.interrupt_notify.notified() => classify_tool_error(call, "tool call interrupted"),
         }
     }
@@ -2376,7 +2414,17 @@ has failed {} times and the last error code was {}",
         })
     }
 
-    fn execute_proposed_plan(&self, call: &ToolCall) -> Value {
+    fn execute_proposed_plan_for_sequence(
+        &self,
+        assistant_sequence: i64,
+        call: &ToolCall,
+    ) -> Value {
+        if let Err(error) = self
+            .recorder
+            .mark_tool_call_dispatch_attempted(assistant_sequence, &call.id)
+        {
+            return classify_tool_error(call, error.to_string());
+        }
         let object = call.arguments.as_object();
         let title = object
             .and_then(|value| value.get("title"))
@@ -2502,6 +2550,7 @@ has failed {} times and the last error code was {}",
         self.begin_turn()?;
         self.clear_steering_queue();
         self.interrupted.store(false, Ordering::SeqCst);
+        self.provider_silent.store(false, Ordering::SeqCst);
         self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
         let result = async {
@@ -2527,6 +2576,7 @@ has failed {} times and the last error code was {}",
         self.begin_turn()?;
         self.clear_steering_queue();
         self.interrupted.store(false, Ordering::SeqCst);
+        self.provider_silent.store(false, Ordering::SeqCst);
         self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
         let result = async {
@@ -2608,6 +2658,7 @@ has failed {} times and the last error code was {}",
         self.begin_turn()?;
         self.clear_steering_queue();
         self.interrupted.store(false, Ordering::SeqCst);
+        self.provider_silent.store(false, Ordering::SeqCst);
         self.policy_denied.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
         let result = async { self.run_loop(self.provider_messages()?).await }.await;
@@ -2624,6 +2675,8 @@ has failed {} times and the last error code was {}",
     pub async fn resume_pending_turn(&self) -> Result<Option<AssistantTurn>, EngineError> {
         self.begin_turn()?;
         self.clear_steering_queue();
+        self.interrupted.store(false, Ordering::SeqCst);
+        self.provider_silent.store(false, Ordering::SeqCst);
         self.set_session_status("running", "none");
         self.policy_denied.store(false, Ordering::SeqCst);
         let _ = self
@@ -2658,7 +2711,7 @@ has failed {} times and the last error code was {}",
                     .and_then(Value::as_array)
                     .is_some_and(|calls| !calls.is_empty())
         }) else {
-            return Ok(None);
+            return Ok(Some(self.run_loop(self.provider_messages()?).await?));
         };
         let result_ids = messages
             .iter()
@@ -2690,10 +2743,99 @@ has failed {} times and the last error code was {}",
             })
             .collect::<Vec<_>>();
         if calls.is_empty() {
-            Ok(None)
+            return Ok(Some(self.run_loop(self.provider_messages()?).await?));
+        }
+        let pending_ids = self
+            .store
+            .load_pending(&self.session_id)
+            .map_err(|error| EngineError::Store(error.to_string()))?
+            .into_iter()
+            .map(|pending| pending.call_id)
+            .collect::<HashSet<_>>();
+        if let Some(pending) = calls.iter().find(|call| pending_ids.contains(&call.id)) {
+            return Err(EngineError::ApprovalPending(pending.id.clone()));
+        }
+        let mut safe_to_retry = Vec::new();
+        let mut blocked = Vec::new();
+        for call in &calls {
+            let dispatch_attempted = self
+                .store
+                .tool_call_dispatch_attempted(&self.session_id, assistant.sequence, &call.id)
+                .map_err(|error| EngineError::Store(error.to_string()))?;
+            let risk = if call.name == "propose_plan" {
+                ToolRisk::Write
+            } else {
+                tool_risk(&call.name)
+            };
+            if dispatch_attempted {
+                blocked.push((
+                    call.clone(),
+                    "execution_state_unknown",
+                    "The tool dispatch was attempted, but no durable result exists; execution may have completed.",
+                ));
+            } else if matches!(risk, ToolRisk::Read | ToolRisk::Search | ToolRisk::GitRead) {
+                safe_to_retry.push(call.clone());
+            } else {
+                blocked.push((
+                    call.clone(),
+                    "side_effecting_unresolved",
+                    "This side-effecting tool has no durable result and cannot be replayed safely.",
+                ));
+            }
+        }
+        if !blocked.is_empty() {
+            let blocked_results = blocked
+                .iter()
+                .map(|(call, classification, explanation)| {
+                    let mut result = structured_tool_error(
+                        "Recovery required: tool call was not replayed",
+                        ToolErrorEnvelope::new(
+                            ToolErrorCode::RecoveryRequired,
+                            *explanation,
+                            tool_error_target(call),
+                            "reconcile the external side effect or explicitly decide how to continue",
+                            ToolErrorRetry::No,
+                            None,
+                        ),
+                    );
+                    result["recovery"] = json!({
+                        "classification": classification,
+                        "dispatch_attempted": classification == &"execution_state_unknown",
+                        "result_persisted": false,
+                    });
+                    result["_opcos_not_executed"] = json!(true);
+                    (call.id.clone(), result)
+                })
+                .collect::<Vec<_>>();
+            let blocked_calls = blocked
+                .iter()
+                .map(|(call, _, _)| call.clone())
+                .collect::<Vec<_>>();
+            self.persist_tool_results(assistant.sequence, &blocked_calls, blocked_results)
+                .await?;
+            let _ = self
+                .working_event(
+                    "recovery_required",
+                    "lifecycle",
+                    json!({
+                        "classifications": blocked.iter().map(|(_, classification, _)| *classification).collect::<Vec<_>>(),
+                        "calls": blocked.iter().map(|(call, _, _)| json!({
+                            "call_id": call.id,
+                            "tool": call.name,
+                        })).collect::<Vec<_>>(),
+                    }),
+                )
+                .await;
+        }
+        if safe_to_retry.is_empty() {
+            if blocked.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(self.run_loop(self.provider_messages()?).await?))
+            }
         } else {
             let sequence = assistant.sequence;
-            for call in &calls {
+            for call in &safe_to_retry {
                 self.store
                     .append_tool_call(&opcos_store::ToolCallRecord {
                         session_id: self.session_id.clone(),
@@ -2705,7 +2847,7 @@ has failed {} times and the last error code was {}",
                     })
                     .map_err(|error| EngineError::Store(error.to_string()))?;
             }
-            self.execute_tools(sequence, &calls).await?;
+            self.execute_tools(sequence, &safe_to_retry).await?;
             Ok(Some(self.run_loop(self.provider_messages()?).await?))
         }
     }
@@ -2744,6 +2886,7 @@ has failed {} times and the last error code was {}",
 
     fn turn_status<T>(&self, result: &Result<T, EngineError>) -> (&'static str, &'static str) {
         let (run_state, stop_reason) = match result {
+            Ok(_) if self.provider_silent.load(Ordering::SeqCst) => ("error", "provider_silent"),
             Ok(_) => ("idle", "finished"),
             Err(EngineError::ApprovalPending(call_id)) => {
                 let waiting_for_user = self
@@ -3060,9 +3203,10 @@ has failed {} times and the last error code was {}",
                     "ask_user must be handled by the engine pending mechanism",
                 )
             } else if target.tool == "propose_plan" {
-                self.execute_proposed_plan(&target_call)
+                self.execute_proposed_plan_for_sequence(message_sequence, &target_call)
             } else {
-                self.execute_tool_streaming(&target_call).await
+                self.execute_tool_streaming_for_sequence(message_sequence, &target_call)
+                    .await
             }
         } else {
             classify_tool_error(&target_call, "tool call denied by user")
@@ -3479,6 +3623,17 @@ has failed {} times and the last error code was {}",
             }
             match provider_result {
                 Ok(turn) => {
+                    let provider_silent = is_provider_silent(&turn);
+                    self.provider_silent
+                        .store(provider_silent, Ordering::SeqCst);
+                    if provider_silent {
+                        self.notice(
+                            "provider_silent",
+                            "Provider returned a successful turn without text, reasoning, or tool calls"
+                                .into(),
+                        )
+                        .await?;
+                    }
                     if let Some(reasoning) =
                         partial.reasoning.as_deref().or(turn.reasoning.as_deref())
                     {
@@ -4010,6 +4165,7 @@ has failed {} times and the last error code was {}",
 
     async fn execute_tool_once(
         &self,
+        assistant_sequence: i64,
         call: &ToolCall,
         context: &ToolDispatchContext,
     ) -> Result<ToolDispatchResult, EngineError> {
@@ -4293,10 +4449,20 @@ has failed {} times and the last error code was {}",
                 }
                 if call.name == "tool_script" {
                     return Ok(ToolDispatchResult::Completed(
-                        self.execute_tool_script(call).await,
+                        self.execute_tool_script_for_sequence(assistant_sequence, call)
+                            .await,
                     ));
                 }
                 let previous = if matches!(call.name.as_str(), "write_file" | "edit_file") {
+                    if let Err(error) = self
+                        .recorder
+                        .mark_tool_call_dispatch_attempted(assistant_sequence, &call.id)
+                    {
+                        return Ok(ToolDispatchResult::PreflightError(classify_tool_error(
+                            call,
+                            error.to_string(),
+                        )));
+                    }
                     self.executor
                         .execute(
                             "read_file",
@@ -4309,9 +4475,10 @@ has failed {} times and the last error code was {}",
                     None
                 };
                 let result = if call.name == "propose_plan" {
-                    self.execute_proposed_plan(call)
+                    self.execute_proposed_plan_for_sequence(assistant_sequence, call)
                 } else {
-                    self.execute_tool_interruptible(call).await
+                    self.execute_tool_interruptible_for_sequence(assistant_sequence, call)
+                        .await
                 };
                 if matches!(call.name.as_str(), "write_file" | "edit_file")
                     && result.get("error").is_none()
@@ -4359,13 +4526,23 @@ has failed {} times and the last error code was {}",
 
     fn execute_tool_once_boxed<'a>(
         &'a self,
+        assistant_sequence: i64,
         call: &'a ToolCall,
         context: &'a ToolDispatchContext,
     ) -> Pin<Box<dyn Future<Output = Result<ToolDispatchResult, EngineError>> + Send + 'a>> {
-        Box::pin(self.execute_tool_once(call, context))
+        Box::pin(self.execute_tool_once(assistant_sequence, call, context))
     }
 
+    #[cfg(test)]
     async fn execute_tool_script(&self, call: &ToolCall) -> Value {
+        self.execute_tool_script_for_sequence(0, call).await
+    }
+
+    async fn execute_tool_script_for_sequence(
+        &self,
+        assistant_sequence: i64,
+        call: &ToolCall,
+    ) -> Value {
         let limits = match tool_script_limits(&call.arguments) {
             Ok(limits) => limits,
             Err(error) => {
@@ -4381,6 +4558,7 @@ has failed {} times and the last error code was {}",
             }
         };
         self.execute_tool_script_with_limits(
+            assistant_sequence,
             call,
             limits.max_calls,
             limits.max_stdout_bytes,
@@ -4391,6 +4569,7 @@ has failed {} times and the last error code was {}",
 
     async fn execute_tool_script_with_limits(
         &self,
+        assistant_sequence: i64,
         call: &ToolCall,
         max_calls: usize,
         max_stdout_bytes: usize,
@@ -4514,12 +4693,32 @@ has failed {} times and the last error code was {}",
                                 "arguments": audit_arguments,
                             }),
                         );
+                        let child_record = opcos_store::ToolCallRecord {
+                            session_id: self.session_id.clone(),
+                            message_sequence: assistant_sequence,
+                            call_id: child_call.id.clone(),
+                            name: child_call.name.clone(),
+                            arguments: child_call.arguments.clone(),
+                            result: None,
+                        };
+                        if let Err(error) = self.store.append_tool_call(&child_record) {
+                            stopped_reason = "dispatch_error";
+                            ScriptResponse::Abort(json!({
+                                "error": error.to_string(),
+                                "tool": child_call.name,
+                            }))
+                        } else {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         let result = tokio::time::timeout(
                             remaining,
                             async {
                                 let _active = self.track_tool_calls(std::slice::from_ref(&child_call));
-                                self.execute_tool_once_boxed(&child_call, &context).await
+                                self.execute_tool_once_boxed(
+                                    assistant_sequence,
+                                    &child_call,
+                                    &context,
+                                )
+                                .await
                             },
                         )
                         .await;
@@ -4561,6 +4760,12 @@ has failed {} times and the last error code was {}",
                             Ok(Ok(ToolDispatchResult::Completed(mut value)))
                             | Ok(Ok(ToolDispatchResult::PreflightError(mut value))) => {
                                 self.secret_scrubber.scrub(&mut value);
+                                let _ = self.store.complete_tool_call(
+                                    &self.session_id,
+                                    assistant_sequence,
+                                    &child_call.id,
+                                    &value,
+                                );
                                 let _ = self.working_event(
                                     "tool_script_call_completed",
                                     "script",
@@ -4585,8 +4790,24 @@ has failed {} times and the last error code was {}",
                                 );
                                 ScriptResponse::Result(value)
                             }
-                            Ok(Ok(ToolDispatchResult::ScriptAbort(value))) => {
+                            Ok(Ok(ToolDispatchResult::ScriptAbort(mut value))) => {
                                 stopped_reason = "approval_required";
+                                let _ = self.store.complete_tool_call(
+                                    &self.session_id,
+                                    assistant_sequence,
+                                    &child_call.id,
+                                    &value,
+                                );
+                                if let Some(object) = value.as_object_mut() {
+                                    object.insert(
+                                        "recovery".into(),
+                                        json!({
+                                            "classification": "side_effecting_unresolved",
+                                            "dispatch_attempted": false,
+                                            "result_persisted": false,
+                                        }),
+                                    );
+                                }
                                 ScriptResponse::Abort(value)
                             }
                             Ok(Ok(ToolDispatchResult::DeferredReadonly))
@@ -4595,8 +4816,14 @@ has failed {} times and the last error code was {}",
                                 ScriptResponse::Abort(json!({
                                     "error": "tool dispatch returned an unsupported script state",
                                     "tool": child_call.name,
+                                    "recovery": {
+                                        "classification": "side_effecting_unresolved",
+                                        "dispatch_attempted": false,
+                                        "result_persisted": false,
+                                    },
                                 }))
                             }
+                        }
                         }
                     };
                     let abort_response = matches!(&response, ScriptResponse::Abort(_));
@@ -4695,7 +4922,10 @@ has failed {} times and the last error code was {}",
                 results[index] = Some(classify_tool_error(call, "tool call interrupted"));
                 continue;
             }
-            match self.execute_tool_once(call, &context).await? {
+            match self
+                .execute_tool_once(assistant_sequence, call, &context)
+                .await?
+            {
                 ToolDispatchResult::Completed(result)
                 | ToolDispatchResult::PreflightError(result) => {
                     results[index] = Some(result);
@@ -4712,7 +4942,12 @@ has failed {} times and the last error code was {}",
                 } => {
                     let completed_reads = futures_util::future::join_all(readonly.drain(..).map(
                         |(read_index, read_call): (usize, &ToolCall)| async move {
-                            let result = self.execute_tool_interruptible(read_call).await;
+                            let result = self
+                                .execute_tool_interruptible_for_sequence(
+                                    assistant_sequence,
+                                    read_call,
+                                )
+                                .await;
                             (read_index, result)
                         },
                     ))
@@ -4759,7 +4994,9 @@ has failed {} times and the last error code was {}",
         }
         let readonly_results =
             futures_util::future::join_all(readonly.into_iter().map(|(index, call)| async move {
-                let result = self.execute_tool_interruptible(call).await;
+                let result = self
+                    .execute_tool_interruptible_for_sequence(assistant_sequence, call)
+                    .await;
                 (index, result)
             }))
             .await;
@@ -4793,9 +5030,24 @@ has failed {} times and the last error code was {}",
             .collect())
     }
 
+    #[cfg(test)]
     async fn execute_tool_streaming(&self, call: &ToolCall) -> Value {
+        self.execute_tool_streaming_for_sequence(0, call).await
+    }
+
+    async fn execute_tool_streaming_for_sequence(
+        &self,
+        assistant_sequence: i64,
+        call: &ToolCall,
+    ) -> Value {
         if let Some(result) = self.execute_recording_tool(call).await {
             return result;
+        }
+        if let Err(error) = self
+            .recorder
+            .mark_tool_call_dispatch_attempted(assistant_sequence, &call.id)
+        {
+            return classify_tool_error(call, error.to_string());
         }
         let emitted = Arc::new(AtomicUsize::new(0));
         let truncated = Arc::new(AtomicBool::new(false));
@@ -6039,6 +6291,18 @@ fn run_tool_script(
         .eval::<Dynamic>(script)
         .map(|_| ())
         .map_err(|error| error.to_string())
+}
+
+fn is_provider_silent(turn: &AssistantTurn) -> bool {
+    turn.text
+        .as_deref()
+        .is_none_or(|text| text.trim().is_empty())
+        && turn
+            .reasoning
+            .as_deref()
+            .is_none_or(|reasoning| reasoning.trim().is_empty())
+        && turn.tool_calls.is_empty()
+        && turn.finish_reason.is_none()
 }
 
 fn tool_risk(name: &str) -> ToolRisk {
@@ -7766,6 +8030,7 @@ mod tests {
         );
         let calls = engine
             .execute_tool_script_with_limits(
+                0,
                 &ToolCall {
                     id: "script-calls".into(),
                     name: "tool_script".into(),
@@ -7782,6 +8047,7 @@ mod tests {
         let text = "x".repeat(1000);
         let stdout = engine
             .execute_tool_script_with_limits(
+                0,
                 &ToolCall {
                     id: "script-stdout".into(),
                     name: "tool_script".into(),
@@ -7810,6 +8076,7 @@ mod tests {
         );
         let deadline = deadline_engine
             .execute_tool_script_with_limits(
+                0,
                 &ToolCall {
                     id: "script-deadline".into(),
                     name: "tool_script".into(),
@@ -7828,6 +8095,37 @@ mod tests {
                 .iter()
                 .any(|event| event.kind == "tool_script_call_abandoned")
         );
+    }
+
+    #[tokio::test]
+    async fn script_abort_records_conservative_recovery_classification() {
+        let engine = TurnEngine::new(
+            FakeProvider,
+            Arc::new(SqliteStore::open_in_memory().unwrap()),
+            Arc::new(FakeTools),
+            "script-abort-recovery",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+        let result = engine
+            .execute_tool_script_for_sequence(
+                1,
+                &ToolCall {
+                    id: "script-abort".into(),
+                    name: "tool_script".into(),
+                    arguments: json!({
+                        "script": r#"tool_call("write_file", #{path: "x", content: "changed"});"#
+                    }),
+                },
+            )
+            .await;
+        assert_eq!(result["stopped_reason"], "approval_required");
+        assert_eq!(
+            result["recovery"]["classification"],
+            "side_effecting_unresolved"
+        );
+        assert_eq!(result["recovery"]["dispatch_attempted"], false);
     }
 
     #[tokio::test]
@@ -8179,6 +8477,65 @@ mod tests {
             } else {
                 Ok(json!("ok"))
             }
+        }
+    }
+
+    struct InspectingTools {
+        store: Arc<SqliteStore>,
+        observed_dispatch: Arc<std::sync::Mutex<Option<bool>>>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for InspectingTools {
+        async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
+            let attempted = self
+                .store
+                .tool_call_dispatch_attempted("dispatch-order", 1, "dispatch")
+                .map_err(|error| error.to_string())?;
+            *self.observed_dispatch.lock().unwrap() = Some(attempted);
+            Ok(json!("ok"))
+        }
+    }
+
+    struct CountingTools {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for CountingTools {
+        async fn execute(&self, _: &str, _: Value) -> Result<Value, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(json!("unexpected execution"))
+        }
+    }
+
+    #[derive(Clone)]
+    struct SuccessfulEmptyProvider {
+        finish_reason: Option<String>,
+    }
+
+    #[async_trait]
+    impl Provider for SuccessfulEmptyProvider {
+        async fn complete(&self, _: ProviderRequest) -> Result<AssistantTurn, ProviderError> {
+            Ok(AssistantTurn {
+                finish_reason: self.finish_reason.clone(),
+                ..Default::default()
+            })
+        }
+
+        async fn stream(
+            &self,
+            _: ProviderRequest,
+            _: mpsc::Sender<StreamChunk>,
+        ) -> Result<AssistantTurn, ProviderError> {
+            Ok(AssistantTurn {
+                finish_reason: self.finish_reason.clone(),
+                ..Default::default()
+            })
+        }
+
+        fn capabilities(&self, _: &str) -> Caps {
+            Caps::default()
         }
     }
 
@@ -12112,6 +12469,443 @@ mod tests {
                     .and_then(Value::as_str)
                     == Some("orphan")
         }));
+    }
+
+    #[tokio::test]
+    async fn successful_provider_silence_has_distinct_durable_stop_reason() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        for (session_id, finish_reason, expected) in [
+            ("silent", None, "provider_silent"),
+            ("empty", Some("stop".into()), "finished"),
+        ] {
+            store
+                .save_session(&SessionRecord {
+                    session_id: session_id.into(),
+                    workspace: "/workspace".into(),
+                    model: "fake".into(),
+                    mode: "Auto".into(),
+                    harness: "builtin".into(),
+                    title: session_id.into(),
+                    extra_roots: vec![],
+                    grants: json!({}),
+                    pinned: false,
+                    archived: false,
+                    origin: None,
+                    origin_label: None,
+                    compaction: json!({}),
+                    host_id: "local".into(),
+                    provider: None,
+                    external_session_id: None,
+                    run_state: "idle".into(),
+                    stop_reason: "none".into(),
+                    terminal_cause: None,
+                    provider_finish_reason: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    last_active_at: Utc::now(),
+                    sleep_state: "awake".into(),
+                    slept_at: None,
+                    project_id: None,
+                    agent_id: None,
+                })
+                .unwrap();
+            let engine = TurnEngine::new(
+                SuccessfulEmptyProvider { finish_reason },
+                store.clone(),
+                Arc::new(FakeTools),
+                session_id,
+                "/workspace",
+                PermissionMode::Auto,
+                "fake",
+            );
+            engine.submit_text("empty").await.unwrap();
+            assert_eq!(
+                store.load_session(session_id).unwrap().unwrap().stop_reason,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_attempt_is_durable_before_executor_invocation() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "dispatch-order".into(),
+                message_sequence: 1,
+                call_id: "dispatch".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"x"}),
+                result: None,
+            })
+            .unwrap();
+        let observed_dispatch = Arc::new(std::sync::Mutex::new(None));
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(InspectingTools {
+                store: store.clone(),
+                observed_dispatch: observed_dispatch.clone(),
+            }),
+            "dispatch-order",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine
+            .execute_tools(
+                1,
+                &[ToolCall {
+                    id: "dispatch".into(),
+                    name: "read_file".into(),
+                    arguments: json!({"path":"x"}),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(*observed_dispatch.lock().unwrap(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn unresolved_mutating_recovery_reports_without_replaying() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .append_message(&StoredMessage {
+                session_id: "unsafe-recovery".into(),
+                sequence: 1,
+                role: "assistant".into(),
+                content: json!({"role":"assistant","tool_calls":[
+                    {"id":"write","name":"write_file","arguments":{"path":"x","content":"changed"}}
+                ]}),
+                display_only: false,
+            })
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(CountingTools {
+                calls: calls.clone(),
+            }),
+            "unsafe-recovery",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine.resume_pending_turn().await.unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let messages = store.load_messages("unsafe-recovery").unwrap();
+        let result = messages
+            .iter()
+            .find(|message| message.role == "tool")
+            .and_then(|message| message.content.pointer("/content/0/content/0/text"))
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(result.contains("side_effecting_unresolved"));
+        assert!(result.contains("cannot be replayed safely"));
+    }
+
+    #[tokio::test]
+    async fn mixed_recovery_persists_safe_and_blocked_results() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .save_session(&SessionRecord {
+                session_id: "mixed-recovery".into(),
+                workspace: "/workspace".into(),
+                model: "fake".into(),
+                mode: "Auto".into(),
+                harness: "builtin".into(),
+                title: "mixed-recovery".into(),
+                extra_roots: vec![],
+                grants: json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: json!({}),
+                host_id: "local".into(),
+                provider: None,
+                external_session_id: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                terminal_cause: None,
+                provider_finish_reason: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                last_active_at: Utc::now(),
+                sleep_state: "awake".into(),
+                slept_at: None,
+                project_id: None,
+                agent_id: None,
+            })
+            .unwrap();
+        store
+            .append_message(&StoredMessage {
+                session_id: "mixed-recovery".into(),
+                sequence: 1,
+                role: "assistant".into(),
+                content: json!({"role":"assistant","tool_calls":[
+                    {"id":"read","name":"read_file","arguments":{"path":"x"}},
+                    {"id":"write","name":"write_file","arguments":{"path":"x","content":"changed"}}
+                ]}),
+                display_only: false,
+            })
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(CountingTools {
+                calls: calls.clone(),
+            }),
+            "mixed-recovery",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+
+        engine.resume_pending_turn().await.unwrap().unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let messages = store.load_messages("mixed-recovery").unwrap();
+        let results = messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .filter_map(|message| {
+                Some((
+                    message
+                        .content
+                        .pointer("/content/0/tool_use_id")?
+                        .as_str()?,
+                    message
+                        .content
+                        .pointer("/content/0/content/0/text")?
+                        .as_str()?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results
+                .iter()
+                .any(|(id, result)| { *id == "read" && result.contains("unexpected execution") })
+        );
+        assert!(results.iter().any(|(id, result)| {
+            *id == "write" && result.contains("side_effecting_unresolved")
+        }));
+        let events = store.load_session_events("mixed-recovery").unwrap();
+        assert!(events.iter().any(|event| {
+            event.event["type"] == "read_file_completed"
+                && event.event["working_event"]["payload"]["call_id"] == "read"
+        }));
+        assert!(!events.iter().any(|event| {
+            event.event["type"] == "write_file_completed"
+                && event.event["working_event"]["payload"]["call_id"] == "write"
+        }));
+    }
+
+    #[tokio::test]
+    async fn dispatched_read_recovery_reports_unknown_without_replaying() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .append_message(&StoredMessage {
+                session_id: "dispatched-read-recovery".into(),
+                sequence: 1,
+                role: "assistant".into(),
+                content: json!({"role":"assistant","tool_calls":[
+                    {"id":"read","name":"read_file","arguments":{"path":"x"}}
+                ]}),
+                display_only: false,
+            })
+            .unwrap();
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "dispatched-read-recovery".into(),
+                message_sequence: 1,
+                call_id: "read".into(),
+                name: "read_file".into(),
+                arguments: json!({"path":"x"}),
+                result: None,
+            })
+            .unwrap();
+        store
+            .mark_tool_call_dispatch_attempted("dispatched-read-recovery", 1, "read")
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(CountingTools {
+                calls: calls.clone(),
+            }),
+            "dispatched-read-recovery",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+
+        engine.resume_pending_turn().await.unwrap().unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let messages = store.load_messages("dispatched-read-recovery").unwrap();
+        let result = messages
+            .iter()
+            .find(|message| message.role == "tool")
+            .and_then(|message| message.content.pointer("/content/0/content/0/text"))
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(result.contains("execution_state_unknown"));
+        assert!(result.contains("execution may have completed"));
+    }
+
+    #[tokio::test]
+    async fn approved_dispatch_crash_is_not_replayed_during_recovery() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .save_session(&SessionRecord {
+                session_id: "approved-crash".into(),
+                workspace: "/workspace".into(),
+                model: "fake".into(),
+                mode: "Interactive".into(),
+                harness: "builtin".into(),
+                title: "approved-crash".into(),
+                extra_roots: vec![],
+                grants: json!({}),
+                pinned: false,
+                archived: false,
+                origin: None,
+                origin_label: None,
+                compaction: json!({}),
+                host_id: "local".into(),
+                provider: None,
+                external_session_id: None,
+                run_state: "idle".into(),
+                stop_reason: "none".into(),
+                terminal_cause: None,
+                provider_finish_reason: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                last_active_at: Utc::now(),
+                sleep_state: "awake".into(),
+                slept_at: None,
+                project_id: None,
+                agent_id: None,
+            })
+            .unwrap();
+        store
+            .append_message(&StoredMessage {
+                session_id: "approved-crash".into(),
+                sequence: 1,
+                role: "assistant".into(),
+                content: json!({"role":"assistant","tool_calls":[
+                    {"id":"approved-write","name":"write_file","arguments":{"path":"x","content":"changed"}}
+                ]}),
+                display_only: false,
+            })
+            .unwrap();
+        store
+            .save_pending(&PendingRecord {
+                session_id: "approved-crash".into(),
+                call_id: "approved-write".into(),
+                tool: "write_file".into(),
+                arguments: json!({"path":"x","content":"changed"}),
+                state: "pending".into(),
+            })
+            .unwrap();
+        store
+            .take_pending("approved-crash", "approved-write")
+            .unwrap()
+            .unwrap();
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "approved-crash".into(),
+                message_sequence: 1,
+                call_id: "approved-write".into(),
+                name: "write_file".into(),
+                arguments: json!({"path":"x","content":"changed"}),
+                result: None,
+            })
+            .unwrap();
+        store
+            .mark_tool_call_dispatch_attempted("approved-crash", 1, "approved-write")
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(CountingTools {
+                calls: calls.clone(),
+            }),
+            "approved-crash",
+            "/workspace",
+            PermissionMode::Interactive,
+            "fake",
+        );
+
+        engine.resume_pending_turn().await.unwrap().unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let messages = store.load_messages("approved-crash").unwrap();
+        let result = messages
+            .iter()
+            .find(|message| message.role == "tool")
+            .and_then(|message| message.content.pointer("/content/0/content/0/text"))
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(result.contains("execution_state_unknown"));
+        assert!(result.contains("execution may have completed"));
+    }
+
+    #[tokio::test]
+    async fn dispatched_unresolved_recovery_reports_unknown_without_replaying() {
+        let store = Arc::new(SqliteStore::open_in_memory().unwrap());
+        store
+            .append_message(&StoredMessage {
+                session_id: "unknown-recovery".into(),
+                sequence: 1,
+                role: "assistant".into(),
+                content: json!({"role":"assistant","tool_calls":[
+                    {"id":"remote","name":"git_push","arguments":{"remote":"origin"}}
+                ]}),
+                display_only: false,
+            })
+            .unwrap();
+        store
+            .append_tool_call(&opcos_store::ToolCallRecord {
+                session_id: "unknown-recovery".into(),
+                message_sequence: 1,
+                call_id: "remote".into(),
+                name: "git_push".into(),
+                arguments: json!({"remote":"origin"}),
+                result: None,
+            })
+            .unwrap();
+        store
+            .mark_tool_call_dispatch_attempted("unknown-recovery", 1, "remote")
+            .unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let engine = TurnEngine::new(
+            FakeProvider,
+            store.clone(),
+            Arc::new(CountingTools {
+                calls: calls.clone(),
+            }),
+            "unknown-recovery",
+            "/workspace",
+            PermissionMode::Auto,
+            "fake",
+        );
+        engine.resume_pending_turn().await.unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let messages = store.load_messages("unknown-recovery").unwrap();
+        let result = messages
+            .iter()
+            .find(|message| message.role == "tool")
+            .and_then(|message| message.content.pointer("/content/0/content/0/text"))
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(result.contains("execution_state_unknown"));
+        assert!(result.contains("execution may have completed"));
     }
 
     #[derive(Clone)]
