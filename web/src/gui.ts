@@ -369,7 +369,10 @@ export function noticeClass(kind: string): string {
 }
 
 export function redactApproval(value: unknown): string {
-  const text = JSON.stringify(value) ?? String(value ?? "");
+  const text =
+    typeof value === "string"
+      ? value
+      : (JSON.stringify(value) ?? String(value ?? ""));
   return text
     .replace(/Bearer\s+[^\s"]+/gi, "Bearer [redacted]")
     .replace(

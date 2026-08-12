@@ -165,6 +165,15 @@ const zhEnglishWordAllowlist = new Set([
   "Box",
   "Drive",
   "Cloud",
+  "ID",
+  "id",
+  "workspace",
+  "workspaces",
+  "md",
+  "devin",
+  "yaml",
+  "Checks",
+  "skills",
 ]);
 
 describe("i18n source coverage", () => {
@@ -203,6 +212,29 @@ describe("i18n source coverage", () => {
         .replace(/(?:^|\s)[\w.-]+\.[A-Za-z0-9_-]+(?=\s|$|[),.;])/g, " ")
         .replace(/\/[\w./-]+/g, "");
       const words = normalized.match(/[A-Za-z]{3,}/g) || [];
+      const unexpected = words.filter(
+        (word) =>
+          !zhEnglishWordAllowlist.has(word) &&
+          !zhEnglishWordAllowlist.has(
+            word[0].toUpperCase() + word.slice(1).toLowerCase(),
+          ),
+      );
+      if (unexpected.length) violations.push(`${key}:${unexpected.join(",")}`);
+    }
+    expect(violations).toEqual([]);
+  });
+
+  it("scans every Chinese dictionary value for unapproved Latin words", () => {
+    const violations: string[] = [];
+    for (const [key, value] of Object.entries(messages.zh)) {
+      if (zhFreeTextKeyAllowlist.has(key)) continue;
+      const normalized = value
+        .replace(/\{[^}]*\}/g, "")
+        .replace(/https?:\/\/\S+/g, "")
+        .replace(/(?:^|\s)\.?[\w.-]+\/[\w./-]+/g, " ")
+        .replace(/(?:^|\s)[\w.-]+\.[A-Za-z0-9_-]+(?=\s|$|[),.;])/g, " ")
+        .replace(/\/[\w./-]+/g, "");
+      const words = normalized.match(/[A-Za-z]{2,}/g) || [];
       const unexpected = words.filter(
         (word) =>
           !zhEnglishWordAllowlist.has(word) &&
@@ -413,11 +445,49 @@ describe("i18n source coverage", () => {
     );
     expect(appSource).toMatch(/translateBackendValue\(workflow\.status\)/);
     expect(appSource).toMatch(/insightFieldLabel\(key\)/);
+    expect(appSource).toMatch(/translateBackendValue\(template\.kind\)/);
     expect(appSource).not.toMatch(
       /translateBackendValue\(\s*projectAgentRosterHost/,
     );
     expect(appSource).not.toMatch(
       /translateBackendValue\(\s*(?:selected\.)?(?:host_name|workspace|model|name|branch|worktree|worktree_path)/,
+    );
+  });
+
+  it("keeps backend enum mappings exhaustive and preserves unknown tokens", () => {
+    const requiredValues = [
+      "finished",
+      "harness_error",
+      "internal_error",
+      "interrupted_by_user",
+      "waiting_for_approval",
+      "none",
+      "agent-template",
+      "command-template",
+      "team-template",
+    ];
+    for (const value of requiredValues) {
+      expect(backendValueKeys[value]).toBeTruthy();
+    }
+    const i18nSource = readFileSync(`${sourceRoot}i18n.ts`, "utf8");
+    expect(i18nSource).toContain("return key ? translate(key) : text;");
+  });
+
+  it("does not JSON-stringify strings in toast or error display paths", () => {
+    const guiSource = readFileSync(`${sourceRoot}gui.ts`, "utf8");
+    const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
+    expect(guiSource).toMatch(
+      /typeof value === "string"[\s\S]*?\? value[\s\S]*JSON\.stringify/,
+    );
+    expect(appSource).not.toMatch(
+      /showErrorToast[\s\S]*JSON\.stringify\(\s*message/,
+    );
+  });
+
+  it("formats insight durations with their millisecond unit", () => {
+    const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
+    expect(appSource).toMatch(
+      /key === "duration_ms"[\s\S]*return `\$\{value\} ms`/,
     );
   });
 

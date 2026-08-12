@@ -974,6 +974,8 @@ export const messages: Record<Locale, Record<string, string>> = {
       "OPCOS maps Outposts to registered long-lived Local/RVM hosts; this list shows hosts without inventing separate Outpost resources.",
     commandManagementDescription:
       "System commands can be overridden or reset; Custom commands can be added, edited, and deleted.",
+    commandTemplate: "Command template",
+    teamTemplate: "Team template",
     unknownCapabilities: "capabilities unknown",
     sourceLabel: "Source:",
     liveApiDiscovery: "Live API discovery",
@@ -1010,6 +1012,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     waitingForApproval: "Waiting for approval",
     finished: "Finished",
     interrupted: "Interrupted",
+    interruptedByUser: "Interrupted by user",
     interruptedByCrash: "Interrupted (application exited)",
     hostUnavailable: "Host unavailable",
     providerError: "Model service error",
@@ -2072,7 +2075,9 @@ export const messages: Record<Locale, Record<string, string>> = {
     outpostsDescription:
       "OPCOS 将远程据点映射为已登记的长期主机（本地环境/RVM）；这里展示主机清单，不额外虚构独立据点资源。",
     commandManagementDescription:
-      "System 命令可覆盖或 Reset；Custom 命令可添加、编辑和删除。",
+      "系统命令可覆盖或重置；自定义命令可添加、编辑和删除。",
+    commandTemplate: "命令模板",
+    teamTemplate: "团队模板",
     unknownCapabilities: "能力未知",
     sourceLabel: "来源：",
     liveApiDiscovery: "API 实时发现",
@@ -2107,6 +2112,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     waitingForApproval: "等审批",
     finished: "已完成",
     interrupted: "已中断",
+    interruptedByUser: "用户中断",
     interruptedByCrash: "已中断（应用退出）",
     hostUnavailable: "主机不可用",
     providerError: "模型服务错误",
@@ -2271,6 +2277,15 @@ export const backendValueKeys: Record<string, string> = {
   success: "completed",
   test: "test",
   devops: "devOps",
+  "agent-template": "agentTemplate",
+  "command-template": "commandTemplate",
+  "team-template": "teamTemplate",
+  finished: "finished",
+  harness_error: "harnessError",
+  internal_error: "internalError",
+  interrupted_by_user: "interruptedByUser",
+  waiting_for_approval: "waitingForApproval",
+  none: "none",
   unknown: "unknownValue",
 };
 
@@ -2278,7 +2293,7 @@ export function translateBackendValue(value: unknown): string {
   const text = String(value ?? "").trim();
   if (!text) return translate("unknownValue");
   const key = backendValueKeys[text.toLowerCase()];
-  return key ? translate(key) : translate("unknownValue");
+  return key ? translate(key) : text;
 }
 
 const backendErrorKeys: Record<string, string> = {

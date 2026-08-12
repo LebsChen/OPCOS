@@ -5962,7 +5962,7 @@ function ManageSections({
                         </small>
                       </div>
                       <span className="max-w-[45%] break-words text-right text-xs text-muted">
-                        {template.kind}
+                        {translateBackendValue(template.kind)}
                       </span>
                     </div>
                     <p className="mt-2 break-words text-sm text-muted">
@@ -10043,6 +10043,7 @@ function insightFieldLabel(key: string): string {
 }
 
 function formatInsightValue(key: string, value: unknown): string {
+  if (key === "duration_ms" && typeof value === "number") return `${value} ms`;
   if (
     key === "token_usage" &&
     value &&

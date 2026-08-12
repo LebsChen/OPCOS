@@ -8188,15 +8188,15 @@ description: 为新行为和缺陷修复设计覆盖正常、失败及边界条�
         (
             "template-command-verify",
             "/verify",
-            "展开为一份明确的本地验证请求；命令本身不执行任何动作。",
-            "请按 {{scope}} 范围检查当前仓库：先确认变更范围，再运行项目已有的格式化、静态检查、类型检查、构建和测试门禁。只报告实际执行结果，不把未运行的检查写成通过。",
+            "Expand into a clear local verification request; the command itself performs no actions.",
+            "Check the current repository within {{scope}}: confirm the change scope first, then run the project's existing formatting, static checks, type checks, build, and test gates. Report only commands actually run; never claim an unrun check passed.",
             json!([{"name":"scope","type":"string","required":true}]),
         ),
         (
             "template-command-review",
             "/review-change",
-            "展开为一份聚焦风险和证据的代码审查请求；命令本身不执行任何动作。",
-            "请审查当前变更，重点检查 {{focus}}、错误路径、边界条件、凭据安全和测试覆盖。按文件位置给出可复现证据；没有问题时说明检查过的风险面。",
+            "Expand into a focused code review request about risks and evidence; the command itself performs no actions.",
+            "Review the current change, focusing on {{focus}}, error paths, boundary conditions, credential safety, and test coverage. Give reproducible evidence with file locations; if there are no issues, state which risk areas were checked.",
             json!([{"name":"focus","type":"string","required":true}]),
         ),
     ];
