@@ -21,6 +21,9 @@
 structured code 和参数，前端负责把已知 code 映射到当前 locale。参数中的 provider
 名、host 详情、路径、model ID 和错误细节保持原文，不作为 UI dictionary 的 key。
 
-现有回归扫描会检查 `translate("literal")`，并对 `translate(variable)` 做有限
-分析；动态拼接或其它间接 translation call 可能绕过该扫描，这是已知盲区。新增或
-修改 UI 文案仍需在真实调用路径检查中英文显示。
+现有回归扫描会用正则检查源码中的 `translate("literal")`，并对少数已知动态来源
+做专门断言（例如确保 provider model suggestions 不被误传给
+`translate(providerModels[descriptor.name])`）。它不是对所有
+`translate(variable)` 调用的通用覆盖；动态拼接、未列入专门断言的变量来源或其它
+间接 translation call 可能绕过扫描，这是已知盲区。新增或修改 UI 文案仍需在真实
+渲染路径检查中英文显示。

@@ -24,7 +24,11 @@ stop_reason:  none | waiting_for_user | waiting_for_approval | finished
               | interrupted_by_user | host_unavailable | provider_error
               | policy_denied | context_exhausted | internal_error
               | max_iterations | idle_timeout
-terminal_cause: harness_error | ...
+terminal_cause: harness_error | host_unavailable | completed | user_interrupted
+                | provider_silent | waiting_for_user | waiting_for_approval
+                | provider_error | context_exhausted | internal_error
+                | tool_preflight_error | max_iterations | usage_limit
+                | policy_denied | model_stopped
 ```
 
 约束：
@@ -35,7 +39,12 @@ terminal_cause: harness_error | ...
 - `sleeping` 表示 idle 断连后的运行时释放，不等同于错误；store 会将休眠会话设为
   `stop_reason=idle_timeout`。
 - `terminal_cause` 保留更细的终止分类，例如 harness 初始化失败使用
-  `harness_error`；provider 的细节另存于 `provider_finish_reason`。
+  `harness_error`；provider 的协议细节另存于 `provider_finish_reason`。
+  上面列出的是当前可达写入路径确认过的 `terminal_cause` 字面量：
+  builtin engine 的终止状态会把对应的终止原因写入该列，ACP turn 还会写入
+  `model_stopped` / `completed` / `user_interrupted`。`interrupted_by_user` 是
+  `stop_reason` 的值，`idle_timeout` 也是 `stop_reason` 的值；休眠迁移会清空
+  `terminal_cause`，因此二者不属于这里的枚举。
 
 ### 3.2.1 Idle 断连
 
