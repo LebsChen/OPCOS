@@ -14,9 +14,8 @@ use opcos_engine::SecretScrubber;
 use opcos_engine::{
     AcpHarness, AcpHarnessConfig, AgentAutomationAction, AgentEngine, AgentRole, ArtifactReference,
     ArtifactRequest, ArtifactSink, BoundedWorkType, CapturedFrame, EngineError,
-    ExternalContextAttachment, Harness, LifecycleHook, LifecycleHookConfig, PreflightDecision,
-    RecordingSource, SessionRecorder, ToolExecutor, ToolOrigin, TurnEngine,
-    HookCommandOutput,
+    ExternalContextAttachment, Harness, HookCommandOutput, LifecycleHook, LifecycleHookConfig,
+    PreflightDecision, RecordingSource, SessionRecorder, ToolExecutor, ToolOrigin, TurnEngine,
     computer_use::{
         BestEffortScreenshotChangedVerifier, ComputerUseLoopConfig, ComputerUseStep,
         run_computer_use_loop,

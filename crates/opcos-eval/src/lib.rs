@@ -27,9 +27,9 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use opcos_engine::{
-    ApprovalOutcome, EngineError, LifecycleHook, LifecycleHookConfig, PreflightDecision,
-    ToolExecutor, TurnEngine, builtin_full_tool_catalog_tokens, builtin_tool_catalog_tokens,
-    builtin_tool_definition_tokens,
+    ApprovalOutcome, EngineError, HookCommandOutput, LifecycleHook, LifecycleHookConfig,
+    PreflightDecision, ToolExecutor, TurnEngine, builtin_full_tool_catalog_tokens,
+    builtin_tool_catalog_tokens, builtin_tool_definition_tokens,
 };
 use opcos_policy::PermissionMode;
 use opcos_provider::openai::OpenAiProvider;
@@ -691,14 +691,19 @@ impl ToolExecutor for FixtureTools {
         _command: &str,
         _input: Value,
         _timeout: Duration,
-    ) -> Result<Option<Value>, String> {
-        Ok(self.hook_context.as_ref().map(|context| {
-            json!({
-                "hookSpecificOutput": {
-                    "additionalContext": context
-                }
-            })
-        }))
+    ) -> Result<HookCommandOutput, String> {
+        Ok(HookCommandOutput::Json(
+            self.hook_context
+                .as_ref()
+                .map(|context| {
+                    json!({
+                        "hookSpecificOutput": {
+                            "additionalContext": context
+                        }
+                    })
+                })
+                .unwrap_or_else(|| json!({})),
+        ))
     }
 }
 
