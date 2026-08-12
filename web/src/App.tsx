@@ -7836,7 +7836,7 @@ function McpManage({
           <input
             value={serverName}
             onChange={(event) => setServerName(event.target.value)}
-            placeholder="Server name"
+            placeholder={translate("serverName")}
           />
           <select
             value={serverTransport}
@@ -7855,7 +7855,7 @@ function McpManage({
               <input
                 value={serverCommand}
                 onChange={(event) => setServerCommand(event.target.value)}
-                placeholder="Command"
+                placeholder={translate("commandInput")}
               />
               <textarea
                 value={serverArgs}
@@ -7870,9 +7870,7 @@ function McpManage({
                 rows={3}
               />
               <p className="text-xs text-slate-500 md:col-span-2">
-                Use environment entries for non-sensitive runtime settings.
-                Store bearer tokens in the secure token field below, not in
-                environment variables.
+                {translate("secureTokenNotice")}
               </p>
             </>
           ) : (
@@ -7887,7 +7885,7 @@ function McpManage({
             type="password"
             value={serverToken}
             onChange={(event) => setServerToken(event.target.value)}
-            placeholder="Bearer token (stored securely)"
+            placeholder={translate("bearerToken")}
           />
           <label className="flex items-center gap-2">
             <input
@@ -7905,7 +7903,7 @@ function McpManage({
                 setServerRequiresApproval(event.target.checked)
               }
             />
-            Require approval for tools
+            {translate("requireApprovalTools")}
           </label>
         </div>
         <div className="mt-3 flex gap-2">
@@ -7918,7 +7916,9 @@ function McpManage({
             }
             onClick={saveServer}
           >
-            {editingServerId ? "Save and verify" : "Create and verify"}
+            {editingServerId
+              ? translate("saveAndVerify")
+              : translate("createAndVerify")}
           </Button>
         </div>
       </section>
@@ -8093,7 +8093,9 @@ function McpManage({
             {prompts.map((prompt) => (
               <div className="integration-card" key={String(prompt.name)}>
                 <strong>{String(prompt.title || prompt.name)}</strong>
-                <small>{String(prompt.description || "MCP prompt")}</small>
+                <small>
+                  {String(prompt.description || translate("mcpPrompt"))}
+                </small>
                 {Array.isArray(prompt.arguments) &&
                   prompt.arguments.map((argument) => {
                     const argumentName = String(
@@ -8146,7 +8148,11 @@ function McpManage({
                 {JSON.stringify(resourcePreview, null, 2)}
               </pre>
             )}
-            <h4>Current context resources ({contextResources.length})</h4>
+            <h4>
+              {translate("currentContextResources", {
+                count: contextResources.length,
+              })}
+            </h4>
             {contextResources.map((resource) => (
               <div
                 className="inline-actions"
