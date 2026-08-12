@@ -175,6 +175,8 @@ GitHub 只有一个领域模型，多实例差异体现在「实例身份」上�
   结构化事件；
 - ACP harness 独立接入；OpenCode ACP 启动 recipe 随 builtin `acp-agent` 模板提供；
 - provider registry 和 API 动态模型发现/缓存；
+- 前端完整中英文 i18n 与语言切换；provider 的自定义 model ID 只要求非空，
+  内置模型列表是建议/默认值，不是封闭白名单；
 - global/project/repo/host/session 配置对象和 builtin preset；
 - `.agents/commands/*.md` 参数化 prompt command：只做纯文本展开，不执行
   shell/Git/MCP，只有用户/UI/slash command 能显式触发，模型不能自行调用；
@@ -268,9 +270,12 @@ Node/Vite 的版本提示或 chunk-size warning 不是成功构建的替代条�
 
 ## 发布
 
-发布产物在本地构建，由维护者上传 GitHub Releases。GitHub Actions 目前只是
-可查询的 CI 信号，不是发布路径。Linux 和 Windows 的 Tauri 构建命令以及产物
-路径见 `docs/` 和 `AGENTS.md`。
+正式发布使用 GitHub Actions 的 `Release bundles` workflow。它保留
+`workflow_dispatch`，并在推送匹配 `v*` 的 tag 时触发；`linux-bundle` 与
+`windows-bundle` 并行构建，分别产出未签名的 Linux AppImage/deb/rpm 和
+Windows NSIS `.exe`/MSI。tag 运行在两个 bundle job 成功后执行
+`publish-release`，下载两个 artifact 并将五个文件上传到同一个 GitHub Release。
+本地手工打包不是正式发布路径。
 
 ## 文档状态
 

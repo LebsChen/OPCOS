@@ -10,16 +10,18 @@
 | `save_host`       | `id?`, `name`, `url`, `token`                                    | `HostView`                                                                             | 已存在 host 不允许修改；secret 写入失败回滚 host。token 只进入 secret store。                                                                                              |
 | `test_host`       | `host_id`                                                        | `HostView`                                                                             | 认证失败与其它远程错误转为 `online=false, reason`，不是静默成功。                                                                                                          |
 | `delete_host`     | `host_id`                                                        | `()`                                                                                   | host 不存在时报错，并删除关联 secrets。                                                                                                                                    |
-| `surface_url`     | `session_id`, `host_id`, `surface`, `cols?`, `rows?`, `cwd?`, `project_id?` | `{url, vnc_password?}`，远端 `wss://.../{pty,vnc,cdp}-ws?token=...` | 先唤醒并 touch session，执行 host health 检查；host 不可用、surface 不支持或 computer-use 未启用时显式报错。token 只存在于返回给 WebSocket 构造器的 URL，不渲染到 UI。 |
+| `surface_url`     | `session_id`, `host_id`, `surface`, `cols?`, `rows?`, `cwd?`, `project_id?` | `{url, vnc_password?, lease_id}`，远端 `wss://.../{pty,vnc,cdp}-ws?token=...` | 先唤醒并 touch session，执行 host health 检查；host 不可用、surface 不支持或 computer-use 未启用时显式报错。`lease_id` 是 lease 身份而不是 task id；token 只存在于返回给 WebSocket 构造器的 URL，不渲染到 UI。 |
 | `touch_session`   | `session_id`                                                     | `{}`                                                                                   | 唤醒会话并刷新闲置活动时间。                                                                                                                                                 |
 | `wake_session`    | `session_id`                                                     | `{}`                                                                                   | 清除休眠状态并刷新闲置活动时间；运行时按下一次实际入口惰性重建。                                                                                                             |
 | `ide_bootstrap`   | `session_id`, `folder_uri`                                       | `IdeBootstrap`                                                                         | `folder_uri` 必须以 `vscode-remote://` 开头；session/远程读取失败显式报错。                                                                                                |
-| `ide_url`         | `session_id`, `folder_uri`                                       | 远端 IDE URL                                                                            | 返回远端 IDE URL，`folder_uri` 前缀或远端请求失败显式报错；前端直接加载该 URL，不再启动本地 IDE proxy。                                                                     |
+| `ide_url`         | `session_id`, `folder_uri`                                       | `{url, lease_id}`                                                                       | 返回远端 IDE URL 和 lease 身份；`folder_uri` 前缀或远端请求失败显式报错；前端直接加载该 URL，不启动本地 IDE proxy。 |
+| `release_surface_runtime` | `session_id`, `surface`, `lease_id` | `()` | 按 lease 身份释放 surface；过期/旧 lease 的清理无害。 |
+| `release_ide_runtime` | `session_id`, `lease_id` | `()` | 按 lease 身份释放 IDE lease；过期/旧 lease 的清理无害。 |
 | `create_session`  | `title`, `host_id`, `model?`, `provider?`, `mode?`, `workspace?` | `SessionView`                                                                          | host 不存在时报 `remote host not found; session was not created`。                                                                                                         |
 | `list_sessions`   | 无                                                               | `SessionView[]`                                                                        | 数据库错误转字符串。                                                                                                                                                       |
 | `read_transcript` | `session_id`                                                     | `[{kind,payload}]`，pending approval 转为 `kind=approval`，tool call 按 `call_id` 合并 | store 读取失败报错；approval arguments 先脱敏；store 对无 result 且无 pending 的工具保留 `status=unresolved`，adapter 按活跃引擎覆盖为 `running`，否则返回 `interrupted`。 |
 
-上述命令实现位于 `src-tauri/src/main.rs`。`surface_url`、IDE proxy、`test_host` 是网络操作；它们在远端不可用时显式失败，不把远程 host 不可用转换为本地执行。
+上述命令实现位于 `src-tauri/src/main.rs`。`surface_url`、`ide_url`、`test_host` 是网络操作；它们在远端不可用时显式失败，不把远程 host 不可用转换为本地执行。
 
 ## 2.2 Turn、审批、provider
 
@@ -88,6 +90,7 @@
 
 | channel             | payload                                                                          |
 | ------------------- | -------------------------------------------------------------------------------- |
+| `stream`            | 持久化 working/session event；setup 状态和 user message 也通过此 channel 到达前端。 |
 | `message`           | `{role:"user", text}` 或消息事件。                                               |
 | `turn_start`        | turn 起始 JSON；完整序列见 [03](03-lifecycle.md)。                               |
 | `assistant_delta`   | 文本增量 JSON。                                                                  |
@@ -95,9 +98,11 @@
 | `approval`          | `{call_id, tool, arguments, risk, reason}`，arguments 脱敏。                     |
 | `approval_resolved` | `{call_id, approve}`。                                                           |
 | `tool_result`       | 工具结果 payload。                                                               |
-| `notice`            | `{kind,text}`，例如 `approval_pending`、`error`、`interrupted`、`model_switch`。 |
+| `notice`            | `{kind,text}`；`text` 可为 `turn_setup_*`、`host_unavailable`、`idle_teardown_retrying`、`wake_runtime_failed`、approval、provider/model 等 structured code。 |
 | `steering`          | `{text}`。                                                                       |
 | `turn_done`         | `{run_state,stop_reason}`，必须是本 turn 最后事件；两字段是引擎产出的原始枚举。  |
+| `session-sleep`     | `{session_id}`，runtime idle 断连完成。 |
+| `session-wake`      | `{session_id}`，session 从 sleeping 唤醒。 |
 
 `stop_reason` 除生命周期原因外还包括 `internal_error`（store/engine 自身失败）
 与 `max_iterations`（达到引擎最大轮次）；前端必须按未知值安全降级，不能把
@@ -132,6 +137,7 @@ Cloud-Dev 的 PTY 做法是动态事件名 `term-data-{id}`（byte array）与 `
 - `steering` 立即返回，但完成由后台 task 发 `turn_done`；前端不能把 invoke resolve 当作 turn 完成。
 - `interrupt` 立即请求 engine 停止，停止完成仍由 engine/event 状态确认。
 - `surface_url` 返回已通过 host health 检查的远端 WebSocket URL；前端 Terminal 和 Desktop webview 直接连接该 URL，Browser 保留 `capture_remote_browser_frame` 截图轮询，不建立 CDP webview 连接。URL 中的 `token` 不渲染到 UI，也不得进入日志、错误、transcript 或 fixture。
+- `surface_url` 返回 `lease_id`，前端释放时调用 `release_surface_runtime(sessionId, surface, leaseId)`；`ide_url` 返回 `lease_id`，前端释放时调用 `release_ide_runtime(sessionId, leaseId)`。surface lease 按 `(session_id, surface)` 替换，IDE lease 按 `session_id` 替换；重复注册不会累积永久租约，旧 lease 的延迟 cleanup 不会删除新 lease。
 - 会话闲置达到阈值后会真实休眠并释放运行时；前端负责关闭 Terminal/Desktop 的直连 WebSocket。`wake_session`、`touch_session` 或下一次会话入口会自动唤醒。桌面端发出 `session-sleep` / `session-wake` 事件，payload 只含 `session_id`。
 - `mcp_tools` 是远程 `tools/list` 请求；若 server 长时间无响应，必须受 client timeout 约束，具体 timeout 当前未确认。
 

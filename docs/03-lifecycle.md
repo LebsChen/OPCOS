@@ -16,21 +16,80 @@
 
 **Den worker**［OW文］：worker 用签名 token 主动 `POST /v1/workers/{id}/activity-heartbeat` 上报 `lastActiveAt` / `openSessionCount` / `isActiveRecently`——**健康状态由 worker 推送而非中心轮询**。
 
-## 3.2 OPCOS 会话状态（目标态）［推断］
+## 3.2 OPCOS 会话状态
 
 ```
-run_state:    idle | running | interrupted | error
+run_state:    idle | running | interrupted | error | sleeping
 stop_reason:  none | waiting_for_user | waiting_for_approval | finished
               | interrupted_by_user | host_unavailable | provider_error
               | policy_denied | context_exhausted | internal_error
-              | max_iterations
+              | max_iterations | idle_timeout
+terminal_cause: harness_error | host_unavailable | completed | user_interrupted
+                | provider_silent | waiting_for_user | waiting_for_approval
+                | provider_error | context_exhausted | internal_error
+                | tool_preflight_error | max_iterations | usage_limit
+                | policy_denied | model_stopped
 ```
 
 约束：
 
-- `run_state = idle` 时 `stop_reason` 必须非 `none`；两者一起持久化。
+- `run_state`、`stop_reason`、`terminal_cause` 和 `provider_finish_reason` 分开持久化；
+  例如新建 session 可以暂时是 `idle/none`，而 setup 失败是 `error/harness_error`。
 - `host_unavailable` 是**终止原因**，不是重试状态——远程不可用要显式暴露，见 [00](00-architecture.md) 硬约束 3。
-- 恢复（重启后续跑）只允许从 `interrupted` 与 `waiting_for_*` 进入 `running`。
+- `sleeping` 表示 idle 断连后的运行时释放，不等同于错误；store 会将休眠会话设为
+  `stop_reason=idle_timeout`。
+- `terminal_cause` 保留更细的终止分类，例如 harness 初始化失败使用
+  `harness_error`；provider 的协议细节另存于 `provider_finish_reason`。
+  上面列出的是当前可达写入路径确认过的 `terminal_cause` 字面量：
+  builtin engine 的终止状态会把对应的终止原因写入该列，ACP turn 还会写入
+  `model_stopped` / `completed` / `user_interrupted`。`interrupted_by_user` 是
+  `stop_reason` 的值，`idle_timeout` 也是 `stop_reason` 的值；休眠迁移会清空
+  `terminal_cause`，因此二者不属于这里的枚举。
+
+### 3.2.1 Idle 断连
+
+桌面端的 idle maintenance 以 `session_activity` 而不是 `sessions.last_active_at`
+单独选候选，并在候选真正 teardown 前重新加载 session。重新检查会话状态、active
+turn、pending approval/question、surface lease 和 IDE lease；任一 guard 命中都不
+释放运行时。
+
+teardown 成功顺序固定为：
+
+1. 释放 engine、capability/host、ACP 和 MCP runtime；
+2. 成功后才写 `run_state='sleeping'`，记录 idle audit 并发出 `session-sleep`；
+3. 每个 tick 最多处理八个 disconnect。
+
+teardown 失败时写 `idle_teardown_failed` audit，payload 至少包含 `phase` 和
+`detail`；不覆盖失败前的 session 状态，发出 `idle_teardown_retrying` structured
+notice，并在后续 tick 重试。
+
+### 3.2.2 Wake
+
+`wake_session_inner()` 负责从 sleeping 清除休眠状态、刷新 activity 并发出
+`session-wake`；需要实际 runtime 时统一走 `engine_for_with_context()`，不另建第二套
+runtime builder。重建失败会释放半初始化 runtime map，确保
+`state.engines[session_id]` 不残留，并恢复为 `sleeping`，发出
+`wake_runtime_failed` structured notice，后续仍可重试。
+
+### 3.2.3 首轮先接受
+
+首轮入口先把 user message 写入 `messages`/`session_events` 并 emit 给前端，使
+transcript 立即可见；随后才执行 wake、远程 host health、engine、capability/tool/
+asset discovery。setup 失败保留这条 user message，设置 `terminal_cause=harness_error`
+并发出 `turn_setup_failed`（远程 host 健康检查失败使用 `host_unavailable`）。
+这一失败边界不创建 pending tool call、assistant tool call 或 dispatch marker，因此
+恢复不会重放尚未 dispatch 的工具。
+
+### 3.2.4 Recovery 分类
+
+恢复 pending turn 时，先检查 durable dispatch marker：
+
+- 已记录 dispatch 尝试但没有 durable result：`execution_state_unknown`，不重放；
+- 未 dispatch 且工具是安全 read/search/git-read：允许安全重试；
+- 未 dispatch 但工具会产生副作用：`side_effecting_unresolved`，写入 recovery
+  结果并明确不重放；
+- dispatch marker 在 executor 调用前持久化，避免崩溃窗口把可能已发出的副作用
+  当成可安全重试。
 
 ## 3.3 Turn 生命周期
 

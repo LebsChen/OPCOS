@@ -138,4 +138,6 @@
 - [ ] 剩余自造 UI（会话 topbar、Transcript、composer 外壳、Settings 正文页、Activity 看板）退回 OpenWork / Cloud-Dev 参照实现
 - [ ] blueprint 写入 Tauri / Rust / 系统依赖
 - [ ] 每个里程碑后跑真机 Tauri 端到端验收并录屏
-- [ ] 发布产物：deb / rpm / AppImage / Windows NSIS + `SHA256SUMS.txt`（本地构建，GitHub Actions 只做 lint/test）
+- [x] 发布产物：GitHub Actions `Release bundles` workflow 构建未签名的 deb / rpm /
+  AppImage / Windows NSIS + MSI，并在 tag run 中发布到同一个 GitHub Release；签名和
+  `SHA256SUMS.txt` 仍未实现。

@@ -89,7 +89,7 @@ OPCOS 不把 MCP/能力声明当成结构化 LSP transport。LSP 需要双向 st
 | PTY/VNC/CDP                    | Tauri surface relay 已有                    | capability gate、生命周期统一      |
 | screenshot/computer-use        | 通过 RVM/engine 路径接入                    | 明确 capability 和结果类型         |
 | LSP/DAP/browser                | MCP/协议层未形成统一 OPCOS trait            | 增加 capability-specific adapter   |
-| Web IDE                        | IDE proxy 已有                              | 与 host 生命周期和 token gate 统一 |
+| Web IDE                        | `ide_url` 获取远端 URL，webview 直连      | 与 host 生命周期和 token gate 统一 |
 | upload/download/storage/deploy | upload、asset export 等已有                 | artifact 引用和错误模型统一        |
 | LocalHost                      | `opcos-hosts` 进程内实现 exec/read/write/ls | capability 探测与会话能力继续扩展  |
 | CloudWorker                    | 未实现                                      | 仅在 cloud 形态启用后增加          |
