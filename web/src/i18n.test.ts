@@ -43,12 +43,55 @@ const allowlist = [
   { pattern: /^(Esc|A|O)$/, reason: "keyboard shortcut label" },
   { pattern: /^(per|s)$/, reason: "duration unit fragment" },
 ];
+const zhEnglishKeyAllowlist = new Set([
+  "english",
+  "mcp",
+  "bearerToken",
+  "workspacePath",
+  "beta",
+  "harness",
+  "blueprints",
+  "yamlBlueprint",
+  "outposts",
+  "openaiCompatible",
+  "cloudflare",
+  "linear",
+  "streamableHttp",
+  "httpSse",
+  "stdio",
+  "shell",
+  "workingEvent",
+  "ownerRepository",
+]);
+const zhFreeTextKeyAllowlist = new Set([
+  "jsonWorkflowExample",
+  "jsonRolesExample",
+  "jsonEnvelopeExample",
+]);
 
 describe("i18n source coverage", () => {
   it("keeps English and Chinese dictionaries key-identical", () => {
     expect(Object.keys(messages.en).sort()).toEqual(
       Object.keys(messages.zh).sort(),
     );
+  });
+
+  it("keeps Chinese translations Chinese unless explicitly technical", () => {
+    const zhWithoutChinese = Object.entries(messages.zh)
+      .filter(
+        ([key, value]) =>
+          !zhEnglishKeyAllowlist.has(key) &&
+          !zhFreeTextKeyAllowlist.has(key) &&
+          !/[\u4e00-\u9fff]/.test(value),
+      )
+      .map(([key, value]) => `${key}:${value}`);
+    const englishWithChinese = Object.entries(messages.en)
+      .filter(
+        ([key, value]) => key !== "chinese" && /[\u4e00-\u9fff]/.test(value),
+      )
+      .map(([key, value]) => `${key}:${value}`);
+    expect(zhWithoutChinese).toEqual([]);
+    expect(englishWithChinese).toEqual([]);
   });
 
   it("defines every literal translate key used by the frontend", () => {
