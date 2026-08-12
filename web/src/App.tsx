@@ -5646,7 +5646,7 @@ function ManageSections({
                       onChange={(event) =>
                         setInstructionsDraft(event.target.value)
                       }
-                      placeholder="输入全局指令内容"
+                      placeholder={translate("globalInstructionsPlaceholder")}
                     />
                     <div className="inline-actions">
                       <Button className="primary" onClick={saveInstructions}>
@@ -5674,7 +5674,7 @@ function ManageSections({
                   {versionHistoryAsset && (
                     <div className="manage-card mt-4">
                       <div className="flex items-center justify-between">
-                        <strong>版本历史</strong>
+                        <strong>{translate("versionHistory")}</strong>
                         <Button
                           className="bordered"
                           onClick={() => {
@@ -5731,7 +5731,7 @@ function ManageSections({
                   value={libraryProjectId}
                   onChange={(event) => setLibraryProjectId(event.target.value)}
                 >
-                  <option value="">选择项目进行仓库同步</option>
+                  <option value="">{translate("syncRepositoryProject")}</option>
                   {projects.map((project) => (
                     <option key={project.id} value={project.id}>
                       {project.name}
@@ -5766,7 +5766,7 @@ function ManageSections({
                   value={libraryProjectId}
                   onChange={(event) => setLibraryProjectId(event.target.value)}
                 >
-                  <option value="">选择项目导入/导出团队</option>
+                  <option value="">{translate("importExportTeamProject")}</option>
                   {projects.map((project) => (
                     <option key={project.id} value={project.id}>
                       {project.name}
@@ -5822,7 +5822,11 @@ function ManageSections({
                   onClick={(event) => event.stopPropagation()}
                 >
                   <div className="flex items-center justify-between">
-                    <strong>{templateDraftId ? "编辑模板" : "添加模板"}</strong>
+                    <strong>
+                      {templateDraftId
+                        ? translate("editTemplate")
+                        : translate("addTemplate")}
+                    </strong>
                     <button
                       type="button"
                       className="btn"
@@ -5838,7 +5842,7 @@ function ManageSections({
                       onChange={(event) =>
                         setTemplateDraftName(event.target.value)
                       }
-                      placeholder="模板名称"
+                      placeholder={translate("templateName")}
                     />
                     <input
                       className="input"
@@ -5846,7 +5850,7 @@ function ManageSections({
                       onChange={(event) =>
                         setTemplateDraftDescription(event.target.value)
                       }
-                      placeholder="描述"
+                      placeholder={translate("description")}
                     />
                   </div>
                   <textarea
@@ -5929,7 +5933,9 @@ function ManageSections({
                     </pre>
                     {template.readonly && (
                       <div className="mt-2 flex items-center justify-between">
-                        <small className="text-muted">内置模板只读。</small>
+                        <small className="text-muted">
+                          {translate("builtInTemplateReadonly")}
+                        </small>
                         <button
                           type="button"
                           className="btn"
@@ -6035,15 +6041,19 @@ function ManageSections({
             </div>
             {!libraryEntries.some(
               (template) => template.kind === activeLibraryKind,
-            ) && <div className="py-8 text-sm text-muted">暂无模板</div>}
+            ) && (
+              <div className="py-8 text-sm text-muted">
+                {translate("noTemplates")}
+              </div>
+            )}
           </div>
         )}
         {tab === "skill" && (
           <div className="space-y-6">
             <label className="settings-row">
               <div>
-                <strong>Skills & Rules 作用域</strong>
-                <small>项目视图只统计该项目下会话的真实技能调用。</small>
+                <strong>{translate("skillsRulesScope")}</strong>
+                <small>{translate("skillsRulesScopeDescription")}</small>
               </div>
               <SelectMenu
                 value={settingsProjectId || ""}
@@ -6060,19 +6070,21 @@ function ManageSections({
             <section className="rounded-lg border border-line p-4">
               <div className="flex items-center justify-between mb-3">
                 <div>
-                  <strong>技能用量</strong>
+                  <strong>{translate("skillUsage")}</strong>
                   <small className="block">
                     数据来自技能实际注入会话上下文时的埋点；同一会话同一技能只计一次。
                   </small>
                 </div>
               </div>
               {!skillUsage?.skills.length ? (
-                <div className="text-sm text-muted py-6">暂无技能启用记录</div>
+                <div className="text-sm text-muted py-6">
+                  {translate("noSkillUsage")}
+                </div>
               ) : (
                 <>
                   <div className="grid grid-cols-3 gap-2 mb-4">
                     <div className="rounded-md bg-panel p-3">
-                      <small>启用次数</small>
+                      <small>{translate("activationCount")}</small>
                       <strong className="block text-lg">
                         {skillUsage.skills.reduce(
                           (sum, item) => sum + item.calls,
@@ -6081,13 +6093,13 @@ function ManageSections({
                       </strong>
                     </div>
                     <div className="rounded-md bg-panel p-3">
-                      <small>涉及技能</small>
+                      <small>{translate("involvedSkills")}</small>
                       <strong className="block text-lg">
                         {skillUsage.skills.length}
                       </strong>
                     </div>
                     <div className="rounded-md bg-panel p-3">
-                      <small>时间范围</small>
+                      <small>{translate("timeRange")}</small>
                       <strong className="block text-lg">
                         {skillUsage.timeline.length
                           ? `${skillUsage.timeline[0].date} – ${skillUsage.timeline.at(-1)?.date}`
@@ -6123,7 +6135,7 @@ function ManageSections({
             <section className="rounded-lg border border-line p-4">
               <div className="flex items-center justify-between mb-3">
                 <div>
-                  <strong>Browse</strong>
+                  <strong>{translate("browse")}</strong>
                   <small className="block">
                     浏览仓库发现的 .agents/skills 与规则文件；Skill 不在此创建。
                   </small>
@@ -6134,13 +6146,19 @@ function ManageSections({
                   请先打开一个项目会话以浏览仓库技能和规则
                 </div>
               ) : !skillBrowse ? (
-                <div className="text-sm text-muted py-6">正在读取仓库资产…</div>
+                <div className="text-sm text-muted py-6">
+                  {translate("readingRepositoryAssets")}
+                </div>
               ) : (
                 <div className="space-y-4">
                   <div>
-                    <h4 className="font-medium mb-2">Skills · 仓库来源</h4>
+                    <h4 className="font-medium mb-2">
+                      {translate("skillsRepositorySource")}
+                    </h4>
                     {!skillBrowse.skills.length ? (
-                      <div className="text-sm text-muted">暂无仓库 Skill</div>
+                      <div className="text-sm text-muted">
+                        {translate("noRepositorySkills")}
+                      </div>
                     ) : (
                       skillBrowse.skills.map((item) => (
                         <details
@@ -6161,9 +6179,13 @@ function ManageSections({
                     )}
                   </div>
                   <div>
-                    <h4 className="font-medium mb-2">Rules · 仓库来源</h4>
+                    <h4 className="font-medium mb-2">
+                      {translate("rulesRepositorySource")}
+                    </h4>
                     {!skillBrowse.rules.length ? (
-                      <div className="text-sm text-muted">暂无仓库规则</div>
+                      <div className="text-sm text-muted">
+                        {translate("noRepositoryRules")}
+                      </div>
                     ) : (
                       skillBrowse.rules.map((item) => (
                         <details
