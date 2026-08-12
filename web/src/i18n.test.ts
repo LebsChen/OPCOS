@@ -460,6 +460,23 @@ describe("i18n source coverage", () => {
       `${sourceRoot}../../src-tauri/src/main.rs`,
       "utf8",
     );
+    const emittedSessionValues = [
+      ...backendSource.matchAll(/(?:stop_reason|run_state)\s*:\s*"([^"]+)"/g),
+    ].map((match) => match[1]);
+    expect(emittedSessionValues.length).toBeGreaterThan(0);
+    for (const value of new Set(emittedSessionValues)) {
+      expect(backendValueKeys[value]).toBeTruthy();
+    }
+    const seededTemplateKinds = [
+      ...backendSource.matchAll(
+        /seed_builtin_template\([\s\S]{0,220}?"(agent-template|team-template|rules|skill|mcp|connector|acp-agent|command)"/g,
+      ),
+    ].map((match) => match[1]);
+    expect(seededTemplateKinds.length).toBeGreaterThan(0);
+    for (const kind of new Set(seededTemplateKinds)) {
+      expect(backendValueKeys[kind]).toBeTruthy();
+      expect(translateBackendValue(kind)).not.toBe(kind);
+    }
     const requiredValues = [
       "running",
       "idle",
@@ -484,18 +501,6 @@ describe("i18n source coverage", () => {
     ];
     for (const value of requiredValues) {
       expect(backendValueKeys[value]).toBeTruthy();
-    }
-    for (const kind of [
-      "agent-template",
-      "team-template",
-      "rules",
-      "skill",
-      "mcp",
-      "connector",
-      "acp-agent",
-      "command",
-    ]) {
-      expect(translateBackendValue(kind)).not.toBe(kind);
     }
     expect(backendSource).toContain('"provider_error"');
     expect(backendSource).toMatch(/status.*?"open"/s);
