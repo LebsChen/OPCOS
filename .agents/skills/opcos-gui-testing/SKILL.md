@@ -1592,3 +1592,46 @@ The `shouldShowSurfaceRetry({port, sleeping, failed})` banner (i18n `surfaceUnav
   host reports (local-host sessions have no Terminal/Desktop icon at all). Always `zoom` the rail
   (region ~`[995, 25, 1024, 400]`) to locate the monitor (Desktop) and `>_` (Terminal) icons before
   clicking; clicking the already-active icon toggles the panel closed.
+
+## Direct surface WebSockets (from PR #208, `surface_url`) — how to test without a relay
+
+Terminal/Desktop no longer go through a local relay port: `surface_url(...)` returns
+`{ url, vnc_password }` with `ws(s)://host/{pty,vnc,cdp}-ws?...&token=...` and the **webview** connects
+directly (`new WebSocket(url)` / `new RFB(host, url)`). `start_surface`/`stop_surface`/`relay_surface`/
+`surface-ended` are gone. This changes every piece of evidence you used to collect:
+
+- **No more per-surface loopback listener.** `ss -ltnp | grep -c opcos` must stay at the app baseline
+  (3 on this box) no matter how many surfaces are open. A count that grows by one per panel means the
+  relay is back. Use this as the primary "is it really direct?" assertion.
+- **Count webview sockets instead of listeners:**
+  `ss -tnp | grep <host:port> | grep WebKit` — one ESTAB line per live direct surface, owned by
+  `WebKitNetworkPr`. Note the local ephemeral port: if the same local port survives a UI transition,
+  the socket was never torn down and the panel is reusing a stale connection.
+- **Fixture must accept URL tokens and expose `/api/health`.** `surface_url` health-checks the host
+  *before* returning, so unavailable hosts now fail synchronously (no relay to discover it later) — the
+  reason string is the health error (`error sending request …`, `http 503 …`). Make the fixture's
+  `/pty-ws` / `/vnc-ws` handlers ignore/accept `?token=`, and log `pty-ws open/close pid=` so you can
+  prove the remote shell really died.
+- **Host-side request counting still works** for storm checks, but point the *stub* at the same port and
+  count `/api/health` + `/pty-ws` lines. Verified-good numbers: 0 requests over a 27 s untouched window
+  in the failed state, exactly 1 new request per Retry click. A stronger no-storm proof with direct
+  sockets: restart the host while the panel sits failed and confirm **no** `pty-ws open` appears until
+  Retry is pressed.
+- **Known defect to re-check (PR #208 head `eafaca5`): switching panel tabs does not close the direct
+  socket.** Terminal → Desktop/Browser leaves the PTY socket ESTAB and the remote `/bin/bash -i`
+  running (no `pty-ws close`), and coming back reuses the stale socket (no new `pty-ws open`, old
+  scrollback still there). Panel close (X), session switch and idle sleep *do* close it. Likely cause:
+  the terminal socket effect deps are `[selected.id, surfaceUrl, sleeping]` with `tab` missing, so a tab
+  change never runs its cleanup. Test recipe: note `grep -c 'pty-ws close'` + WebKit conn count, click
+  the other surface icon, wait ~8 s, re-count.
+- **Browser tab no longer opens a CDP WebSocket** — it only polls `capture_remote_browser_frame`, and
+  the polling *stops* after the first failure (measure: host request count flat for ≥24 s, one extra
+  request per Retry). Consequence for sleep tests: the Browser tab no longer keeps a session awake, so
+  a session can now sleep with Browser selected (confirmed: DB `asleep` + audit row while Browser open).
+  The pane still renders "Waiting for a remote browser page target…" underneath the failure banner —
+  cosmetic, but do not read it as "working".
+- **Token exposure check:** the `?token=` query is sanctioned by `AGENTS.md` for surface WebSockets only.
+  Verify the UI never renders it: the Browser footer must read `Remote browser preview (CDP)` (the old
+  `CDP relay for an external client: ws://127.0.0.1:<port>` line is gone), and
+  `grep -i token /tmp/opcos-*.log` must be empty. A fixture/stub access log containing
+  `GET /pty-ws?...&token=...` is expected (that is the host side, not OPCOS UI/logs).
