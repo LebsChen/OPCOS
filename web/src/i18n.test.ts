@@ -520,6 +520,27 @@ describe("i18n source coverage", () => {
     expect(i18nSource).toContain("return key ? translate(key) : text;");
   });
 
+  it("keeps backend-only display keys out of literal UI labels", () => {
+    const appSources = sourceFiles()
+      .filter((file) => file.endsWith(".tsx"))
+      .map((file) => readFileSync(`${sourceRoot}${file}`, "utf8"))
+      .join("\n");
+    const backendOnlyKeys = [
+      "agentTemplate",
+      "commandTemplate",
+      "teamTemplate",
+      "rulesTemplate",
+      "skillTemplate",
+      "mcpTemplate",
+      "connectorTemplate",
+      "acpAgentTemplate",
+      "stateOpen",
+    ];
+    for (const key of backendOnlyKeys) {
+      expect(appSources).not.toMatch(new RegExp(`translate\\("${key}"\\)`));
+    }
+  });
+
   it("does not JSON-stringify strings in toast or error display paths", () => {
     const guiSource = readFileSync(`${sourceRoot}gui.ts`, "utf8");
     const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");

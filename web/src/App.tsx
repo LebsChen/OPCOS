@@ -13423,7 +13423,7 @@ function AppContent() {
                     />
                     <select
                       className="chip"
-                      title={translate("agentTemplate")}
+                      title={translate("agentTemplateLabel")}
                       value={homeAgentTemplateId}
                       onChange={(event) => {
                         const id = event.target.value;
@@ -13463,7 +13463,9 @@ function AppContent() {
                         }
                       }}
                     >
-                      <option value="">{translate("agentTemplate")}</option>
+                      <option value="">
+                        {translate("agentTemplateLabel")}
+                      </option>
                       {homeAgentTemplates.map((template) => (
                         <option key={template.id} value={template.id}>
                           {template.name}
