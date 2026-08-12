@@ -278,6 +278,125 @@ describe("i18n source coverage", () => {
     expect(appSource).not.toMatch(/` · Tasks: \$\{/);
   });
 
+  it("translates every Activity tab label and subtitle", () => {
+    const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
+    expect(appSource).not.toMatch(
+      /\[0\]\.toUpperCase\(\)\s*\+\s*\w+\.slice\(1\)/,
+    );
+    expect(appSource).not.toMatch(
+      /(?:goals|board|tasks|messages|worklog):\s*"(?:Define|Start|Create|Send|Inspect)/,
+    );
+    for (const [tab, key] of [
+      ["audit", "activityAudit"],
+      ["actions", "activityActions"],
+      ["queue", "activityQueue"],
+      ["events", "activityEvents"],
+      ["goals", "activityGoals"],
+      ["board", "activityBoard"],
+      ["roles", "activityRoles"],
+      ["tasks", "activityTasks"],
+      ["messages", "activityMessages"],
+      ["worklog", "activityWorklog"],
+      ["insights", "activityInsights"],
+    ]) {
+      expect(appSource).toContain(`${tab}: "${key}"`);
+    }
+    for (const key of [
+      "reviewSecurityEvents",
+      "reviewExternalActions",
+      "reviewWorkQueue",
+      "reviewEventRules",
+      "reviewGoals",
+      "reviewBoard",
+      "reviewRoles",
+      "reviewTasks",
+      "reviewMessages",
+      "reviewWorklog",
+      "reviewInsights",
+    ])
+      expect(appSource).toContain(`translate("${key}")`);
+  });
+
+  it("keeps panel labels semantically distinct from settings keys", () => {
+    const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
+    expect(
+      appSource.match(/<strong>\{translate\("panelAgents"\)\}<\/strong>/g),
+    ).toHaveLength(2);
+    expect(appSource).not.toMatch(
+      /<strong>\{translate\("agents"\)\}<\/strong>/,
+    );
+  });
+
+  it("keeps backend template source values stable and non-CJK", () => {
+    const backendSource = readFileSync(
+      `${sourceRoot}../../src-tauri/src/main.rs`,
+      "utf8",
+    );
+    expect(backendSource).toMatch(/"source":\s*"project"/);
+    expect(backendSource).toMatch(/"builtin"/);
+    expect(backendSource).toMatch(/"repository"/);
+    expect(backendSource).toMatch(/"custom"/);
+    expect(backendSource).not.toMatch(/"source"\s*:\s*"[\u4e00-\u9fff]+"/);
+    expect(backendSource).not.toMatch(
+      /"source":\s*if[\s\S]{0,500}"[\u4e00-\u9fff]+"/,
+    );
+  });
+
+  it("localizes composer errors and harness labels", () => {
+    const guiSource = readFileSync(`${sourceRoot}gui.ts`, "utf8");
+    const composerSource = readFileSync(
+      `${sourceRoot}components/Composer.tsx`,
+      "utf8",
+    );
+    expect(guiSource).toContain('translate("providerKeyNotConfigured")');
+    expect(composerSource).toMatch(
+      /option\.id === "builtin"[\s\S]*translate\("builtIn"\)/,
+    );
+  });
+
+  it("renders insight fields individually with formatted token usage", () => {
+    const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
+    expect(appSource).toContain("function formatInsightValue");
+    expect(appSource).toMatch(
+      /key === "token_usage"[\s\S]*translate\("input"\)[\s\S]*translate\("output"\)/,
+    );
+    expect(appSource).not.toMatch(
+      /<pre>\{JSON\.stringify\(insights,\s*null,\s*2\)\}<\/pre>/,
+    );
+    expect(appSource).toMatch(/formatInsightValue\(key, value\)/);
+  });
+
+  it("keeps MCP errors canonical and translated", () => {
+    const guiSource = readFileSync(`${sourceRoot}gui.ts`, "utf8");
+    const backendSource = readFileSync(
+      `${sourceRoot}../../src-tauri/src/main.rs`,
+      "utf8",
+    );
+    expect(guiSource).toContain("translateBackendError");
+    expect(backendSource).toContain(
+      "The local host does not provide remote MCP tools; bind a remote host.",
+    );
+    expect(backendSource).not.toContain("本机 host 不提供远程 MCP tools");
+  });
+
+  it("localizes environment status and keeps slash seeds language-consistent", () => {
+    const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
+    const dictionarySource = readFileSync(`${sourceRoot}i18n.ts`, "utf8");
+    const backendSource = readFileSync(
+      `${sourceRoot}../../src-tauri/src/main.rs`,
+      "utf8",
+    );
+    expect(dictionarySource).toContain('outposts: "前哨"');
+    expect(appSource).toContain('translate("localHost")');
+    const slashSeeds = backendSource.match(
+      /fn builtin_slash_commands\(\)[\s\S]*?fn builtin_control_slash_commands/,
+    )?.[0];
+    expect(slashSeeds).toBeTruthy();
+    expect(slashSeeds).not.toMatch(
+      /"\/(?:implement|plan|review|test|think-hard|deploy|pull-project)"[\s\S]*[\u4e00-\u9fff]/,
+    );
+  });
+
   it("maps backend status and enum values before rendering", () => {
     const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
     expect(appSource).not.toMatch(/translate\(String\(/);

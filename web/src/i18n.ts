@@ -406,6 +406,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     repositoryUrl: "Repository URL",
     setupCommand: "Setup command (optional)",
     outposts: "Outposts",
+    localHost: "Local",
     noRegisteredHosts: "No registered hosts yet.",
     configurationScope: "Configuration scope",
     configurationScopeDescription:
@@ -691,6 +692,22 @@ export const messages: Record<Locale, Record<string, string>> = {
       "Review durable events, causal chains, and bounded effect rules.",
     reviewRoles: "Review board roles and their current state.",
     reviewInsights: "Review cross-session activity insights.",
+    activityAudit: "Audit",
+    activityActions: "Actions",
+    activityQueue: "Queue",
+    activityEvents: "Events",
+    activityGoals: "Goals",
+    activityBoard: "Board",
+    activityRoles: "Roles",
+    activityTasks: "Tasks",
+    activityMessages: "Messages",
+    activityWorklog: "Worklog",
+    activityInsights: "Insights",
+    reviewGoals: "Define bounded autonomous goals and review planning rounds.",
+    reviewBoard: "Start or observe the active coordination board.",
+    reviewTasks: "Create, claim, complete, and verify coordination tasks.",
+    reviewMessages: "Send and review coordination messages.",
+    reviewWorklog: "Inspect the remote session worklog timeline.",
     filterAudit: "Filter audit events",
     noAuditEvents: "No audit events recorded yet.",
     filterActionHistory: "Filter action history",
@@ -757,6 +774,8 @@ export const messages: Record<Locale, Record<string, string>> = {
     resourcesPrompts: "Resources / prompts",
     selectSessionMcpTools: "Select a session to inspect its host MCP tools.",
     noMcpToolsAvailable: "No MCP tools available.",
+    mcpToolsUnavailable:
+      "The local host does not provide remote MCP tools; bind a remote host.",
     plan: "Plan",
     retry: "Retry",
     addCurrentContext: "Add to current context",
@@ -892,7 +911,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     inputTokens: "Input tokens",
     outputTokens: "Output tokens",
     iteration: "Iteration",
-    toolCalls: "tool calls",
+    toolCalls: "Tool calls",
     showMoreCount: "Show more ({count})",
     archivedCount: "Archived ({count})",
     allowed: "Allowed",
@@ -994,6 +1013,8 @@ export const messages: Record<Locale, Record<string, string>> = {
     interruptedByCrash: "Interrupted (application exited)",
     hostUnavailable: "Host unavailable",
     providerError: "Model service error",
+    providerKeyNotConfigured:
+      "Provider key is not configured; open Provider settings first.",
     policyDenied: "Policy denied",
     contextExhausted: "Context exhausted",
     internalError: "Internal error",
@@ -1502,7 +1523,8 @@ export const messages: Record<Locale, Record<string, string>> = {
     advancedRepositories: "高级 · 仓库",
     repositoryUrl: "仓库 URL",
     setupCommand: "初始化命令（可选）",
-    outposts: "Outposts",
+    outposts: "前哨",
+    localHost: "本地",
     noRegisteredHosts: "暂无已登记主机",
     configurationScope: "配置作用域",
     configurationScopeDescription:
@@ -1777,6 +1799,22 @@ export const messages: Record<Locale, Record<string, string>> = {
     reviewEventRules: "查看持久化事件、因果链和受限效果规则。",
     reviewRoles: "查看看板角色及其当前状态。",
     reviewInsights: "查看跨会话活动洞察。",
+    activityAudit: "审计",
+    activityActions: "操作",
+    activityQueue: "队列",
+    activityEvents: "事件",
+    activityGoals: "目标",
+    activityBoard: "看板",
+    activityRoles: "角色",
+    activityTasks: "任务",
+    activityMessages: "消息",
+    activityWorklog: "工作日志",
+    activityInsights: "洞察",
+    reviewGoals: "定义有界自治目标并查看规划轮次。",
+    reviewBoard: "启动或查看当前协作看板。",
+    reviewTasks: "创建、认领、完成并验证协作任务。",
+    reviewMessages: "发送并查看协作消息。",
+    reviewWorklog: "查看远程会话工作日志时间线。",
     filterAudit: "筛选审计事件",
     noAuditEvents: "暂无审计事件记录。",
     filterActionHistory: "筛选操作历史",
@@ -1842,6 +1880,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     resourcesPrompts: "资源 / 提示词",
     selectSessionMcpTools: "请选择会话以查看其主机 MCP 工具。",
     noMcpToolsAvailable: "没有可用的 MCP 工具。",
+    mcpToolsUnavailable: "本地主机不提供远程 MCP 工具；请绑定远程主机。",
     searchAssetsWithLabel: "搜索{label}",
     retry: "重试",
     preview: "预览",
@@ -2071,6 +2110,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     interruptedByCrash: "已中断（应用退出）",
     hostUnavailable: "主机不可用",
     providerError: "模型服务错误",
+    providerKeyNotConfigured: "未配置提供商密钥；请先打开提供商设置。",
     policyDenied: "策略拒绝",
     contextExhausted: "上下文已耗尽",
     internalError: "内部错误",
@@ -2196,9 +2236,11 @@ export const backendValueKeys: Record<string, string> = {
   active: "active",
   abandoned: "failed",
   auth_required: "authRequired",
+  builtin: "builtIn",
   code: "code",
   configured: "configured",
   connected: "connected",
+  custom: "custom",
   disabled: "disabled",
   done: "completed",
   execute: "execute",
@@ -2219,10 +2261,12 @@ export const backendValueKeys: Record<string, string> = {
   pending: "pendingLabel",
   pending_approval: "pendingLabel",
   plan: "plan",
+  project: "projectLabel",
   queued: "queued",
   ready: "ready",
   release: "release",
   review: "review",
+  repository: "repository",
   running: "running",
   success: "completed",
   test: "test",
@@ -2235,6 +2279,18 @@ export function translateBackendValue(value: unknown): string {
   if (!text) return translate("unknownValue");
   const key = backendValueKeys[text.toLowerCase()];
   return key ? translate(key) : translate("unknownValue");
+}
+
+const backendErrorKeys: Record<string, string> = {
+  "provider key is not configured; open provider settings first":
+    "providerKeyNotConfigured",
+  "the local host does not provide remote mcp tools; bind a remote host.":
+    "mcpToolsUnavailable",
+};
+
+export function translateBackendError(value: unknown): string {
+  const text = String(value ?? "").trim();
+  return translate(backendErrorKeys[text.toLowerCase()] || text);
 }
 
 export function translate(

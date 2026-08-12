@@ -749,7 +749,9 @@ export function Composer(props: Props) {
                     value={option.id}
                     disabled={!option.available}
                   >
-                    {option.label}
+                    {option.id === "builtin"
+                      ? translate("builtIn")
+                      : option.label}
                     {!option.available ? ` (${translate("unavailable")})` : ""}
                   </option>
                 ))}

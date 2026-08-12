@@ -1486,7 +1486,7 @@ function ProjectConfigPanel({
                       {template.name}
                     </strong>
                     <small className="mt-1 block break-words text-faint">
-                      {template.source} ·{" "}
+                      {translateBackendValue(template.source)} ·{" "}
                       {template.overridden
                         ? translate("projectOverridden")
                         : translate("inheritedGlobalPreset")}
@@ -4507,7 +4507,10 @@ function ManageSections({
                       >
                         <span>{host.name}</span>
                         <span className="text-xs text-muted">
-                          {host.id} ·{" "}
+                          {host.id === "local"
+                            ? translate("localHost")
+                            : host.id}{" "}
+                          ·{" "}
                           {host.online === false
                             ? translate("offline")
                             : translate("online")}
@@ -5949,10 +5952,12 @@ function ManageSections({
                           {template.name}
                         </strong>
                         <small className="block text-muted">
-                          {template.source ||
-                            (template.status === "builtin"
-                              ? translate("builtIn")
-                              : translate("custom"))}{" "}
+                          {translateBackendValue(
+                            template.source ||
+                              (template.status === "builtin"
+                                ? "builtin"
+                                : "custom"),
+                          )}{" "}
                           · v{template.version}
                         </small>
                       </div>
@@ -8670,7 +8675,23 @@ function Activity({
                 }
                 size={15}
               />
-              {item[0].toUpperCase() + item.slice(1)}
+              {translate(
+                (
+                  {
+                    audit: "activityAudit",
+                    actions: "activityActions",
+                    queue: "activityQueue",
+                    events: "activityEvents",
+                    goals: "activityGoals",
+                    board: "activityBoard",
+                    roles: "activityRoles",
+                    tasks: "activityTasks",
+                    messages: "activityMessages",
+                    worklog: "activityWorklog",
+                    insights: "activityInsights",
+                  } as const
+                )[item],
+              )}
             </button>
           ))}
         </nav>
@@ -8678,7 +8699,23 @@ function Activity({
           <div className="activity-body w-full px-7 py-6">
             <header className="mb-5">
               <h1 className="text-[22px] font-semibold text-ink">
-                {activityTab[0].toUpperCase() + activityTab.slice(1)}
+                {translate(
+                  (
+                    {
+                      audit: "activityAudit",
+                      actions: "activityActions",
+                      queue: "activityQueue",
+                      events: "activityEvents",
+                      goals: "activityGoals",
+                      board: "activityBoard",
+                      roles: "activityRoles",
+                      tasks: "activityTasks",
+                      messages: "activityMessages",
+                      worklog: "activityWorklog",
+                      insights: "activityInsights",
+                    } as const
+                  )[activityTab],
+                )}
               </h1>
               <p className="text-[13px] text-muted mt-1">
                 {
@@ -8688,14 +8725,12 @@ function Activity({
                       actions: translate("reviewExternalActions"),
                       queue: translate("reviewWorkQueue"),
                       events: translate("reviewEventRules"),
-                      goals:
-                        "Define bounded autonomous goals and review planning rounds.",
-                      board: "Start or observe the active coordination board.",
+                      goals: translate("reviewGoals"),
+                      board: translate("reviewBoard"),
                       roles: translate("reviewRoles"),
-                      tasks:
-                        "Create, claim, complete, and verify coordination tasks.",
-                      messages: "Send and review coordination messages.",
-                      worklog: "Inspect the remote session worklog timeline.",
+                      tasks: translate("reviewTasks"),
+                      messages: translate("reviewMessages"),
+                      worklog: translate("reviewWorklog"),
                       insights: translate("reviewInsights"),
                     } as const
                   )[activityTab]
@@ -9327,7 +9362,19 @@ function Activity({
                     {translate("selectSessionInsights")}
                   </p>
                 ) : (
-                  <pre>{JSON.stringify(insights, null, 2)}</pre>
+                  <dl className="space-y-3 text-left">
+                    {insights &&
+                      Object.entries(insights)
+                        .filter(([key]) => key !== "session_id")
+                        .map(([key, value]) => (
+                          <div key={key}>
+                            <dt className="text-muted">
+                              {insightFieldLabel(key)}
+                            </dt>
+                            <dd>{formatInsightValue(key, value)}</dd>
+                          </div>
+                        ))}
+                  </dl>
                 )}
               </div>
             )}
@@ -9995,6 +10042,21 @@ function insightFieldLabel(key: string): string {
   return translationKey ? translate(translationKey) : key;
 }
 
+function formatInsightValue(key: string, value: unknown): string {
+  if (
+    key === "token_usage" &&
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  ) {
+    const usage = value as Record<string, unknown>;
+    return `${translate("input")}: ${String(usage.input ?? 0)} · ${translate(
+      "output",
+    )}: ${String(usage.output ?? 0)}`;
+  }
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
 function StandaloneInsights({
   selected,
   onError,
@@ -10021,7 +10083,7 @@ function StandaloneInsights({
           <Field
             key={key}
             k={insightFieldLabel(key)}
-            v={typeof value === "string" ? value : JSON.stringify(value)}
+            v={formatInsightValue(key, value)}
           />
         ))}
     </div>
@@ -10741,7 +10803,7 @@ function AgentRosterPane({
     return (
       <section className="rail-section">
         <div className="rail-section-head">
-          <strong>{translate("agents")}</strong>
+          <strong>{translate("panelAgents")}</strong>
         </div>
         <div className="rail-section-body">
           <div className="rail-muted">{translate("sessionNotAssociated")}</div>
@@ -10776,7 +10838,7 @@ function AgentRosterPane({
   return (
     <section className="rail-section">
       <div className="rail-section-head">
-        <strong>{translate("agents")}</strong>
+        <strong>{translate("panelAgents")}</strong>
         <button
           className="rail-mini-btn"
           onClick={refresh}
@@ -11233,11 +11295,7 @@ function SessionRightPanel({
                             <dt className="text-muted">
                               {insightFieldLabel(key)}
                             </dt>
-                            <dd>
-                              {typeof value === "string"
-                                ? value
-                                : JSON.stringify(value)}
-                            </dd>
+                            <dd>{formatInsightValue(key, value)}</dd>
                           </div>
                         ))}
                     </dl>
@@ -13439,7 +13497,9 @@ function AppContent() {
                           value={option.id}
                           disabled={!option.available}
                         >
-                          {option.label}
+                          {option.id === "builtin"
+                            ? translate("builtIn")
+                            : option.label}
                           {!option.available
                             ? ` (${translate("unavailable")})`
                             : ""}

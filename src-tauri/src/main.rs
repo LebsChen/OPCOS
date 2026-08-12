@@ -8496,31 +8496,31 @@ fn builtin_slash_commands() -> Vec<(&'static str, &'static str)> {
     vec![
         (
             "/implement",
-            "请把当前任务落实为可运行的实现：先检查相关代码和约束，再做最小完整修改，并运行针对性测试。",
+            "Implement the current task as a runnable change: inspect the relevant code and constraints, make the smallest complete edit, and run focused tests.",
         ),
         (
             "/plan",
-            "请先分析目标、现状、依赖和风险，给出分步骤执行计划；未经确认不要修改文件。",
+            "Analyze the goal, current state, dependencies, and risks, then give a step-by-step plan; do not edit files without confirmation.",
         ),
         (
             "/review",
-            "请以严格代码审查方式检查当前变更，优先找功能缺陷、回归、边界条件和安全问题，并给出证据。",
+            "Review the current changes rigorously, prioritizing defects, regressions, edge cases, and security issues, with evidence.",
         ),
         (
             "/test",
-            "请围绕当前任务补充或运行有意义的测试，覆盖成功、失败和边界行为，不要只验证数据存取。",
+            "Add or run meaningful tests for the current task, covering success, failure, and boundary behavior rather than only data access.",
         ),
         (
             "/think-hard",
-            "请深入推演问题的隐含约束、替代方案和失败模式，再提出经过验证的实现路径。",
+            "Reason deeply about hidden constraints, alternatives, and failure modes before proposing a validated implementation path.",
         ),
         (
             "/deploy",
-            "请检查发布前置条件、构建产物和部署步骤；只执行仓库允许且明确授权的部署动作。",
+            "Check release prerequisites, build artifacts, and deployment steps; execute only explicitly authorized repository actions.",
         ),
         (
             "/pull-project",
-            "请同步当前项目的仓库状态，核对分支和未提交改动，再继续处理项目任务。",
+            "Sync the current project repository state, verify the branch and uncommitted changes, then continue with the task.",
         ),
     ]
 }
@@ -10061,14 +10061,14 @@ fn list_project_configuration_templates(
                 "name": row.get::<_, String>(2)?,
                 "status": row.get::<_, String>(3)?,
                 "source": if row.get::<_, String>(3)? == "builtin" {
-                    "内置"
+                    "builtin"
                 } else if row
                     .get::<_, Option<String>>(4)?
                     .is_some_and(|scope| scope.starts_with("repo:"))
                 {
-                    "仓库"
+                    "repository"
                 } else {
-                    "自定义"
+                    "custom"
                 },
                 "content": row.get::<_, String>(5)?,
                 "applied": row.get::<_, bool>(12)?,
@@ -10102,7 +10102,7 @@ fn list_project_configuration_templates(
                 "kind": row.get::<_, String>(1)?,
                 "name": row.get::<_, String>(2)?,
                 "status": row.get::<_, String>(3)?,
-                "source": "项目",
+                "source": "project",
                 "content": row.get::<_, String>(4)?,
                 "applied": true,
                 "overridden": true,
@@ -18744,11 +18744,11 @@ fn list_configured_library(
                     .get::<_, Option<String>>(7)?
                     .is_some_and(|scope| scope.starts_with("repo:"))
                 {
-                    "仓库"
+                    "repository"
                 } else if row.get::<_, String>(3)? == "builtin" {
-                    "内置"
+                    "builtin"
                 } else {
-                    "自定义"
+                    "custom"
                 }
             }))
         })
@@ -20717,7 +20717,7 @@ async fn mcp_tools(
 ) -> Result<Vec<Value>, String> {
     let host_id = session_host_id(&state, &session_id)?;
     if host_id == "local" {
-        return Err("本机 host 不提供远程 MCP tools；请绑定远程主机".into());
+        return Err("The local host does not provide remote MCP tools; bind a remote host.".into());
     }
     let response = client_for(&state, &host_id)?
         .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
