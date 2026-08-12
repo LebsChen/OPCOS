@@ -8230,7 +8230,7 @@ function Automations({
       <div className="flex min-h-full">
         <nav className="page-subnav w-[208px] shrink-0 border-r border-line bg-panel/40 px-3 py-4">
           <div className="px-2 text-[13.5px] font-semibold mb-3 flex items-center gap-2">
-            <Icon name="clock" size={16} /> Automations
+            <Icon name="clock" size={16} /> {translate("automations")}
           </div>
           {(["schedules", "runs"] as const).map((item) => (
             <button
@@ -8246,18 +8246,24 @@ function Automations({
                 name={item === "schedules" ? "refresh" : "code"}
                 size={15}
               />
-              {item === "schedules" ? "Schedules" : "Runs"}
+              {item === "schedules"
+                ? translate("schedules")
+                : translate("runs")}
             </button>
           ))}
         </nav>
         <div className="flex-1 min-w-0 overflow-y-auto">
           <div className="w-full px-7 py-6">
             <PageHeader
-              title={automationTab === "schedules" ? "Schedules" : "Runs"}
+              title={
+                automationTab === "schedules"
+                  ? translate("schedules")
+                  : translate("runs")
+              }
               subtitle={
                 automationTab === "schedules"
-                  ? "Create and manage recurring OPCOS playbook runs."
-                  : "Review the latest results reported by scheduled runs."
+                  ? translate("automationDescription")
+                  : translate("runsDescription")
               }
             />
             {automationTab === "schedules" ? (
@@ -8271,7 +8277,7 @@ function Automations({
                       className="primary"
                       onClick={() => setScheduleFormOpen(true)}
                     >
-                      New schedule
+                      {translate("newSchedule")}
                     </Button>
                   }
                   rows={
@@ -8282,8 +8288,9 @@ function Automations({
                             <span>
                               <strong>{schedule.name}</strong>
                               <small>
-                                {schedule.trigger || "cron"} · {schedule.cron} ·{" "}
-                                {schedule.last_result || "never run"}
+                                {schedule.trigger || translate("cron")} ·{" "}
+                                {schedule.cron} ·{" "}
+                                {schedule.last_result || translate("neverRun")}
                               </small>
                             </span>
                             <Button
@@ -8295,7 +8302,7 @@ function Automations({
                                   .catch(onError)
                               }
                             >
-                              Run now
+                              {translate("runNow")}
                             </Button>
                           </div>
                         ))}
@@ -8307,14 +8314,14 @@ function Automations({
                     scheduleFormOpen ? (
                       <div className="manage-card form-grid">
                         <label>
-                          Name
+                          {translate("name")}
                           <input
                             value={name}
                             onChange={(event) => setName(event.target.value)}
                           />
                         </label>
                         <label>
-                          Session
+                          {translate("sessionLabel")}
                           <SelectMenu
                             value={sessionId}
                             onChange={setSessionId}
@@ -8325,7 +8332,7 @@ function Automations({
                           />
                         </label>
                         <label>
-                          Playbook
+                          {translate("playbook")}
                           <SelectMenu
                             value={playbookId}
                             onChange={setPlaybookId}
@@ -8338,23 +8345,23 @@ function Automations({
                           />
                         </label>
                         <label>
-                          Trigger
+                          {translate("triggerLabel")}
                           <SelectMenu
                             value={trigger}
                             onChange={(value) =>
                               setTrigger(value as "cron" | "filesystem")
                             }
                             options={[
-                              { value: "cron", label: "Cron" },
+                              { value: "cron", label: translate("cron") },
                               {
                                 value: "filesystem",
-                                label: "File changes (local only)",
+                                label: translate("fileChangesLocal"),
                               },
                             ]}
                           />
                         </label>
                         <label>
-                          Cron
+                          {translate("cron")}
                           <input
                             value={cron}
                             onChange={(event) => setCron(event.target.value)}
@@ -8389,7 +8396,7 @@ function Automations({
                               .catch(onError)
                           }
                         >
-                          Save automation
+                          {translate("saveAutomation")}
                         </Button>
                       </div>
                     ) : undefined
@@ -8409,7 +8416,7 @@ function Automations({
                           <span>
                             <strong>{schedule.name}</strong>
                             <small>
-                              {schedule.last_result || "No run recorded yet"}
+                                {schedule.last_result || translate("noRunRecorded")}
                             </small>
                           </span>
                         </div>
