@@ -750,7 +750,7 @@ export function Composer(props: Props) {
                     disabled={!option.available}
                   >
                     {option.label}
-                    {!option.available ? " (unavailable)" : ""}
+                    {!option.available ? ` (${translate("unavailable")})` : ""}
                   </option>
                 ))}
               </select>
@@ -834,17 +834,17 @@ export function Composer(props: Props) {
               title={
                 dictationBusy ||
                 (dictation?.recording
-                  ? "Stop recording and transcribe"
+                  ? translate("stopRecordingAndTranscribe")
                   : voiceReady
-                    ? "Start local voice dictation"
-                    : "Configure Voice Input in Settings")
+                    ? translate("startLocalVoiceDictation")
+                    : translate("configureVoiceInput"))
               }
               aria-label={
                 dictation?.recording
-                  ? "Stop dictation"
+                  ? translate("stopDictation")
                   : voiceReady
-                    ? "Start dictation"
-                    : "Configure Voice Input in Settings"
+                    ? translate("startDictation")
+                    : translate("configureVoiceInput")
               }
               aria-disabled={!voiceReady && !dictation?.recording}
             >
@@ -864,13 +864,13 @@ export function Composer(props: Props) {
             }
             onSend={submit}
             onInterrupt={props.onInterrupt}
-            title={needsModel ? "Connect a model to send" : undefined}
+            title={needsModel ? translate("connectModelToSend") : undefined}
           />
         </div>
       </div>
       <span className="sr-only" role="status" aria-live="polite">
         {dictation?.recording
-          ? `Listening, ${recordingTime}`
+          ? `${translate("listening")}, ${recordingTime}`
           : dictationBusy || ""}
       </span>
     </div>
@@ -897,7 +897,7 @@ export function SendButton({
       onClick={running ? onInterrupt : onSend}
       disabled={disabled && !running}
       title={title}
-      aria-label={running ? "Stop" : "Send"}
+      aria-label={running ? translate("stop") : translate("send")}
     >
       {running ? (
         <span aria-hidden="true">■</span>
@@ -1155,7 +1155,9 @@ export function PlusMenu({
                     ref={submenuRef}
                     className="pm-submenu"
                     role="menu"
-                    aria-label={`${category.label} items`}
+                    aria-label={translate("categoryItems", {
+                      label: category.label,
+                    })}
                     style={submenuStyle ?? undefined}
                     onKeyDown={(event) => {
                       if (event.key === "Escape" || event.key === "ArrowLeft") {

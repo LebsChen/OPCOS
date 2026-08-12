@@ -299,7 +299,10 @@ export function ApprovalCard({
     >
       <div className="approval-top">
         <div className="approval-heading">
-          <span className="approval-ico" title={`Tool: ${item.name}`}>
+          <span
+            className="approval-ico"
+            title={translate("toolName", { name: item.name })}
+          >
             <Icon name="shield" size={15} />
           </span>
           <TitleText line={title} />

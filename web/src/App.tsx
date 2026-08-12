@@ -1611,7 +1611,7 @@ function ProjectConfigPanel({
                 onChange={(event) => setBody(event.target.value)}
                 placeholder={
                   kind === "blueprint"
-                    ? "clone:\n  - git fetch"
+                    ? translate("cloneExample")
                     : translate("projectConfigContent")
                 }
               />
@@ -3437,12 +3437,13 @@ function CiMonitorPanel({
             const signatures = state.failure_signatures ?? [];
             return (
               <article key={record.queue_id ?? JSON.stringify(item)}>
-                <strong>{record.queue_id ?? "ci_repair_loop"}</strong>
+                <strong>{record.queue_id ?? translate("ciRepairLoop")}</strong>
                 <div>
-                  {translate("status")}: {record.status ?? "unknown"}
+                  {translate("status")}:{" "}
+                  {record.status ?? translate("unknownValue")}
                 </div>
                 <div>
-                  {translate("phase")}: {state.phase ?? "queued"}
+                  {translate("phase")}: {state.phase ?? translate("queued")}
                 </div>
                 <div>
                   {translate("attempts")}: {state.repair_attempts ?? 0} /{" "}
@@ -3453,21 +3454,26 @@ function CiMonitorPanel({
                   {state.max_polls ?? 20}
                 </div>
                 <div>
-                  {translate("deadline")}: {state.deadline ?? "not set"}
+                  {translate("deadline")}:{" "}
+                  {state.deadline ?? translate("notSet")}
                 </div>
                 <div>
-                  {translate("currentSha")}: {state.head_sha ?? "not set"}
+                  {translate("currentSha")}:{" "}
+                  {state.head_sha ?? translate("notSet")}
                 </div>
                 <div>
                   {translate("expectedSha")}:{" "}
-                  {state.expected_head_sha ?? "not set"}
+                  {state.expected_head_sha ?? translate("notSet")}
                 </div>
                 <div>
-                  {translate("stopReason")}: {state.stop_reason ?? "none"}
+                  {translate("stopReason")}:{" "}
+                  {state.stop_reason ?? translate("none")}
                 </div>
                 <div>
                   {translate("signatures")}:{" "}
-                  {signatures.length > 0 ? signatures.join(" → ") : "none"}
+                  {signatures.length > 0
+                    ? signatures.join(" → ")
+                    : translate("none")}
                 </div>
               </article>
             );
@@ -4723,7 +4729,9 @@ function ManageSections({
                     <div className="flex items-center gap-2">
                       <code className="text-accent">{item.name}</code>
                       <span className="text-[11px] text-muted">
-                        {item.kind === "system" ? "System" : "Custom"}
+                        {item.kind === "system"
+                          ? translate("system")
+                          : translate("custom")}
                       </span>
                       <span className="ml-auto flex gap-2">
                         {item.kind === "system" && (
@@ -4976,14 +4984,16 @@ function ManageSections({
                       </span>
                       <span className="block text-[11.5px] text-faint">
                         {config?.configured
-                          ? "✓ Configured securely."
-                          : "Not configured yet."}
+                          ? translate("configuredSecurely")
+                          : translate("notConfiguredYet")}
                       </span>
                     </span>
                   </div>
                   <div className="form-grid mt-4">
                     <label>
-                      {isCloudflare ? "Base URL (derived)" : "Base URL"}
+                      {isCloudflare
+                        ? translate("baseUrlDerived")
+                        : translate("baseUrl")}
                       <input
                         type="url"
                         value={currentUrl}
@@ -5043,7 +5053,9 @@ function ManageSections({
                           type="password"
                           value={providerKeys[descriptor.name] || ""}
                           placeholder={
-                            config?.configured ? "Stored securely" : ""
+                            config?.configured
+                              ? translate("storedSecurely")
+                              : ""
                           }
                           onChange={(event) =>
                             setProviderKeys((items) => ({
@@ -5387,7 +5399,9 @@ function ManageSections({
                     onChange={(event) =>
                       setCustomProviderKey(event.target.value)
                     }
-                    placeholder={customProviderId ? "Stored securely" : ""}
+                    placeholder={
+                      customProviderId ? translate("storedSecurely") : ""
+                    }
                   />
                 </label>
               </div>
@@ -5524,7 +5538,9 @@ function ManageSections({
                                 .finally(() => setTestingHostId(null));
                             }}
                           >
-                            {testingHostId === host.id ? "Testing…" : "Test"}
+                            {testingHostId === host.id
+                              ? translate("testing")
+                              : translate("test")}
                           </Button>
                           <Button
                             className="danger"
@@ -5540,8 +5556,8 @@ function ManageSections({
                             }}
                           >
                             {confirmDeleteHostId === host.id
-                              ? "Confirm delete"
-                              : "Delete"}
+                              ? translate("confirmDelete")
+                              : translate("delete")}
                           </Button>
                         </>
                       }
@@ -5591,7 +5607,7 @@ function ManageSections({
                     type="password"
                   />
                   <Button type="submit" className="primary">
-                    {editingHostId ? "Save" : "Add host"}
+                    {editingHostId ? translate("save") : translate("addHost")}
                   </Button>
                   <Button
                     type="button"
@@ -6295,8 +6311,8 @@ function ManageSections({
                               }
                             >
                               {remoteAssetAction === "discovering"
-                                ? "Discovering…"
-                                : "Discover remote"}
+                                ? translate("discovering")
+                                : translate("discoverRemote")}
                             </Button>
                             <Button
                               className="bordered"
@@ -6317,8 +6333,8 @@ function ManageSections({
                               }
                             >
                               {remoteAssetAction === "importing"
-                                ? "Importing…"
-                                : "Import"}
+                                ? translate("importing")
+                                : translate("import")}
                             </Button>
                           </>
                         )}
@@ -6339,8 +6355,8 @@ function ManageSections({
                           }
                         >
                           {remoteAssetAction === "exporting"
-                            ? "Exporting…"
-                            : "Export"}
+                            ? translate("exporting")
+                            : translate("export")}
                         </Button>
                       </div>
                     ) : undefined
@@ -6381,8 +6397,8 @@ function ManageSections({
                                     ? translate("enabled")
                                     : translate("disabled")
                                   : asset.enabled
-                                    ? "Enabled"
-                                    : "Disabled"}
+                                    ? translate("enabled")
+                                    : translate("disabled")}
                               </span>
                             </div>
                             <p className="mt-2 text-[13px] text-muted line-clamp-2">
@@ -6392,7 +6408,7 @@ function ManageSections({
                               {asset.trigger ||
                                 (kind === "agents"
                                   ? translate("noTrigger")
-                                  : "No trigger")}
+                                  : translate("noTrigger"))}
                             </small>
                           </div>
                         ))}
@@ -6411,7 +6427,7 @@ function ManageSections({
                     >
                       {kind === "agents"
                         ? translate("newRule")
-                        : `New ${label}`}
+                        : translate("newAssetWithLabel", { label })}
                     </Button>
                   }
                   rows={
@@ -6437,8 +6453,8 @@ function ManageSections({
                                     ? translate("enabled")
                                     : translate("disabled")
                                   : asset.enabled
-                                    ? "Enabled"
-                                    : "Disabled"}
+                                    ? translate("enabled")
+                                    : translate("disabled")}
                                 {asset.trigger ? ` · ${asset.trigger}` : ""}
                               </small>
                             </span>
@@ -6467,14 +6483,14 @@ function ManageSections({
                                 {assetPending === asset.id
                                   ? kind === "agents"
                                     ? translate("saving")
-                                    : "Saving…"
+                                    : translate("saving")
                                   : asset.enabled
                                     ? kind === "agents"
                                       ? translate("disable")
-                                      : "Disable"
+                                      : translate("disable")
                                     : kind === "agents"
                                       ? translate("enable")
-                                      : "Enable"}
+                                      : translate("enable")}
                               </Button>
                               <Button
                                 className="bordered"
@@ -6575,7 +6591,7 @@ function ManageSections({
                       <span>
                         <strong>
                           v{String(version.version)}
-                          {isCurrent ? " · current" : ""}
+                          {isCurrent ? ` · ${translate("current")}` : ""}
                         </strong>
                         <small>{String(version.created_at)}</small>
                       </span>
@@ -7103,7 +7119,7 @@ function ManageSections({
                           placeholder={
                             field.key === "token" &&
                             connectorStatuses[openConnector]?.connected
-                              ? "Stored securely"
+                              ? translate("storedSecurely")
                               : field.placeholder
                           }
                           onChange={(event) => {
@@ -7183,10 +7199,10 @@ function ManageSections({
                       {OAUTH_CONNECTOR_KINDS.includes(
                         openConnector as (typeof OAUTH_CONNECTOR_KINDS)[number],
                       )
-                        ? "Connect"
+                        ? translate("connect")
                         : openConnector === "browser"
-                          ? "Connect"
-                          : "Save & verify"}
+                          ? translate("connect")
+                          : translate("saveAndVerify")}
                     </Button>
                     {connectorMessages[openConnector] && (
                       <small
@@ -7341,8 +7357,8 @@ function ManageSections({
               >
                 {indexStatus?.status === "ready" ||
                 indexStatus?.status === "limited"
-                  ? "Refresh index"
-                  : "Build index"}
+                  ? translate("refreshIndex")
+                  : translate("buildIndex")}
               </Button>
             }
             rows={
@@ -7353,21 +7369,23 @@ function ManageSections({
                     <small>
                       {indexStatus.file_count} {translate("files")} ·{" "}
                       {indexStatus.symbol_count} {translate("symbols")}
-                      {indexStatus.truncated ? " · limited by size" : ""}
+                      {indexStatus.truncated
+                        ? ` · ${translate("limitedBySize")}`
+                        : ""}
                     </small>
                   </span>
                   <span className="muted">
                     {indexStatus.built_at
                       ? new Date(indexStatus.built_at).toLocaleString()
-                      : "not built"}
+                      : translate("notBuilt")}
                   </span>
                 </div>
               ) : null
             }
             empty={
               selected
-                ? "Repository index has not been built for this session host."
-                : "Select a session to manage its repository index."
+                ? translate("repositoryIndexNotBuilt")
+                : translate("selectSessionRepositoryIndex")
             }
           />
         )}
@@ -7381,7 +7399,7 @@ function ManageSections({
                 className="primary"
                 onClick={() => setSecretFormOpen((open) => !open)}
               >
-                {secretFormOpen ? "Cancel" : translate("addSecret")}
+                {secretFormOpen ? translate("cancel") : translate("addSecret")}
               </Button>
             }
             rows={
@@ -8039,7 +8057,9 @@ function McpManage({
                           .catch(onError)
                       }
                     >
-                      {tool.enabled === true ? "Disable" : "Enable"}
+                      {tool.enabled === true
+                        ? translate("disable")
+                        : translate("enable")}
                     </Button>
                   }
                   key={String(tool.name)}
@@ -8855,8 +8875,10 @@ function Activity({
                                 {String(rule.effect_kind)}
                               </strong>
                               <small>
-                                {rule.enabled ? "enabled" : "disabled"} ·{" "}
-                                {String(rule.trigger_count)}/
+                                {rule.enabled
+                                  ? translate("enabled")
+                                  : translate("disabled")}{" "}
+                                · {String(rule.trigger_count)}/
                                 {String(rule.max_triggers)} per{" "}
                                 {String(rule.window_seconds)}s
                                 <button
@@ -8876,7 +8898,9 @@ function Activity({
                                       .catch(onError)
                                   }
                                 >
-                                  {rule.enabled ? "disable" : "enable"}
+                                  {rule.enabled
+                                    ? translate("disable")
+                                    : translate("enable")}
                                 </button>
                               </small>
                             </span>
@@ -10137,7 +10161,9 @@ function ArtifactsPane({ selected }: { selected: Session }) {
                 <strong>{translate("sampledScreenshotTimeline")}</strong>
                 <span>
                   {manifest.frames?.length ?? 0} {translate("framesLabel")}
-                  {manifest.truncated ? " · truncated at limit" : ""}
+                  {manifest.truncated
+                    ? ` · ${translate("truncatedAtLimit")}`
+                    : ""}
                 </span>
               </div>
               {selectedFrame &&
@@ -10145,7 +10171,9 @@ function ArtifactsPane({ selected }: { selected: Session }) {
                   <img
                     className="artifact-image max-w-full"
                     src={`data:image/png;base64,${frameContent.content_base64}`}
-                    alt={`Recording frame ${frameIndex + 1}`}
+                    alt={translate("recordingFrame", {
+                      index: frameIndex + 1,
+                    })}
                   />
                 )}
               <input
@@ -10220,7 +10248,9 @@ function ArtifactsPane({ selected }: { selected: Session }) {
                   {artifact.path.split(/[\\/]/).pop() || artifact.path}
                   <span className="artifact-row-meta">
                     {formatBytes(artifact.size_bytes)}
-                    {artifact.sha256 ? "" : " · Hash not calculated"}
+                    {artifact.sha256
+                      ? ""
+                      : ` · ${translate("hashNotCalculated")}`}
                     {" · "}
                     {new Date(artifact.created_at).toLocaleString()}
                   </span>
@@ -10284,7 +10314,7 @@ function ShellHistoryPane({ selected }: { selected: Session }) {
                     setOpen(open === item.call_id ? null : item.call_id)
                   }
                 >
-                  <code>{item.command || "(empty command)"}</code>
+                  <code>{item.command || translate("emptyCommand")}</code>
                   <span
                     className={item.exit_code === 0 ? "rail-ok" : "rail-muted"}
                   >
@@ -10294,13 +10324,17 @@ function ShellHistoryPane({ selected }: { selected: Session }) {
                   </span>
                 </button>
                 <div className="rail-event-meta">
-                  {item.duration_ms == null ? "" : `${item.duration_ms} ms`}
+                  {item.duration_ms == null
+                    ? ""
+                    : `${item.duration_ms} ${translate("milliseconds")}`}
                 </div>
                 {open === item.call_id &&
                   (item.output || item.output_truncated) && (
                     <pre className="rail-event-output">
                       {item.output}
-                      {item.output_truncated ? "\n[Output truncated]" : ""}
+                      {item.output_truncated
+                        ? `\n[${translate("outputTruncated")}]`
+                        : ""}
                     </pre>
                   )}
               </div>
@@ -10779,7 +10813,9 @@ function AgentRosterPane({
                     </div>
                     <div>
                       <dt>{translate("sessionLabel")}</dt>
-                      <dd>{session ? "Exists" : "None"}</dd>
+                      <dd>
+                        {session ? translate("exists") : translate("none")}
+                      </dd>
                     </div>
                     <div>
                       <dt>{translate("runStateLabel")}</dt>
@@ -10805,8 +10841,8 @@ function AgentRosterPane({
                         onClick={() => void startSession(agent)}
                       >
                         {busyAgentId === agent.id
-                          ? "Starting…"
-                          : "Start session"}
+                          ? translate("starting")
+                          : translate("startSession")}
                       </button>
                     )}
                   </div>
@@ -11123,7 +11159,9 @@ function SessionRightPanel({
                           disabled={item.available === false}
                         >
                           {item.title}
-                          {item.available === false ? " (unavailable)" : ""}
+                          {item.available === false
+                            ? ` (${translate("unavailable")})`
+                            : ""}
                         </option>
                       ))}
                     </select>
@@ -11217,7 +11255,8 @@ function SessionRightPanel({
               <div className="session-pane">
                 {unavailableCapability ? (
                   <div className="rail-error">
-                    {unavailableCapability.reason || "Capability unavailable."}
+                    {unavailableCapability.reason ||
+                      translate("capabilityUnavailable")}
                   </div>
                 ) : (
                   <SurfaceView
@@ -11263,7 +11302,8 @@ function SessionRightPanel({
                   capabilities.browser?.state === "Unavailable" &&
                   !preserveSurfaceTabWhileSleeping(selected.sleep_state) ? (
                     <div className="rail-error">
-                      {capabilities.browser.reason || "Capability unavailable."}
+                      {capabilities.browser.reason ||
+                        translate("capabilityUnavailable")}
                     </div>
                   ) : (
                     <SurfaceView
@@ -11394,10 +11434,10 @@ function InboxPane({
             <div className="flex items-center justify-between gap-2">
               <strong>
                 {item.kind === "question"
-                  ? "Question"
+                  ? translate("question")
                   : item.kind === "plan"
-                    ? "Plan confirmation"
-                    : "Approval"}
+                    ? translate("planConfirmation")
+                    : translate("approval")}
               </strong>
               <span className="text-xs text-faint">{item.tool}</span>
             </div>
@@ -11571,7 +11611,11 @@ function QuestionCard({
               onClick={() => answerOption(JSON.stringify(selectedOptions))}
             >
               <span className="approval-option-key">↵</span>
-              <span>{submitting ? "Sending…" : "Submit selection"}</span>
+              <span>
+                {submitting
+                  ? translate("sending")
+                  : translate("submitSelection")}
+              </span>
             </button>
           )}
         </div>
@@ -13357,7 +13401,9 @@ function AppContent() {
                           disabled={!option.available}
                         >
                           {option.label}
-                          {!option.available ? " (unavailable)" : ""}
+                          {!option.available
+                            ? ` (${translate("unavailable")})`
+                            : ""}
                         </option>
                       ))}
                     </select>
@@ -13388,7 +13434,9 @@ function AppContent() {
                           disabled={provider.available === false}
                         >
                           {provider.title}
-                          {provider.available === false ? " (unavailable)" : ""}
+                          {provider.available === false
+                            ? ` (${translate("unavailable")})`
+                            : ""}
                         </option>
                       ))}
                     </select>

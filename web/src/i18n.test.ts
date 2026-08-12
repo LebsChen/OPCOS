@@ -42,6 +42,11 @@ const allowlist = [
   { pattern: /^(v|· v)$/, reason: "version notation" },
   { pattern: /^(Esc|A|O)$/, reason: "keyboard shortcut label" },
   { pattern: /^(per|s)$/, reason: "duration unit fragment" },
+  { pattern: /^\(⌘B\)$/, reason: "keyboard shortcut notation" },
+  {
+    pattern: /^https:\/\/example\.test\/feed\.xml$/,
+    reason: "feed URL example",
+  },
 ];
 const zhEnglishKeyAllowlist = new Set([
   "english",
@@ -82,6 +87,8 @@ const zhEnglishKeyAllowlist = new Set([
   "prompts",
   "tokens",
   "hash",
+  "cloneExample",
+  "ciRepairLoop",
 ]);
 const zhFreeTextKeyAllowlist = new Set([
   "jsonWorkflowExample",
@@ -137,17 +144,27 @@ describe("i18n source coverage", () => {
         true,
         ts.ScriptKind.TSX,
       );
+      let currentNode: ts.Node | undefined;
       const visit = (node: ts.Node) => {
+        currentNode = node;
         if (ts.isJsxText(node)) {
           checkText(node.getText(tree).trim());
         } else if (
           ts.isJsxAttribute(node) &&
           ts.isIdentifier(node.name) &&
           /^(title|placeholder|aria-label|alt)$/.test(node.name.text) &&
-          node.initializer &&
-          ts.isStringLiteral(node.initializer)
+          node.initializer
         ) {
-          checkText(node.initializer.text.trim());
+          if (ts.isStringLiteral(node.initializer)) {
+            checkText(node.initializer.text.trim());
+          } else if (ts.isJsxExpression(node.initializer)) {
+            checkExpression(node.initializer.expression);
+          }
+        } else if (
+          ts.isJsxExpression(node) &&
+          (ts.isJsxElement(node.parent) || ts.isJsxFragment(node.parent))
+        ) {
+          checkExpression(node.expression);
         } else if (
           ts.isStringLiteralLike(node) &&
           /[\u4e00-\u9fff]/.test(node.text)
@@ -162,7 +179,35 @@ describe("i18n source coverage", () => {
           /[A-Za-z\u4e00-\u9fff]/.test(text) &&
           !allowlist.some((entry) => entry.pattern.test(text))
         ) {
-          violations.push(`${file}:${text}`);
+          const position = tree.getLineAndCharacterOfPosition(
+            (currentNode ?? tree).getStart(tree),
+          );
+          violations.push(`${file}:${position.line + 1}:${text}`);
+        }
+      };
+      const checkExpression = (node: ts.Expression | undefined) => {
+        if (!node) return;
+        if (ts.isStringLiteralLike(node)) {
+          checkText(node.text.trim());
+        } else if (ts.isNoSubstitutionTemplateLiteral(node)) {
+          checkText(node.text.trim());
+        } else if (ts.isTemplateExpression(node)) {
+          checkText(node.head.text.trim());
+          for (const span of node.templateSpans) {
+            checkText(span.literal.text.trim());
+          }
+        } else if (ts.isParenthesizedExpression(node)) {
+          checkExpression(node.expression);
+        } else if (ts.isConditionalExpression(node)) {
+          checkExpression(node.whenTrue);
+          checkExpression(node.whenFalse);
+        } else if (
+          ts.isBinaryExpression(node) &&
+          (node.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken ||
+            node.operatorToken.kind === ts.SyntaxKind.BarBarToken)
+        ) {
+          checkExpression(node.left);
+          checkExpression(node.right);
         }
       };
       visit(tree);

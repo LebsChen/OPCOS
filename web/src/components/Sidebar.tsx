@@ -51,7 +51,7 @@ function AttnBadge({ n }: { n: number }) {
   return (
     <span
       className="text-[10px] font-semibold text-ink bg-faint/30 rounded-full px-1.5 leading-[15px] shrink-0"
-      title={`${n} awaiting your attention`}
+      title={translate("awaitingAttention", { count: n })}
     >
       {n > 99 ? "99+" : n}
     </span>
@@ -68,8 +68,8 @@ function UnseenBadge({ n, failed }: { n: number; failed?: boolean }) {
       className="text-[10px] font-semibold text-ink bg-faint/30 rounded-full px-1.5 leading-[15px] shrink-0"
       title={
         failed
-          ? `${n} new run${n > 1 ? "s" : ""} — the latest failed`
-          : `${n} new run${n > 1 ? "s" : ""}`
+          ? translate("newRunsLatestFailed", { count: n })
+          : translate("newRuns", { count: n })
       }
     >
       {n > 99 ? "99+" : n}
@@ -102,7 +102,7 @@ function OriginIcon({ s }: { s: SessionInfo }) {
     <ConnectorIcon
       connector={{ logo: "slack", brand_color: "#611f69" }}
       size={12}
-      title={s.origin_label || "From Slack"}
+      title={s.origin_label || translate("fromSlack")}
     />
   );
 }
@@ -460,7 +460,7 @@ export function Sidebar(props: SidebarProps) {
   const rowActions = (s: SessionInfo, title: string) => (
     <button
       className="w-6 h-6 grid place-items-center rounded text-faint hover:text-ink hover:bg-paper opacity-0 group-hover:opacity-100 focus:opacity-100 shrink-0"
-      aria-label={`Actions for ${title}`}
+      aria-label={translate("actionsFor", { title })}
       title={translate("sessionActions")}
       onClick={(event) => {
         event.stopPropagation();
@@ -929,7 +929,7 @@ export function Sidebar(props: SidebarProps) {
             {mine.filter(matches).length === 0 ? (
               <div className="px-2 py-1.5 text-[12px] text-faint leading-snug">
                 {normalizedQuery
-                  ? "No matching conversations."
+                  ? translate("noMatchingConversations")
                   : translate("noConversations")}
               </div>
             ) : (
@@ -1071,7 +1071,9 @@ export function Sidebar(props: SidebarProps) {
           <button
             className="nav-pin-btn w-7 h-7 grid place-items-center rounded-md text-faint hover:text-ink hover:bg-paper shrink-0"
             title={
-              props.collapsed ? "Dock sidebar (⌘B)" : "Collapse sidebar (⌘B)"
+              props.collapsed
+                ? `${translate("dockSidebar")} (⌘B)`
+                : `${translate("collapseSidebar")} (⌘B)`
             }
             aria-label={
               props.collapsed
@@ -1303,7 +1305,7 @@ export function Sidebar(props: SidebarProps) {
                 closeRowMenu();
               }}
             >
-              {rowMenuSession.pinned ? "Unpin" : "Pin"}
+              {rowMenuSession.pinned ? translate("unpin") : translate("pin")}
             </button>
             <button
               className="w-full px-2 py-1.5 rounded-lg text-[13px] text-left hover:bg-paper"
@@ -1316,7 +1318,9 @@ export function Sidebar(props: SidebarProps) {
                 closeRowMenu();
               }}
             >
-              {rowMenuSession.archived ? "Unarchive" : "Archive"}
+              {rowMenuSession.archived
+                ? translate("unarchive")
+                : translate("archive")}
             </button>
             <div className="my-1 border-t border-line" />
             <button
@@ -1332,8 +1336,8 @@ export function Sidebar(props: SidebarProps) {
               }}
             >
               {confirmDelId === rowMenuSession.session_id
-                ? "Delete?"
-                : "Delete"}
+                ? translate("deleteQuestion")
+                : translate("delete")}
             </button>
           </div>
         </>

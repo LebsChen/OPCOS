@@ -79,7 +79,7 @@ function BubbleMeta({ text, ts }: { text: string; ts?: number }) {
     <div className="relative h-0 select-none">
       <div className="absolute top-1 left-0 flex items-center gap-1.5 text-[10.5px] text-faint opacity-0 group-hover:opacity-100">
         <button onClick={copy} data-testid="bubble-copy">
-          {copied ? "Copied" : "Copy"}
+          {copied ? translate("copied") : translate("copy")}
         </button>
         {typeof ts === "number" && (
           <span data-testid="bubble-ts">
@@ -387,9 +387,12 @@ function TerminalOutput({
       <pre className="artifact-code max-h-96 overflow-auto whitespace-pre-wrap break-words">
         {output}
         {truncated
-          ? `\n[Output truncated: ${
-              omittedBytes === undefined ? "some" : omittedBytes
-            } bytes omitted; the model saw the tail]`
+          ? `\n[${translate("outputTruncatedWithDetails", {
+              omitted:
+                omittedBytes === undefined
+                  ? translate("some")
+                  : String(omittedBytes),
+            })}]`
           : ""}
       </pre>
     </TranscriptDisclosure>
@@ -803,7 +806,12 @@ export function Transcript({
                   {running &&
                   index === lastWorkIndex &&
                   node.startedAt !== undefined
-                    ? `Working for ${Math.max(0, Math.floor((clock - node.startedAt) / 1000))}s`
+                    ? translate("workingFor", {
+                        seconds: Math.max(
+                          0,
+                          Math.floor((clock - node.startedAt) / 1000),
+                        ),
+                      })
                     : node.label}
                 </span>
                 {!!(node.additions || node.deletions) && (
