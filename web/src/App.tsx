@@ -8845,7 +8845,9 @@ function Activity({
             {activityTab === "goals" && (
               <div className="space-y-5">
                 <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
-                  <h2 className="text-[15px] font-semibold">Current plan</h2>
+                  <h2 className="text-[15px] font-semibold">
+                    {translate("currentPlan")}
+                  </h2>
                   {currentPlan ? (
                     <>
                       <div className="text-[13px]">
@@ -8894,12 +8896,12 @@ function Activity({
                     <input
                       value={accountId}
                       onChange={(event) => setAccountId(event.target.value)}
-                      placeholder="Account ID"
+                      placeholder={translate("accountId")}
                     />
                     <input
                       value={accountHostId}
                       onChange={(event) => setAccountHostId(event.target.value)}
-                      placeholder="Remote host ID"
+                      placeholder={translate("remoteHostId")}
                     />
                   </div>
                   <Button
@@ -8947,21 +8949,23 @@ function Activity({
                   />
                 </div>
                 <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
-                  <h2 className="text-[15px] font-semibold">Login state</h2>
+                  <h2 className="text-[15px] font-semibold">
+                    {translate("loginState")}
+                  </h2>
                   <div className="grid grid-cols-2 gap-3">
                     <input
                       value={loginProfilePath}
                       onChange={(event) =>
                         setLoginProfilePath(event.target.value)
                       }
-                      placeholder="Remote browser profile path"
+                      placeholder={translate("remoteBrowserProfilePath")}
                     />
                     <input
                       value={loginBackupDir}
                       onChange={(event) =>
                         setLoginBackupDir(event.target.value)
                       }
-                      placeholder="Remote backup directory"
+                      placeholder={translate("remoteBackupDirectory")}
                     />
                   </div>
                   <div className="flex gap-2">
@@ -9024,21 +9028,21 @@ function Activity({
                       onChange={(event) =>
                         setLoginValidationUrl(event.target.value)
                       }
-                      placeholder="Validation URL"
+                      placeholder={translate("validationUrl")}
                     />
                     <input
                       value={loginExpectedSignal}
                       onChange={(event) =>
                         setLoginExpectedSignal(event.target.value)
                       }
-                      placeholder="Expected signal"
+                      placeholder={translate("expectedSignal")}
                     />
                     <input
                       value={loginObservedSignal}
                       onChange={(event) =>
                         setLoginObservedSignal(event.target.value)
                       }
-                      placeholder="Observed signal (optional)"
+                      placeholder={translate("observedSignalOptional")}
                     />
                   </div>
                   <Button
@@ -9114,7 +9118,9 @@ function Activity({
                   />
                 </div>
                 <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
-                  <h2 className="text-[15px] font-semibold">New goal</h2>
+                  <h2 className="text-[15px] font-semibold">
+                    {translate("newGoal")}
+                  </h2>
                   <input
                     className="w-full"
                     value={goalDescription}
