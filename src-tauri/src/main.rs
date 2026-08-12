@@ -6968,7 +6968,7 @@ fn emit_pending_approval_for(
                 "tool": pending.tool,
                 "arguments": redact_approval_value(&pending.arguments),
                 "risk": approval_risk(&pending.tool),
-                "reason": "Tool action requires approval",
+                "reason": structured_ui_message("approval_tool_action_requires", json!({})),
             })
         },
     );
@@ -6979,9 +6979,9 @@ fn emit_pending_approval_for(
         json!({
             "kind": if is_question { "question_pending" } else { "approval_pending" },
             "text": if is_question {
-                "Question requires an answer before this tool can continue"
+                "Question requires an answer before this tool can continue".to_owned()
             } else {
-                "Approval required before this tool can continue"
+                structured_ui_message("approval_required_before_tool_continue", json!({}))
             }
         }),
     );
@@ -8857,7 +8857,10 @@ async fn execute_control_slash_action(
                 state,
                 &session.session_id,
                 "model_switch",
-                json!({"text":format!("Switched to {model}")}),
+                json!({"text": structured_ui_message(
+                    "model_switch",
+                    json!({"model": model}),
+                )}),
             )?;
         }
         "/ls" => {
@@ -13072,9 +13075,22 @@ async fn engine_for_with_context(
     Ok(Arc::clone(entry))
 }
 
+fn structured_ui_message(code: &str, params: Value) -> String {
+    if params.as_object().is_some_and(serde_json::Map::is_empty) {
+        return code.to_owned();
+    }
+    format!(
+        "{code} {}",
+        serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_owned())
+    )
+}
+
 fn engine_error_message(error: EngineError) -> String {
     match error {
-        EngineError::Provider(provider) => format!("provider_request_failed: {provider}"),
+        EngineError::Provider(provider) => structured_ui_message(
+            "provider_request_failed",
+            json!({"detail": provider.to_string()}),
+        ),
         error => error.to_string(),
     }
 }
@@ -14744,7 +14760,10 @@ async fn read_transcript_for_state(
                         if let Some(tool) = payload.get("tool").and_then(Value::as_str) {
                             payload["risk"] = json!(approval_risk(tool));
                         }
-                        payload["reason"] = json!("Tool action requires approval");
+                        payload["reason"] = json!(structured_ui_message(
+                            "approval_tool_action_requires",
+                            json!({})
+                        ));
                     }
                     json!({"kind":record.kind,"payload":payload})
                 })
@@ -16118,11 +16137,11 @@ pub(crate) async fn submit_turn_inner_with_context(
                     json!({
                         "kind": pending_kind,
                         "text": if pending_kind == "question" {
-                            "Question delivered to Inbox"
+                            "Question delivered to Inbox".to_owned()
                         } else if pending_kind == "plan" {
-                            "Plan confirmation delivered to Inbox"
+                            "Plan confirmation delivered to Inbox".to_owned()
                         } else {
-                            "Approval required; delivered to Inbox"
+                            structured_ui_message("approval_delivered_to_inbox", json!({}))
                         }
                     }),
                 );
@@ -16160,7 +16179,10 @@ pub(crate) async fn submit_turn_inner_with_context(
                             "tool":pending.tool,
                             "arguments":redact_approval_value(&pending.arguments),
                             "risk":approval_risk(&pending.tool),
-                            "reason":"Tool action requires approval"
+                            "reason": structured_ui_message(
+                                "approval_tool_action_requires",
+                                json!({}),
+                            )
                         }),
                     );
                 }
@@ -16168,7 +16190,7 @@ pub(crate) async fn submit_turn_inner_with_context(
             let message = if pending_kind == "question" {
                 "Question requires an answer before this tool can continue".to_owned()
             } else {
-                "Approval required before this tool can continue".to_owned()
+                structured_ui_message("approval_required_before_tool_continue", json!({}))
             };
             emit(
                 &app,
@@ -16512,7 +16534,10 @@ impl AcpDesktopLifecycle {
                         );
                         self.sink.emit(
                             "notice",
-                            json!({"kind":"approval_pending","text":"Approval request sent to the Inbox"}),
+                            json!({"kind":"approval_pending","text": structured_ui_message(
+                                "approval_request_sent_to_inbox",
+                                json!({}),
+                            )}),
                         );
                         self.sink.emit(
                             "turn_done",
@@ -16798,7 +16823,10 @@ async fn interrupt_for_state(
         &app,
         "notice",
         Some(&session_id),
-        json!({"kind":"interrupted","text":"Turn interrupted"}),
+        json!({
+            "kind":"interrupted",
+            "text": structured_ui_message("turn_interrupted", json!({})),
+        }),
     );
     emit(
         &app,
@@ -18246,7 +18274,7 @@ async fn resolve_inbox(
                     Some(&session_id),
                     json!({
                         "kind": "approval_pending",
-                        "text": "Approval required; delivered to the Inbox",
+                        "text": structured_ui_message("approval_delivered_to_inbox", json!({})),
                         "task_id": payload["task_id"],
                         "call_id": next_call_id,
                     }),
@@ -18279,7 +18307,10 @@ async fn change_model(
         &app,
         "notice",
         Some(&session_id),
-        json!({"kind":"model_switch","text":format!("Switched to {model}")}),
+        json!({"kind":"model_switch","text": structured_ui_message(
+            "model_switch",
+            json!({"model": model}),
+        )}),
     );
     Ok(())
 }
@@ -26865,7 +26896,10 @@ async fn mark_worker_approval_pending(
         Some(leader_session),
         json!({
             "kind": "coordination_approval_pending",
-            "text": "A dispatched Worker needs approval; open the Inbox to continue.",
+            "text": structured_ui_message(
+                "coordination_worker_approval_required",
+                json!({}),
+            ),
             "task_id": task_id,
             "worker_session_id": worker_session,
             "call_id": call_id,
@@ -26877,7 +26911,7 @@ async fn mark_worker_approval_pending(
         Some(worker_session),
         json!({
             "kind": "approval_pending",
-            "text": "Approval required; delivered to the Inbox",
+            "text": structured_ui_message("approval_delivered_to_inbox", json!({})),
             "task_id": task_id,
             "call_id": call_id,
         }),

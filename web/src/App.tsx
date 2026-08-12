@@ -12058,7 +12058,7 @@ function AppContent() {
       .__TAURI_INTERNALS__;
     const message = errorMessage(reason);
     if (
-      message.includes("Approval required before this tool can continue") ||
+      message.includes(translate("approvalRequiredBeforeToolContinue")) ||
       message.includes(
         "Question requires an answer before this tool can continue",
       )
@@ -13201,7 +13201,7 @@ function AppContent() {
                           callId: pendingApproval.callId,
                           name: pendingApproval.name,
                           args: pendingApproval.args,
-                          reason: "Tool action requires approval",
+                          reason: translate("approvalToolActionRequires"),
                         }}
                         hostName={selected.host_name}
                         onApprove={(decision, optionId) => {

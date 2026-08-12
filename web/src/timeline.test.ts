@@ -26,11 +26,52 @@ const saved = persisted as TimelineEvent[];
 const opcos = opcosEvents as TimelineEvent[];
 
 describe("single event-log timeline", () => {
+  it("translates recognized normal-flow notice codes before rendering in zh", () => {
+    const previousLocale = getLocale();
+    setLocale("zh");
+    try {
+      const codes = [
+        "turn_interrupted",
+        "turn_finished",
+        "approval_request_sent_to_inbox",
+        "approval_tool_action_requires",
+        "approval_required_before_tool_continue",
+        "coordination_worker_approval_required",
+        'model_switch {"model":"custom-model"}',
+        'provider_request_failed {"detail":"upstream overloaded"}',
+      ];
+      const nodes = buildTimeline(
+        codes.map((message, index) => ({
+          type: "error",
+          event_id: `structured-${index}`,
+          created_at_ms: index + 1,
+          working_event: {
+            event_type: "error",
+            payload: { message },
+          },
+        })) as TimelineEvent[],
+      );
+      const rendered = nodes
+        .filter((node) => node.kind === "notice")
+        .map((node) => node.text)
+        .join("\n");
+      for (const code of codes) {
+        expect(rendered).not.toContain(code.split(" ")[0]);
+      }
+      expect(rendered).not.toContain("Turn interrupted");
+      expect(rendered).not.toContain("Tool action requires approval");
+      expect(rendered).toContain("提供商请求失败");
+    } finally {
+      setLocale(previousLocale);
+    }
+  });
+
   it("keeps provider notice and toast localized in the zh locale", () => {
     const previousLocale = getLocale();
     setLocale("zh");
     try {
-      const code = "provider_request_failed: provider returned HTTP 400";
+      const code =
+        'provider_request_failed {"detail":"provider returned HTTP 400"}';
       const nodes = buildTimeline([
         {
           type: "provider_error",
@@ -66,7 +107,7 @@ describe("single event-log timeline", () => {
         working_event: {
           event_type: "provider_error",
           payload: {
-            message: "provider_request_failed: upstream overloaded",
+            message: 'provider_request_failed {"detail":"upstream overloaded"}',
           },
         },
       },
@@ -78,7 +119,7 @@ describe("single event-log timeline", () => {
       text: "Provider request failed: upstream overloaded",
     });
     expect(notice?.kind === "notice" && notice.text).not.toContain(
-      "provider_request_failed:",
+      "provider_request_failed",
     );
   });
 
@@ -190,7 +231,7 @@ describe("single event-log timeline", () => {
           event_type: "provider_waiting",
           payload: {
             elapsed_seconds: 3,
-            message: "Waiting for provider response (3s)",
+            message: 'provider_waiting {"elapsed":"3","phase":"response"}',
           },
         },
       },
@@ -202,7 +243,7 @@ describe("single event-log timeline", () => {
           event_type: "provider_waiting",
           payload: {
             elapsed_seconds: 8,
-            message: "Waiting for provider response (8s)",
+            message: 'provider_waiting {"elapsed":"8","phase":"response"}',
           },
         },
       },
@@ -212,7 +253,7 @@ describe("single event-log timeline", () => {
         created_at_ms: 9000,
         working_event: {
           event_type: "provider_waiting_cleared",
-          payload: { message: "Provider response resumed" },
+          payload: { message: "provider_waiting_cleared" },
         },
       },
     ] as TimelineEvent[]);

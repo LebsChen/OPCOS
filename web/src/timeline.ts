@@ -597,6 +597,7 @@ export function buildTimeline(
         "model_current",
         "session_list",
         "slash_help",
+        "model_switch",
       ].includes(type)
     ) {
       flush(event.created_at_ms);
@@ -612,20 +613,9 @@ export function buildTimeline(
       if (text) {
         nodes.push({
           kind: "notice",
-          // Backend error codes must be translated on every rendered path; keep provider detail raw.
-          text: type === "provider_error" ? translateBackendError(text) : text,
+          text: translateBackendError(text),
           noticeKind: type,
           retriable: type === "error" || type === "provider_error",
-        });
-      }
-    } else if (type === "model_switch") {
-      flush(event.created_at_ms);
-      const model = String(data.model ?? data.model_id ?? "").trim();
-      if (model) {
-        nodes.push({
-          kind: "notice",
-          text: translate("switchedToModel", { model }),
-          noticeKind: type,
         });
       }
     } else if (
@@ -645,8 +635,13 @@ export function buildTimeline(
       const activeWork = ensureWork(event.created_at_ms);
       const message =
         typeof data.message === "string" && data.message.trim()
-          ? data.message.trim()
-          : `Waiting for provider response (${String(data.elapsed_seconds ?? 0)}s)`;
+          ? translateBackendError(data.message.trim())
+          : translateBackendError(
+              `provider_waiting ${JSON.stringify({
+                elapsed: String(data.elapsed_seconds ?? 0),
+                phase: "response",
+              })}`,
+            );
       const existing = activeWork.rows.find((row) => row.providerWaiting);
       if (existing) {
         existing.label = message;

@@ -1041,6 +1041,19 @@ export const messages: Record<Locale, Record<string, string>> = {
     hostUnavailable: "Host unavailable",
     providerError: "Model service error",
     providerRequestFailed: "Provider request failed{status}",
+    providerWaiting: "Waiting for provider {phase} ({elapsed}s)",
+    providerResponse: "response",
+    providerStream: "stream",
+    providerWaitingCleared: "Provider response resumed",
+    turnInterrupted: "Turn interrupted",
+    turnFinished: "Turn finished",
+    approvalRequestSentToInbox: "Approval request sent to the Inbox",
+    approvalDeliveredToInbox: "Approval required; delivered to the Inbox",
+    approvalToolActionRequires: "Tool action requires approval",
+    approvalRequiredBeforeToolContinue:
+      "Approval required before this tool can continue",
+    coordinationWorkerApprovalRequired:
+      "A dispatched Worker needs approval; open the Inbox to continue.",
     providerKeyNotConfigured:
       "Provider key is not configured; open Provider settings first.",
     providerValidationFailed: "Provider validation failed: {error}",
@@ -2163,6 +2176,18 @@ export const messages: Record<Locale, Record<string, string>> = {
     hostUnavailable: "主机不可用",
     providerError: "模型服务错误",
     providerRequestFailed: "提供商请求失败{status}",
+    providerWaiting: "等待提供商{phase}（{elapsed} 秒）",
+    providerResponse: "响应",
+    providerStream: "流",
+    providerWaitingCleared: "提供商响应已恢复",
+    turnInterrupted: "回合已中断",
+    turnFinished: "回合已完成",
+    approvalRequestSentToInbox: "审批请求已发送到收件箱",
+    approvalDeliveredToInbox: "需要审批；已发送到收件箱",
+    approvalToolActionRequires: "工具操作需要审批",
+    approvalRequiredBeforeToolContinue: "继续此工具前需要审批",
+    coordinationWorkerApprovalRequired:
+      "已调度的工作单元需要审批；请打开收件箱继续。",
     providerKeyNotConfigured: "未配置提供商密钥；请先打开提供商设置。",
     providerValidationFailed: "提供商校验失败：{error}",
     policyDenied: "策略拒绝",
@@ -2372,18 +2397,52 @@ const backendErrorKeys: Record<string, string> = {
   "provider base url is not configured": "providerBaseUrlNotConfigured",
   "provider model discovery is unsupported":
     "providerModelDiscoveryUnsupported",
+  provider_request_failed: "providerRequestFailed",
+  provider_waiting: "providerWaiting",
+  provider_waiting_cleared: "providerWaitingCleared",
+  turn_interrupted: "turnInterrupted",
+  turn_finished: "turnFinished",
+  model_switch: "switchedToModel",
+  approval_request_sent_to_inbox: "approvalRequestSentToInbox",
+  approval_delivered_to_inbox: "approvalDeliveredToInbox",
+  approval_tool_action_requires: "approvalToolActionRequires",
+  approval_required_before_tool_continue: "approvalRequiredBeforeToolContinue",
+  coordination_worker_approval_required: "coordinationWorkerApprovalRequired",
 };
 
 export function translateBackendError(value: unknown): string {
   const text = String(value ?? "").trim();
-  const providerRequestPrefix = "provider_request_failed:";
-  if (text.toLowerCase().startsWith(providerRequestPrefix)) {
-    const detail = text.slice(providerRequestPrefix.length).trim();
-    return translate("providerRequestFailed", {
-      status: detail ? `: ${detail}` : "",
-    });
+  const match = /^([a-z][a-z0-9_]*)(?:\s+(\{.*\}))?$/i.exec(text);
+  if (!match) return translate(backendErrorKeys[text.toLowerCase()] || text);
+  const code = match[1].toLowerCase();
+  const key = backendErrorKeys[code];
+  if (!key) return translate(backendErrorKeys[text.toLowerCase()] || text);
+  let params: Record<string, string | number> = {};
+  if (match[2]) {
+    try {
+      const parsed = JSON.parse(match[2]) as Record<string, unknown>;
+      params = Object.fromEntries(
+        Object.entries(parsed).map(([name, parameter]) => [
+          name,
+          typeof parameter === "string" || typeof parameter === "number"
+            ? parameter
+            : String(parameter),
+        ]),
+      );
+    } catch {
+      return text;
+    }
   }
-  return translate(backendErrorKeys[text.toLowerCase()] || text);
+  if (code === "provider_waiting") {
+    params.phase =
+      params.phase === "stream"
+        ? translate("providerStream")
+        : translate("providerResponse");
+  }
+  if (code === "provider_request_failed") {
+    params.status = params.detail ? `: ${params.detail}` : "";
+  }
+  return translate(key, params);
 }
 
 export function translate(
