@@ -15,7 +15,7 @@ import { PersonaGlyph, personaGlyph } from "./personaIcon";
 import { SearchModal } from "./SearchModal";
 import { baseName } from "../paths";
 import { showPersonas } from "../flags";
-import { translate } from "../i18n";
+import { subscribeLocale, translate } from "../i18n";
 
 const AUTOMATIONS_CHANGED = "opcos://automations-changed";
 const PERSONAS_CHANGED = "opcos://personas-changed";
@@ -51,7 +51,7 @@ function AttnBadge({ n }: { n: number }) {
   return (
     <span
       className="text-[10px] font-semibold text-ink bg-faint/30 rounded-full px-1.5 leading-[15px] shrink-0"
-      title={`${n} awaiting your attention`}
+      title={translate("awaitingAttention", { count: n })}
     >
       {n > 99 ? "99+" : n}
     </span>
@@ -68,8 +68,8 @@ function UnseenBadge({ n, failed }: { n: number; failed?: boolean }) {
       className="text-[10px] font-semibold text-ink bg-faint/30 rounded-full px-1.5 leading-[15px] shrink-0"
       title={
         failed
-          ? `${n} new run${n > 1 ? "s" : ""} — the latest failed`
-          : `${n} new run${n > 1 ? "s" : ""}`
+          ? translate("newRunsLatestFailed", { count: n })
+          : translate("newRuns", { count: n })
       }
     >
       {n > 99 ? "99+" : n}
@@ -102,7 +102,7 @@ function OriginIcon({ s }: { s: SessionInfo }) {
     <ConnectorIcon
       connector={{ logo: "slack", brand_color: "#611f69" }}
       size={12}
-      title={s.origin_label || "From Slack"}
+      title={s.origin_label || translate("fromSlack")}
     />
   );
 }
@@ -194,6 +194,11 @@ type SidebarProps = Partial<Props> & {
 };
 
 export function Sidebar(props: SidebarProps) {
+  const [, setLocaleVersion] = useState(0);
+  useEffect(
+    () => subscribeLocale(() => setLocaleVersion((value) => value + 1)),
+    [],
+  );
   const agent = props.agent ?? "opcos";
   const workspace = props.workspace ?? "";
   const surfaces = props.surfaces ?? { chat: true };
@@ -460,8 +465,8 @@ export function Sidebar(props: SidebarProps) {
   const rowActions = (s: SessionInfo, title: string) => (
     <button
       className="w-6 h-6 grid place-items-center rounded text-faint hover:text-ink hover:bg-paper opacity-0 group-hover:opacity-100 focus:opacity-100 shrink-0"
-      aria-label={`Actions for ${title}`}
-      title="Session actions"
+      aria-label={translate("actionsFor", { title })}
+      title={translate("sessionActions")}
       onClick={(event) => {
         event.stopPropagation();
         openRowMenu(s.session_id, event.currentTarget);
@@ -613,7 +618,7 @@ export function Sidebar(props: SidebarProps) {
     pinnedSessions.length > 0 ? (
       <div>
         <div className="px-1.5 text-[10.5px] uppercase tracking-[0.07em] text-faint font-semibold mb-1">
-          Pinned
+          {translate("pinned")}
         </div>
         <div className="space-y-0.5">
           {pinnedSessions.map((s) => cardRow(s))}
@@ -628,7 +633,7 @@ export function Sidebar(props: SidebarProps) {
     automations.length > 0 ? (
       <div data-testid="scheduled-band">
         <div className="px-1.5 text-[10.5px] uppercase tracking-[0.07em] text-faint font-semibold mb-1">
-          Scheduled
+          {translate("scheduled")}
         </div>
         <div className="space-y-0.5">
           {automations.map((a) => (
@@ -687,12 +692,12 @@ export function Sidebar(props: SidebarProps) {
               data-testid="group-filter-menu"
             >
               <div className="px-2 pt-1 pb-1 text-[10.5px] uppercase tracking-[0.06em] text-faint font-semibold">
-                Group by
+                {translate("groupBy")}
               </div>
               {(
                 [
-                  ["grouped", "Persona"],
-                  ["flat", "Chronological"],
+                  ["grouped", "persona"],
+                  ["flat", "chronological"],
                 ] as ["flat" | "grouped", string][]
               ).map(([key, label]) => (
                 <button
@@ -700,7 +705,7 @@ export function Sidebar(props: SidebarProps) {
                   className="w-full flex items-center gap-2 px-2 py-1.5 rounded-lg text-[13px] text-left hover:bg-paper"
                   onClick={() => setGroupBy(key)}
                 >
-                  <span className="flex-1">{label}</span>
+                  <span className="flex-1">{translate(label)}</span>
                   {layout === key && (
                     <span className="text-accent text-[12px]">✓</span>
                   )}
@@ -711,14 +716,14 @@ export function Sidebar(props: SidebarProps) {
                   <div className="my-1 border-t border-line" />
                   <div className="px-2 pt-1 pb-1 flex items-center justify-between">
                     <span className="text-[10.5px] uppercase tracking-[0.06em] text-faint font-semibold">
-                      Filter by workspace
+                      {translate("filterWorkspace")}
                     </span>
                     {filterPersonas.size > 0 && (
                       <button
                         className="text-[11px] text-accent"
                         onClick={() => setFilterPersonas(new Set())}
                       >
-                        Clear
+                        {translate("clear")}
                       </button>
                     )}
                   </div>
@@ -749,7 +754,7 @@ export function Sidebar(props: SidebarProps) {
                     })}
                   </div>
                   <div className="px-2 pt-1 pb-0.5 text-[11px] text-faint leading-snug">
-                    None checked shows all.
+                    {translate("noneChecked")}
                   </div>
                 </>
               )}
@@ -838,7 +843,7 @@ export function Sidebar(props: SidebarProps) {
                 rows carry a right-aligned compact age and truncate to PROJECT_PEEK + "Show more". */}
             <div className="flex items-center justify-between px-1.5 pt-1">
               <span className="text-[10.5px] uppercase tracking-[0.07em] text-faint font-semibold">
-                Projects
+                {translate("projects")}
               </span>
               <button
                 className="w-5 h-5 grid place-items-center rounded text-faint hover:text-ink hover:bg-panel"
@@ -852,7 +857,7 @@ export function Sidebar(props: SidebarProps) {
             <div className="space-y-0.5">
               {projectOrder.length === 0 && (
                 <div className="px-2 py-1.5 text-[12px] text-faint leading-snug">
-                  No projects yet — start one with the + above.
+                  {translate("noProjects")}
                 </div>
               )}
               {projectOrder.map((proj) => {
@@ -908,13 +913,15 @@ export function Sidebar(props: SidebarProps) {
                                 setProjShowAll((s) => toggleSet(s, proj))
                               }
                             >
-                              Show more ({list.length - peek})
+                              {translate("showMoreCount", {
+                                count: list.length - peek,
+                              })}
                             </button>
                           )}
                         </div>
                       ) : (
                         <div className="px-2 py-1.5 pl-[19px] text-[12px] text-faint leading-snug">
-                          No conversations in this project yet.
+                          {translate("noProjectConversations")}
                         </div>
                       ))}
                   </div>
@@ -927,8 +934,8 @@ export function Sidebar(props: SidebarProps) {
             {mine.filter(matches).length === 0 ? (
               <div className="px-2 py-1.5 text-[12px] text-faint leading-snug">
                 {normalizedQuery
-                  ? "No matching conversations."
-                  : "No conversations yet."}
+                  ? translate("noMatchingConversations")
+                  : translate("noConversations")}
               </div>
             ) : (
               <>
@@ -944,7 +951,9 @@ export function Sidebar(props: SidebarProps) {
                         setPersonaShowAll((s) => toggleSet(s, browseKey))
                       }
                     >
-                      Show more ({mine.filter(matches).length - peek})
+                      {translate("showMoreCount", {
+                        count: mine.filter(matches).length - peek,
+                      })}
                     </button>
                   )}
               </>
@@ -963,7 +972,7 @@ export function Sidebar(props: SidebarProps) {
                 size={13}
                 className="shrink-0"
               />
-              Archived ({archived.length})
+              {translate("archivedCount", { count: archived.length })}
             </button>
             {showArchived && (
               <div className="space-y-0.5 mt-0.5">
@@ -986,8 +995,8 @@ export function Sidebar(props: SidebarProps) {
         <div className="sidebar-header collapsed-header">
           <button
             className="nav-item-icon"
-            title="展开侧栏 (⌘B)"
-            aria-label="展开侧栏"
+            title={`${translate("expandSidebar")} (⌘B)`}
+            aria-label={translate("expandSidebar")}
             onClick={props.onCollapse}
           >
             <Icon name="sidebar" size={16} />
@@ -995,7 +1004,7 @@ export function Sidebar(props: SidebarProps) {
         </div>
         <button
           className="nav-item-icon"
-          title="新建会话"
+          title={translate("newSession")}
           onClick={() => onNewSession(agent)}
         >
           <Icon name="plus" size={18} />
@@ -1060,14 +1069,16 @@ export function Sidebar(props: SidebarProps) {
       >
         <div className="brand-wordmark text-[15px] flex-1">
           <span className="brand-logo" aria-hidden="true" />
-          OPCOS<span className="beta-tag">BETA</span>
+          OPCOS<span className="beta-tag">{translate("beta")}</span>
         </div>
         {/* Collapse (dock) / pin the sidebar. ⌘B mirrors this. */}
         {props.onCollapse && (
           <button
             className="nav-pin-btn w-7 h-7 grid place-items-center rounded-md text-faint hover:text-ink hover:bg-paper shrink-0"
             title={
-              props.collapsed ? "Dock sidebar (⌘B)" : "Collapse sidebar (⌘B)"
+              props.collapsed
+                ? `${translate("dockSidebar")} (⌘B)`
+                : `${translate("collapseSidebar")} (⌘B)`
             }
             aria-label={
               props.collapsed
@@ -1126,11 +1137,11 @@ export function Sidebar(props: SidebarProps) {
           <div>
             <div className="flex items-center justify-between px-1.5 mb-1">
               <span className="text-[10.5px] uppercase tracking-[0.07em] text-faint font-semibold">
-                项目
+                {translate("projectLabel")}
               </span>
               <button
                 className="w-6 h-6 grid place-items-center rounded-md text-faint hover:text-ink hover:bg-paper"
-                title="新建项目"
+                title={translate("newProject")}
                 onClick={onCreateProject}
               >
                 <Icon name="plus" size={14} />
@@ -1180,7 +1191,7 @@ export function Sidebar(props: SidebarProps) {
                   className="w-full px-2 py-1.5 text-left text-[12px] text-faint hover:text-ink"
                   onClick={onCreateProject}
                 >
-                  新建项目
+                  {translate("newProject")}
                 </button>
               )}
             </div>
@@ -1272,7 +1283,7 @@ export function Sidebar(props: SidebarProps) {
         <>
           <button
             className="fixed inset-0 z-40 cursor-default"
-            aria-label="Close session actions"
+            aria-label={translate("closeSessionActions")}
             onClick={closeRowMenu}
           />
           <div
@@ -1289,7 +1300,7 @@ export function Sidebar(props: SidebarProps) {
                 closeRowMenu();
               }}
             >
-              Rename
+              {translate("rename")}
             </button>
             <button
               className="w-full px-2 py-1.5 rounded-lg text-[13px] text-left hover:bg-paper"
@@ -1299,7 +1310,7 @@ export function Sidebar(props: SidebarProps) {
                 closeRowMenu();
               }}
             >
-              {rowMenuSession.pinned ? "Unpin" : "Pin"}
+              {rowMenuSession.pinned ? translate("unpin") : translate("pin")}
             </button>
             <button
               className="w-full px-2 py-1.5 rounded-lg text-[13px] text-left hover:bg-paper"
@@ -1312,7 +1323,9 @@ export function Sidebar(props: SidebarProps) {
                 closeRowMenu();
               }}
             >
-              {rowMenuSession.archived ? "Unarchive" : "Archive"}
+              {rowMenuSession.archived
+                ? translate("unarchive")
+                : translate("archive")}
             </button>
             <div className="my-1 border-t border-line" />
             <button
@@ -1328,8 +1341,8 @@ export function Sidebar(props: SidebarProps) {
               }}
             >
               {confirmDelId === rowMenuSession.session_id
-                ? "Delete?"
-                : "Delete"}
+                ? translate("deleteQuestion")
+                : translate("delete")}
             </button>
           </div>
         </>
@@ -1373,7 +1386,7 @@ export function Sidebar(props: SidebarProps) {
                 )}
                 {appMenuItem(
                   "inbox",
-                  "Inbox",
+                  translate("inbox"),
                   props.onOpenInbox ?? (() => undefined),
                   props.inboxActive,
                 )}
@@ -1481,7 +1494,7 @@ function NewSessionSplit({
           <div className="fixed inset-0 z-20" onClick={() => setOpen(false)} />
           <div className="newsplit-menu absolute left-3 right-3 mt-1 z-30 bg-panel border border-line rounded-xl2 shadow-xl p-1">
             <div className="px-2 py-1 text-[10.5px] uppercase tracking-[0.06em] text-faint font-semibold">
-              Start a session as
+              {translate("startSessionAs")}
             </div>
             {enabled.map((p) => (
               <button
@@ -1516,7 +1529,7 @@ function NewSessionSplit({
                     onManage();
                   }}
                 >
-                  Manage personas…
+                  {translate("managePersonas")}
                 </button>
               </div>
             )}

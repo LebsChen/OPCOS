@@ -177,8 +177,8 @@ describe("GUI boundary behavior", () => {
     );
     expect(rows).toHaveLength(1);
     expect(rows[0].session).toBeNull();
-    expect(projectAgentRosterValue("")).toBe("Unknown");
-    expect(projectAgentRosterValue(null)).toBe("Unknown");
+    expect(projectAgentRosterValue("")).toBe("");
+    expect(projectAgentRosterValue(null)).toBe("");
   });
 
   it("renders an empty project roster as an empty list", () => {

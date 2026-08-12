@@ -1,3 +1,5 @@
+import { translate, translateBackendError } from "./i18n";
+
 export type Host = {
   id: string;
   name: string;
@@ -81,7 +83,7 @@ export type ProjectAgentRosterRow = {
 export function projectAgentRosterValue(
   value: string | null | undefined,
 ): string {
-  return value?.trim() || "Unknown";
+  return value?.trim() || "";
 }
 
 export function projectAgentRosterHost(session: Session | null): string {
@@ -367,7 +369,10 @@ export function noticeClass(kind: string): string {
 }
 
 export function redactApproval(value: unknown): string {
-  const text = JSON.stringify(value) ?? String(value ?? "");
+  const text =
+    typeof value === "string"
+      ? value
+      : (JSON.stringify(value) ?? String(value ?? ""));
   return text
     .replace(/Bearer\s+[^\s"]+/gi, "Bearer [redacted]")
     .replace(
@@ -379,13 +384,15 @@ export function redactApproval(value: unknown): string {
 export function submitFailureMessage(error: unknown): string {
   const message = errorMessage(error);
   return message.includes("provider key is not configured")
-    ? "Provider key is not configured; open Provider settings first."
+    ? translate("providerKeyNotConfigured")
     : message;
 }
 
 export function errorMessage(error: unknown): string {
-  if (error instanceof Error && error.message.trim()) return error.message;
-  if (typeof error === "string" && error.trim()) return error;
+  if (error instanceof Error && error.message.trim())
+    return translateBackendError(error.message);
+  if (typeof error === "string" && error.trim())
+    return translateBackendError(error);
   if (
     error &&
     typeof error === "object" &&
@@ -393,7 +400,7 @@ export function errorMessage(error: unknown): string {
     typeof error.message === "string" &&
     error.message.trim()
   )
-    return error.message;
+    return translateBackendError(error.message);
   try {
     const serialized = JSON.stringify(error);
     if (serialized && serialized !== "{}") return serialized;

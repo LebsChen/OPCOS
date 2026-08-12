@@ -1,4 +1,5 @@
 import type { Attachment } from "./types";
+import { translate, translateBackendError } from "./i18n";
 
 export type TimelineEvent = {
   type: string;
@@ -394,7 +395,7 @@ export function buildTimeline(
     if (!work) {
       work = {
         kind: "work",
-        label: "Worked for 0s",
+        label: translate("workingFor", { seconds: 0 }),
         rows: [],
         additions: 0,
         deletions: 0,
@@ -448,7 +449,13 @@ export function buildTimeline(
       return;
     }
     const seconds = Math.max(0, Math.round((endedAt - workStarted) / 1000));
-    work.label = `Worked for ${seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`}`;
+    work.label =
+      seconds < 60
+        ? translate("workingFor", { seconds })
+        : translate("workingForMinutes", {
+            minutes: Math.floor(seconds / 60),
+            seconds: seconds % 60,
+          });
     nodes.push(work);
     work = null;
   };
@@ -588,7 +595,6 @@ export function buildTimeline(
         "mode_current",
         "mode_changed",
         "model_current",
-        "model_switch",
         "session_list",
         "slash_help",
       ].includes(type)
@@ -606,9 +612,20 @@ export function buildTimeline(
       if (text) {
         nodes.push({
           kind: "notice",
-          text,
+          // Backend error codes must be translated on every rendered path; keep provider detail raw.
+          text: type === "provider_error" ? translateBackendError(text) : text,
           noticeKind: type,
           retriable: type === "error" || type === "provider_error",
+        });
+      }
+    } else if (type === "model_switch") {
+      flush(event.created_at_ms);
+      const model = String(data.model ?? data.model_id ?? "").trim();
+      if (model) {
+        nodes.push({
+          kind: "notice",
+          text: translate("switchedToModel", { model }),
+          noticeKind: type,
         });
       }
     } else if (

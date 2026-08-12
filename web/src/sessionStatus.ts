@@ -1,46 +1,50 @@
+import { translate } from "./i18n";
+
 export function sessionStatusLabel(
   runState: string | undefined,
   stopReason: string | undefined,
   terminalCause?: string,
 ): string {
-  if (terminalCause === "model_stopped") return "模型主动结束";
+  if (terminalCause === "model_stopped") return translate("modelStopped");
   switch (stopReason) {
     case "waiting_for_user":
-      return "等你回话";
+      return translate("waitingForUser");
     case "waiting_for_approval":
-      return "等审批";
+      return translate("waitingForApproval");
     case "finished":
-      return "已完成";
+      return translate("finished");
     case "interrupted_by_user":
-      return "已中断";
+      return translate("interrupted");
     case "interrupted_by_crash":
-      return "已中断（应用退出）";
+      return translate("interruptedByCrash");
     case "host_unavailable":
-      return "主机不可用";
+      return translate("hostUnavailable");
     case "provider_error":
-      return "模型服务错误";
+      return translate("providerError");
     case "policy_denied":
-      return "策略拒绝";
+      return translate("policyDenied");
     case "context_exhausted":
-      return "上下文已耗尽";
+      return translate("contextExhausted");
     case "internal_error":
-      return "内部错误";
+      return translate("internalError");
     case "tool_preflight_error":
-      return "工具执行前检查失败";
+      return translate("toolPreflightError");
     case "usage_limit":
-      return "已达到用量限制";
+      return translate("usageLimit");
     case "harness_error":
-      return "Agent 运行时连接失败";
+      return translate("harnessError");
     case "turn_already_running":
-      return runState === "running" ? "运行中" : "正在运行";
+      return runState === "running"
+        ? translate("running")
+        : translate("alreadyRunning");
     case "max_iterations":
-      return "达到最大轮次";
+      return translate("maxIterations");
     case "none":
-      if (runState === "running") return "运行中";
-      if (runState === "error") return "运行出错";
-      return "空闲";
+      if (runState === "running") return translate("running");
+      if (runState === "error") return translate("runError");
+      return translate("idle");
     default:
-      return "状态未知";
+      return translate("unknownStatus");
   }
 }
 

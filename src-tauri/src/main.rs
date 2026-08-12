@@ -8188,15 +8188,15 @@ description: 为新行为和缺陷修复设计覆盖正常、失败及边界条�
         (
             "template-command-verify",
             "/verify",
-            "展开为一份明确的本地验证请求；命令本身不执行任何动作。",
-            "请按 {{scope}} 范围检查当前仓库：先确认变更范围，再运行项目已有的格式化、静态检查、类型检查、构建和测试门禁。只报告实际执行结果，不把未运行的检查写成通过。",
+            "Expand into a clear local verification request; the command itself performs no actions.",
+            "Check the current repository within {{scope}}: confirm the change scope first, then run the project's existing formatting, static checks, type checks, build, and test gates. Report only commands actually run; never claim an unrun check passed.",
             json!([{"name":"scope","type":"string","required":true}]),
         ),
         (
             "template-command-review",
             "/review-change",
-            "展开为一份聚焦风险和证据的代码审查请求；命令本身不执行任何动作。",
-            "请审查当前变更，重点检查 {{focus}}、错误路径、边界条件、凭据安全和测试覆盖。按文件位置给出可复现证据；没有问题时说明检查过的风险面。",
+            "Expand into a focused code review request about risks and evidence; the command itself performs no actions.",
+            "Review the current change, focusing on {{focus}}, error paths, boundary conditions, credential safety, and test coverage. Give reproducible evidence with file locations; if there are no issues, state which risk areas were checked.",
             json!([{"name":"focus","type":"string","required":true}]),
         ),
     ];
@@ -8305,27 +8305,81 @@ fn seed_builtin_template(
     description: &str,
     content: &Value,
 ) -> Result<(), String> {
-    let already_defined: bool = connection
+    let existing: Option<(String, String, String, String)> = connection
         .query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM config_object
-               WHERE scope_kind='global' AND status <> 'deleted'
-                 AND kind=?1 AND name=?2
-             )",
+            "SELECT o.id,o.status,v.content,v.metadata_json
+             FROM config_object o
+             LEFT JOIN config_object_version v ON v.id=o.current_version_id
+             WHERE o.scope_kind='global' AND o.status <> 'deleted'
+               AND o.kind=?1 AND o.name=?2
+             LIMIT 1",
             params![kind, name],
-            |row| row.get(0),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                ))
+            },
         )
-        .map_err(|error| error.to_string())?;
-    if already_defined {
-        return Ok(());
-    }
-    let now = Utc::now().to_rfc3339();
-    let metadata = serde_json::to_string(&json!({"description":description}))
+        .optional()
         .map_err(|error| error.to_string())?;
     let body = content
         .as_str()
         .map(str::to_owned)
         .unwrap_or(serde_json::to_string(content).map_err(|error| error.to_string())?);
+    let metadata = serde_json::to_string(&json!({"description":description}))
+        .map_err(|error| error.to_string())?;
+    if let Some((object_id, status, current_body, current_metadata)) = existing {
+        let current_description = serde_json::from_str::<Value>(&current_metadata)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        if status != "builtin"
+            || (current_body == body && current_description.as_deref() == Some(description))
+        {
+            return Ok(());
+        }
+        let next_version: i64 = connection
+            .query_row(
+                "SELECT COALESCE(MAX(version),0)+1
+                 FROM config_object_version WHERE object_id=?1",
+                [&object_id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let version_id = format!("{object_id}:v{next_version}");
+        let now = Utc::now().to_rfc3339();
+        connection
+            .execute(
+                "INSERT INTO config_object_version
+                 (id,object_id,version,content,content_hash,created_at,note,metadata_json)
+                 VALUES (?1,?2,?3,?4,?5,?6,'builtin seed update',?7)",
+                params![
+                    version_id,
+                    object_id,
+                    next_version,
+                    body,
+                    content_hash(&body),
+                    now,
+                    metadata
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        connection
+            .execute(
+                "UPDATE config_object SET current_version_id=?1 WHERE id=?2",
+                params![version_id, object_id],
+            )
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    let now = Utc::now().to_rfc3339();
     connection
         .execute(
             "INSERT OR IGNORE INTO config_object
@@ -8377,8 +8431,10 @@ fn seed_builtin_command(
         .execute(
             "UPDATE config_object_version
              SET metadata_json=?1
-             WHERE id=?2 AND object_id=?3",
-            params![metadata, format!("{id}:v1"), id],
+             WHERE id=(
+               SELECT current_version_id FROM config_object WHERE id=?2
+             ) AND object_id=?2",
+            params![metadata, id],
         )
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -8496,31 +8552,31 @@ fn builtin_slash_commands() -> Vec<(&'static str, &'static str)> {
     vec![
         (
             "/implement",
-            "请把当前任务落实为可运行的实现：先检查相关代码和约束，再做最小完整修改，并运行针对性测试。",
+            "Implement the current task as a runnable change: inspect the relevant code and constraints, make the smallest complete edit, and run focused tests.",
         ),
         (
             "/plan",
-            "请先分析目标、现状、依赖和风险，给出分步骤执行计划；未经确认不要修改文件。",
+            "Analyze the goal, current state, dependencies, and risks, then give a step-by-step plan; do not edit files without confirmation.",
         ),
         (
             "/review",
-            "请以严格代码审查方式检查当前变更，优先找功能缺陷、回归、边界条件和安全问题，并给出证据。",
+            "Review the current changes rigorously, prioritizing defects, regressions, edge cases, and security issues, with evidence.",
         ),
         (
             "/test",
-            "请围绕当前任务补充或运行有意义的测试，覆盖成功、失败和边界行为，不要只验证数据存取。",
+            "Add or run meaningful tests for the current task, covering success, failure, and boundary behavior rather than only data access.",
         ),
         (
             "/think-hard",
-            "请深入推演问题的隐含约束、替代方案和失败模式，再提出经过验证的实现路径。",
+            "Reason deeply about hidden constraints, alternatives, and failure modes before proposing a validated implementation path.",
         ),
         (
             "/deploy",
-            "请检查发布前置条件、构建产物和部署步骤；只执行仓库允许且明确授权的部署动作。",
+            "Check release prerequisites, build artifacts, and deployment steps; execute only explicitly authorized repository actions.",
         ),
         (
             "/pull-project",
-            "请同步当前项目的仓库状态，核对分支和未提交改动，再继续处理项目任务。",
+            "Sync the current project repository state, verify the branch and uncommitted changes, then continue with the task.",
         ),
     ]
 }
@@ -10061,14 +10117,14 @@ fn list_project_configuration_templates(
                 "name": row.get::<_, String>(2)?,
                 "status": row.get::<_, String>(3)?,
                 "source": if row.get::<_, String>(3)? == "builtin" {
-                    "内置"
+                    "builtin"
                 } else if row
                     .get::<_, Option<String>>(4)?
                     .is_some_and(|scope| scope.starts_with("repo:"))
                 {
-                    "仓库"
+                    "repository"
                 } else {
-                    "自定义"
+                    "custom"
                 },
                 "content": row.get::<_, String>(5)?,
                 "applied": row.get::<_, bool>(12)?,
@@ -10102,7 +10158,7 @@ fn list_project_configuration_templates(
                 "kind": row.get::<_, String>(1)?,
                 "name": row.get::<_, String>(2)?,
                 "status": row.get::<_, String>(3)?,
-                "source": "项目",
+                "source": "project",
                 "content": row.get::<_, String>(4)?,
                 "applied": true,
                 "overridden": true,
@@ -13017,7 +13073,10 @@ async fn engine_for_with_context(
 }
 
 fn engine_error_message(error: EngineError) -> String {
-    error.to_string()
+    match error {
+        EngineError::Provider(provider) => format!("provider_request_failed: {provider}"),
+        error => error.to_string(),
+    }
 }
 
 #[tauri::command]
@@ -18744,11 +18803,11 @@ fn list_configured_library(
                     .get::<_, Option<String>>(7)?
                     .is_some_and(|scope| scope.starts_with("repo:"))
                 {
-                    "仓库"
+                    "repository"
                 } else if row.get::<_, String>(3)? == "builtin" {
-                    "内置"
+                    "builtin"
                 } else {
-                    "自定义"
+                    "custom"
                 }
             }))
         })
@@ -20717,7 +20776,7 @@ async fn mcp_tools(
 ) -> Result<Vec<Value>, String> {
     let host_id = session_host_id(&state, &session_id)?;
     if host_id == "local" {
-        return Err("本机 host 不提供远程 MCP tools；请绑定远程主机".into());
+        return Err("The local host does not provide remote MCP tools; bind a remote host.".into());
     }
     let response = client_for(&state, &host_id)?
         .mcp(json!({"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}))
@@ -31855,6 +31914,58 @@ mod m7_tests {
                 .unwrap();
             assert!(count > 0, "expected builtin preset for {kind}");
         }
+    }
+
+    #[test]
+    fn builtin_command_seed_versions_changed_body_and_keeps_description_aligned() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE config_object (
+                   id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
+                   server_key TEXT, scope_kind TEXT NOT NULL, scope_key TEXT,
+                   status TEXT NOT NULL, created_at TEXT NOT NULL,
+                   current_version_id TEXT
+                 );
+                 CREATE TABLE config_object_version (
+                   id TEXT PRIMARY KEY, object_id TEXT NOT NULL, version INTEGER NOT NULL,
+                   content TEXT NOT NULL, content_hash TEXT NOT NULL, created_at TEXT NOT NULL,
+                   note TEXT NOT NULL, metadata_json TEXT NOT NULL,
+                   UNIQUE(object_id,version)
+                 );",
+            )
+            .unwrap();
+        seed_builtin_templates(&connection).unwrap();
+        connection
+            .execute(
+                "UPDATE config_object_version
+                 SET content='请审查当前变更，重点检查风险和证据。', content_hash='legacy'
+                 WHERE id=(
+                   SELECT current_version_id FROM config_object
+                   WHERE id='template-command-review'
+                 )",
+                [],
+            )
+            .unwrap();
+        seed_builtin_templates(&connection).unwrap();
+        let (version, content, metadata): (i64, String, String) = connection
+            .query_row(
+                "SELECT v.version,v.content,v.metadata_json
+                 FROM config_object o
+                 JOIN config_object_version v ON v.id=o.current_version_id
+                 WHERE o.id='template-command-review'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(version, 2);
+        assert!(content.starts_with("Review the current change"));
+        assert!(metadata.contains("Expand into a focused code review request"));
+        assert!(
+            !metadata
+                .chars()
+                .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character))
+        );
     }
 
     #[test]

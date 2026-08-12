@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Persona, SessionInfo } from "../types";
 import { isProjectScoped, shortPersonaName } from "../personaScope";
+import { translate } from "../i18n";
 import { Icon } from "./Icon";
 import { baseName } from "../paths";
 
@@ -135,7 +136,7 @@ export function SearchModal({
             ref={inputRef}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Search chats"
+            placeholder={translate("searchChats")}
             className="flex-1 bg-transparent outline-none text-[15px] text-ink placeholder:text-faint"
           />
           <kbd className="text-[10.5px] text-faint bg-paper border border-line rounded px-1.5 py-0.5 font-sans">
@@ -145,7 +146,7 @@ export function SearchModal({
         <div className="max-h-[52vh] overflow-y-auto hairline-scroll py-2">
           {ordered.length === 0 ? (
             <div className="px-4 py-8 text-center text-[13px] text-faint">
-              No chats found.
+              {translate("noChatsFound")}
             </div>
           ) : (
             <div className="px-2">{ordered.map((s, i) => row(s, i))}</div>

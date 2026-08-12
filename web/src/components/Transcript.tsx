@@ -11,6 +11,7 @@ import {
   type TimelineEvent,
   type TimelineNode,
 } from "../timeline";
+import { translate } from "../i18n";
 import { Markdown } from "./Markdown";
 
 const CHEVRON_PATH =
@@ -78,7 +79,7 @@ function BubbleMeta({ text, ts }: { text: string; ts?: number }) {
     <div className="relative h-0 select-none">
       <div className="absolute top-1 left-0 flex items-center gap-1.5 text-[10.5px] text-faint opacity-0 group-hover:opacity-100">
         <button onClick={copy} data-testid="bubble-copy">
-          {copied ? "Copied" : "Copy"}
+          {copied ? translate("copied") : translate("copy")}
         </button>
         {typeof ts === "number" && (
           <span data-testid="bubble-ts">
@@ -171,7 +172,7 @@ function QuestionCard({
   return (
     <div className="approval transcript-question-card">
       <div className="transcript-question-head">
-        <strong>Question</strong>
+        <strong>{translate("question")}</strong>
         <span className="approval-with">{text}</span>
       </div>
       {options && options.length > 0 && (
@@ -193,7 +194,7 @@ function QuestionCard({
         <input
           className="input"
           value={answer}
-          placeholder="Type an answer"
+          placeholder={translate("typeAnswer")}
           onChange={(event) => setAnswer(event.target.value)}
           onKeyDown={(event) => {
             if (event.key === "Enter" && answer.trim()) {
@@ -211,7 +212,7 @@ function QuestionCard({
             setAnswer("");
           }}
         >
-          Send
+          {translate("send")}
         </button>
       </div>
     </div>
@@ -333,7 +334,7 @@ function PlanCard({
             strokeLinecap="round"
           />
         </svg>
-        <span>OPCOS execution plan</span>
+        <span>{translate("opcosExecutionPlan")}</span>
       </div>
       <div className="transcript-plan-steps">
         {steps.map((step, index) => {
@@ -386,9 +387,12 @@ function TerminalOutput({
       <pre className="artifact-code max-h-96 overflow-auto whitespace-pre-wrap break-words">
         {output}
         {truncated
-          ? `\n[Output truncated: ${
-              omittedBytes === undefined ? "some" : omittedBytes
-            } bytes omitted; the model saw the tail]`
+          ? `\n[${translate("outputTruncatedWithDetails", {
+              omitted:
+                omittedBytes === undefined
+                  ? translate("some")
+                  : String(omittedBytes),
+            })}]`
           : ""}
       </pre>
     </TranscriptDisclosure>
@@ -478,7 +482,7 @@ function ArtifactRow({
           <img
             className="max-w-full max-h-64 cursor-zoom-in"
             src={image}
-            alt="Screenshot artifact"
+            alt={translate("screenshotArtifact")}
             onClick={() => setLightboxOpen(true)}
           />
         ) : content ? (
@@ -486,7 +490,7 @@ function ArtifactRow({
             {diff ?? String(content.content ?? "")}
           </pre>
         ) : (
-          <span className="text-muted">Loading…</span>
+          <span className="text-muted">{translate("loading")}</span>
         )}
       </TranscriptDisclosure>
       {lightboxOpen && image && (
@@ -498,7 +502,7 @@ function ArtifactRow({
           <img
             className="max-h-full max-w-full"
             src={image}
-            alt="Screenshot artifact enlarged"
+            alt={translate("screenshotArtifactEnlarged")}
             onClick={(event) => event.stopPropagation()}
           />
         </div>
@@ -513,7 +517,7 @@ export function Transcript({
   hostName,
   running,
   onRetry,
-  retryLabel = "Retry",
+  retryLabel,
   onQuestionAnswer,
 }: {
   events: TimelineEvent[];
@@ -568,7 +572,10 @@ export function Transcript({
         if (node.kind === "approval")
           return node.resolved ? (
             <div className="transcript-resolved" key={index}>
-              Worked · {node.resolved === "allow" ? "Allowed" : "Denied"}{" "}
+              {translate("workedDetail")} ·{" "}
+              {node.resolved === "allow"
+                ? translate("allowedLabel")
+                : translate("deniedLabel")}{" "}
               {node.name}
             </div>
           ) : null;
@@ -608,7 +615,7 @@ export function Transcript({
               )}
               {node.retriable && onRetry && !running && (
                 <button className="btn ml-2" onClick={onRetry}>
-                  {retryLabel}
+                  {retryLabel || translate("retry")}
                 </button>
               )}
             </div>
@@ -640,11 +647,14 @@ export function Transcript({
                 <span className="transcript-row-meta">{row.shellId}</span>
               )}
               {row.exitCode !== undefined && row.exitCode !== 0 && (
-                <span className="transcript-row-meta">exit {row.exitCode}</span>
+                <span className="transcript-row-meta">
+                  {translate("exitLabel")} {row.exitCode}
+                </span>
               )}
               {row.denied && (
                 <span className="ml-2 text-xs text-muted">
-                  not run{row.detail ? ` · ${row.detail}` : ""}
+                  {translate("notRunDetail")}
+                  {row.detail ? ` · ${row.detail}` : ""}
                 </span>
               )}
               {row.durationMs !== undefined && (
@@ -656,7 +666,7 @@ export function Transcript({
                 <span
                   className={`transcript-row-result${row.resultError ? " text-danger" : ""}`}
                 >
-                  {row.resultError && "failed · "}
+                  {row.resultError && `${translate("failed")} · `}
                   {row.resultSummary}
                 </span>
               )}
@@ -683,12 +693,13 @@ export function Transcript({
                 row.exitCode !== 0 &&
                 !hasTerminalOutput && (
                   <span className="transcript-row-meta">
-                    exit {row.exitCode}
+                    {translate("exitLabel")} {row.exitCode}
                   </span>
                 )}
               {row.denied && !hasTerminalOutput && (
                 <span className="ml-2 text-xs text-muted">
-                  not run{row.detail ? ` · ${row.detail}` : ""}
+                  {translate("notRunDetail")}
+                  {row.detail ? ` · ${row.detail}` : ""}
                 </span>
               )}
               {row.durationMs !== undefined && !hasTerminalOutput && (
@@ -700,7 +711,7 @@ export function Transcript({
                 <span
                   className={`transcript-row-result${row.resultError ? " text-danger" : ""}`}
                 >
-                  {row.resultError && "failed · "}
+                  {row.resultError && `${translate("failed")} · `}
                   {row.resultSummary}
                 </span>
               )}
@@ -756,7 +767,7 @@ export function Transcript({
                   key={`minor-${start}`}
                 >
                   <summary className="transcript-minor-summary">
-                    {minorRows.length} minor actions
+                    {minorRows.length} {translate("minorActions")}
                   </summary>
                   <div className="mt-2 flex flex-col gap-2">
                     {minorRows.map((row, offset) =>
@@ -795,7 +806,12 @@ export function Transcript({
                   {running &&
                   index === lastWorkIndex &&
                   node.startedAt !== undefined
-                    ? `Working for ${Math.max(0, Math.floor((clock - node.startedAt) / 1000))}s`
+                    ? translate("workingFor", {
+                        seconds: Math.max(
+                          0,
+                          Math.floor((clock - node.startedAt) / 1000),
+                        ),
+                      })
                     : node.label}
                 </span>
                 {!!(node.additions || node.deletions) && (
@@ -823,7 +839,7 @@ export function Transcript({
       {running && (
         <div className="current-activity" data-testid="current-activity">
           <span className="spinner" />
-          <span>Working</span>
+          <span>{translate("working")}</span>
         </div>
       )}
     </div>

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { ApprovalDecision, Item } from "../types";
 import { humanizeApprovalTitle, type HumanLine } from "../humanize";
+import { translate } from "../i18n";
 import { Icon } from "./Icon";
 
 type ApprovalArgs = Record<string, unknown>;
@@ -19,13 +20,13 @@ export function shortArgs(args: ApprovalArgs | null | undefined): string {
 
 // Human verbs kept for the §25 grant lines (the card title now comes from humanize.ts).
 const TOOL_VERBS: Record<string, string> = {
-  write_file: "Write a file",
-  replace_in_file: "Edit a file",
-  apply_patch: "Apply a patch",
-  apply_unified_diff: "Apply a patch",
-  run_shell: "Run a command",
-  send_message: "Send a message",
-  send_file: "Send a file",
+  write_file: "writeFileVerb",
+  replace_in_file: "editFileVerb",
+  apply_patch: "applyPatchVerb",
+  apply_unified_diff: "applyPatchVerb",
+  run_shell: "runCommandVerb",
+  send_message: "sendMessageVerb",
+  send_file: "sendFileVerb",
 };
 
 // §35: routine workspace writes render as a compact ROW; everything else is a full card.
@@ -81,7 +82,7 @@ export function scopeNote(
   hostName?: string,
 ): { text: string; external: boolean } {
   if (category === "connector")
-    return { text: "acts on a connected service", external: true };
+    return { text: translate("actsOnConnectedService"), external: true };
   if (EXTERNAL.has(name)) {
     const platform = String(args?.target ?? "").split(":")[0];
     const names: Record<string, string> = {
@@ -89,16 +90,18 @@ export function scopeNote(
       telegram: "Telegram",
     };
     return {
-      text: `leaves the remote host → ${names[platform] || platform || "a connected chat"}`,
+      text: translate("leavesRemoteHost", {
+        destination: names[platform] || platform || translate("connectedChat"),
+      }),
       external: true,
     };
   }
   const overwrite = name === "write_file" && args?.overwrite;
-  const location = hostName || "the bound host";
+  const location = hostName || translate("boundHost");
   return {
     text:
-      `runs on ${location}` +
-      (overwrite ? " · overwrites the existing file" : ""),
+      translate("runsOnHost", { host: location }) +
+      (overwrite ? ` · ${translate("overwritesExistingFile")}` : ""),
     external: false,
   };
 }
@@ -135,10 +138,10 @@ export function PreviewBlock({
           onClick={() => setAll((v) => !v)}
         >
           {all
-            ? "show less"
+            ? translate("showLess")
             : lines.length > PREVIEW_LINES
-              ? `show all ${lines.length} lines`
-              : "show the full message"}
+              ? translate("showAllLines", { count: lines.length })
+              : translate("showFullMessage")}
         </button>
       )}
     </div>
@@ -217,7 +220,7 @@ function Buttons({
             65 + (switchModeOptions.length > 0 ? switchModeOptions.length : 1),
           )}
         </span>
-        <span>Deny</span>
+        <span>{translate("deny")}</span>
       </button>
     </div>
   );
@@ -271,7 +274,7 @@ export function ApprovalCard({
               className="approval-peek"
               onClick={() => setPeek((v) => !v)}
             >
-              preview {peek ? "▴" : "▾"}
+              {translate("preview")} {peek ? "▴" : "▾"}
             </button>
           )}
           <span className="spacer" />
@@ -279,7 +282,7 @@ export function ApprovalCard({
             item={item}
             onApprove={onApprove}
             runTask={runTask}
-            primaryLabel="Allow"
+            primaryLabel={translate("allow")}
           />
         </div>
         {peek && content && <PreviewBlock text={content} />}
@@ -296,7 +299,10 @@ export function ApprovalCard({
     >
       <div className="approval-top">
         <div className="approval-heading">
-          <span className="approval-ico" title={`Tool: ${item.name}`}>
+          <span
+            className="approval-ico"
+            title={translate("toolName", { name: item.name })}
+          >
             <Icon name="shield" size={15} />
           </span>
           <TitleText line={title} />
@@ -319,13 +325,15 @@ export function ApprovalCard({
             </span>
             {String(item.args?.path ?? "")
               .split("/")
-              .pop() || "file"}
-            {item.args?.as_screenshot ? " · as a PNG screenshot" : ""}
+              .pop() || translate("file")}
+            {item.args?.as_screenshot
+              ? ` · ${translate("asPngScreenshot")}`
+              : ""}
           </span>
           {item.args?.comment && (
             <MessagePreview
               text={String(item.args.comment)}
-              label="With the message"
+              label={translate("withMessage")}
             />
           )}
         </>
@@ -346,12 +354,12 @@ export function ApprovalCard({
                 {g.access === "write" ? "✓" : "·"}
               </span>
               <span className="grant-line">
-                {TOOL_VERBS[g.tool] || g.tool}{" "}
+                {translate(TOOL_VERBS[g.tool] || g.tool)}{" "}
                 <code className="approval-tool">{g.target}</code>
                 <span className="grant-note">
                   {g.access === "write"
-                    ? " — always allowed once you approve"
-                    : " — read-only"}
+                    ? ` — ${translate("alwaysAllowed")}`
+                    : ` — ${translate("readOnly")}`}
                 </span>
               </span>
             </div>
@@ -369,14 +377,16 @@ export function ApprovalCard({
 
       {item.resolved ? (
         <div className="resolved">
-          {item.resolved === "allow" ? "Approved" : "Declined"}
+          {item.resolved === "allow"
+            ? translate("approved")
+            : translate("declined")}
         </div>
       ) : (
         <Buttons
           item={item}
           onApprove={onApprove}
           runTask={runTask}
-          primaryLabel="Allow once"
+          primaryLabel={translate("allowOnce")}
         />
       )}
     </div>

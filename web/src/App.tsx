@@ -79,7 +79,13 @@ import { SettingsView, type SettingsSection } from "./components/SettingsView";
 import { Icon } from "./components/Icon";
 import { CollectionPage } from "./components/CollectionPage";
 import { IntegrationCard } from "./components/IntegrationCard";
-import { getLocale, setLocale, subscribeLocale, translate } from "./i18n";
+import {
+  getLocale,
+  setLocale,
+  subscribeLocale,
+  translate,
+  translateBackendValue,
+} from "./i18n";
 import type { Attachment } from "./types";
 import "./openworker-tailwind.css";
 import "./openworker-styles.css";
@@ -491,162 +497,159 @@ type PendingApproval = {
 };
 
 const OPENWORKER_CONNECTORS: ConnectorCatalogEntry[] = [
-  { name: "Telegram", description: "Two-way messaging with a Telegram bot." },
+  { name: "Telegram", description: "connectorTelegramDescription" },
   {
     name: "Slack",
-    description:
-      "Two-way messaging through a Slack app or managed workspace connection.",
+    description: "connectorSlackDescription",
   },
   {
     name: "Email (IMAP)",
-    description: "Read, search, and send mail from an IMAP account.",
+    description: "connectorEmailImapDescription",
   },
-  { name: "Gmail", description: "Search, summarize, draft, and send email." },
+  { name: "Gmail", description: "connectorGmailDescription" },
   {
     name: "Google Calendar",
-    description: "Read availability, summarize schedules, and create events.",
+    description: "connectorGoogleCalendarDescription",
   },
   {
     name: "Browser",
-    description: "Navigate, read, and act on websites with approval.",
+    description: "connectorBrowserDescription",
   },
   {
     name: "GitHub",
-    description: "Work with issues, pull requests, files, and CI status.",
+    description: "connectorGitHubDescription",
   },
   {
     name: "Outlook",
-    description: "Manage Microsoft 365 mail and calendar.",
+    description: "connectorOutlookDescription",
   },
   {
     name: "Jira",
-    description: "Search, summarize, create, and update issues.",
+    description: "connectorJiraDescription",
   },
   {
     name: "monday.com",
-    description: "Read boards and items, track work, and post updates.",
+    description: "connectorMondayDescription",
   },
   {
     name: "Confluence",
-    description: "Search spaces, read pages, and draft documentation.",
+    description: "connectorConfluenceDescription",
   },
   {
     name: "Zendesk",
-    description:
-      "Search tickets, summarize customer context, and draft replies.",
+    description: "connectorZendeskDescription",
   },
   {
     name: "Linear",
-    description: "Search, read, and create Linear issues.",
+    description: "connectorLinearDescription",
   },
   {
     name: "GitLab",
-    description: "Work with issues and merge requests.",
+    description: "connectorGitLabDescription",
   },
   {
     name: "Discord",
-    description: "Read channels and send messages through a Discord bot.",
+    description: "connectorDiscordDescription",
   },
   {
     name: "Stripe",
-    description: "Read customers, charges, and invoices.",
+    description: "connectorStripeDescription",
   },
   {
     name: "Asana",
-    description: "Search, read, create, update, and comment on tasks.",
+    description: "connectorAsanaDescription",
   },
   {
     name: "HubSpot",
-    description: "Search CRM records and update notes and tasks.",
+    description: "connectorHubSpotDescription",
   },
   {
     name: "Dropbox",
-    description: "Search, browse, and read files in Dropbox.",
+    description: "connectorDropboxDescription",
   },
   {
     name: "Box",
-    description: "Search, browse, and read files in Box.",
+    description: "connectorBoxDescription",
   },
   {
     name: "WhatsApp",
-    description: "Send WhatsApp messages through the official Cloud API.",
+    description: "connectorWhatsAppDescription",
   },
   {
     name: "QuickBooks",
-    description: "Read customers, invoices, and financial reports.",
+    description: "connectorQuickBooksDescription",
   },
   {
     name: "Datadog",
-    description: "Pull firing alerts, monitors, and incident timelines.",
+    description: "connectorDatadogDescription",
   },
   {
     name: "Salesforce",
-    description: "Read and update cases, accounts, and opportunities.",
+    description: "connectorSalesforceDescription",
   },
   {
     name: "Docusign",
-    description: "Track agreements and send documents for signature.",
+    description: "connectorDocusignDescription",
   },
   {
     name: "ClickUp",
-    description: "Search tasks and docs; create and update items.",
+    description: "connectorClickUpDescription",
   },
   {
     name: "Google Drive",
-    description: "Search, browse, and read files in Google Drive.",
+    description: "connectorGoogleDriveDescription",
   },
   {
     name: "Canva",
-    description: "Browse, create, and export designs.",
+    description: "connectorCanvaDescription",
   },
   {
     name: "Figma",
-    description: "Read design files and comments; export assets.",
+    description: "connectorFigmaDescription",
   },
   {
     name: "Descript",
-    description: "Read and edit audio and video projects through transcripts.",
+    description: "connectorDescriptDescription",
   },
   {
     name: "Clay",
-    description: "Enrich people and companies for research workflows.",
+    description: "connectorClayDescription",
   },
   {
     name: "Close",
-    description: "Read and update leads, contacts, and opportunities.",
+    description: "connectorCloseDescription",
   },
   {
     name: "Notion",
-    description:
-      "Search pages, read content, query databases, and create pages.",
+    description: "connectorNotionDescription",
   },
   {
     name: "Attio",
-    description: "Read CRM objects, records, and notes.",
+    description: "connectorAttioDescription",
   },
   {
     name: "PostHog",
-    description: "Query product analytics, events, funnels, and insights.",
+    description: "connectorPostHogDescription",
   },
   {
     name: "Mixpanel",
-    description: "Query events and segmentation data.",
+    description: "connectorMixpanelDescription",
   },
   {
     name: "Amplitude",
-    description: "Query product analytics and chart data.",
+    description: "connectorAmplitudeDescription",
   },
   {
     name: "Apollo.io",
-    description: "Enrich people and companies and search the B2B database.",
+    description: "connectorApolloDescription",
   },
   {
     name: "Hunter",
-    description: "Find and verify professional email addresses.",
+    description: "connectorHunterDescription",
   },
   {
     name: "PagerDuty",
-    description: "See on-call schedules and review active incidents.",
+    description: "connectorPagerDutyDescription",
   },
 ];
 
@@ -922,7 +925,7 @@ function ProjectDialog({
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!name.trim() || !hostId) {
-      setError("项目名称和主机不能为空");
+      setError(translate("projectNameRequired"));
       return;
     }
     setSaving(true);
@@ -948,25 +951,27 @@ function ProjectDialog({
         onSubmit={submit}
       >
         <div className="flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-ink">新建项目</h2>
+          <h2 className="text-lg font-semibold text-ink">
+            {translate("newProjectTitle")}
+          </h2>
           <button type="button" className="btn" onClick={onClose}>
-            关闭
+            {translate("close")}
           </button>
         </div>
         <div className="mt-5 min-h-0 flex-1 overflow-y-auto pr-1">
           <div className="grid gap-3">
             <label className="field-label">
-              名称
+              {translate("name")}
               <input
                 autoFocus
                 className="input"
                 value={name}
                 onChange={(event) => setName(event.target.value)}
-                placeholder="项目名称"
+                placeholder={translate("projectName")}
               />
             </label>
             <label className="field-label">
-              主机
+              {translate("host")}
               <select
                 className="input"
                 value={hostId}
@@ -980,7 +985,7 @@ function ProjectDialog({
               </select>
             </label>
             <label className="field-label">
-              仓库 URL（可留空）
+              {translate("repositoryUrlOptional")}
               <input
                 className="input"
                 value={repoUrl}
@@ -989,16 +994,16 @@ function ProjectDialog({
               />
             </label>
             <label className="field-label">
-              仓库路径（可留空）
+              {translate("repositoryPathOptional")}
               <input
                 className="input"
                 value={repoRoot}
                 onChange={(event) => setRepoRoot(event.target.value)}
-                placeholder="按后端默认路径"
+                placeholder={translate("repositoryPathDefault")}
               />
             </label>
             <label className="field-label">
-              默认分支
+              {translate("defaultBranch")}
               <input
                 className="input"
                 value={defaultBranch}
@@ -1006,34 +1011,37 @@ function ProjectDialog({
               />
             </label>
             <label className="field-label">
-              从 Team 模板创建（可选）
+              {translate("teamTemplateOptional")}
               <select
                 className="input"
                 value={teamTemplateId}
                 onChange={(event) => setTeamTemplateId(event.target.value)}
               >
-                <option value="">不使用 Team 模板</option>
+                <option value="">{translate("noTeamTemplate")}</option>
                 {teamTemplates.map((template) => (
                   <option key={template.id} value={template.id}>
                     {template.name} ·{" "}
-                    {template.status === "builtin" ? "内置" : "自定义"}
+                    {template.status === "builtin"
+                      ? translate("builtIn")
+                      : translate("custom")}
                   </option>
                 ))}
               </select>
             </label>
             {selectedTeamContent && (
               <div className="rounded-lg border border-line p-3 text-sm">
-                <strong>将创建的成员</strong>
+                <strong>{translate("membersToCreate")}</strong>
                 <div className="mt-1">
                   {(selectedTeamContent.agents || [])
                     .map(
                       (agent) =>
-                        `${agent.name || "成员"}（${agent.role || "Worker"}）`,
+                        `${agent.name || translate("member")}（${agent.role || translate("worker")}）`,
                     )
                     .join("、")}
                 </div>
                 <small className="text-muted">
-                  Workflow：{JSON.stringify(selectedTeamContent.workflow)}
+                  {translate("workflow")}：{" "}
+                  {JSON.stringify(selectedTeamContent.workflow)}
                 </small>
               </div>
             )}
@@ -1042,14 +1050,14 @@ function ProjectDialog({
         {error && <p className="mt-3 text-sm text-danger">{error}</p>}
         <div className="sticky bottom-0 mt-6 flex justify-end gap-2 bg-panel pt-1">
           <button type="button" className="btn" onClick={onClose}>
-            取消
+            {translate("cancel")}
           </button>
           <button
             type="submit"
             className="btn approval-primary"
             disabled={saving}
           >
-            {saving ? "创建中…" : "创建项目"}
+            {saving ? translate("creating") : translate("createProject")}
           </button>
         </div>
       </form>
@@ -1097,7 +1105,7 @@ function MemberDialog({
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     if (!name.trim() || !role.trim()) {
-      setError("成员名称和角色不能为空");
+      setError(translate("memberNameRoleRequired"));
       return;
     }
     setError("");
@@ -1124,15 +1132,17 @@ function MemberDialog({
       >
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold text-ink">
-            {mode === "add" ? "添加成员" : "编辑成员"}
+            {mode === "add"
+              ? translate("addingMember")
+              : translate("editingMember")}
           </h2>
           <button type="button" className="btn" onClick={onClose}>
-            关闭
+            {translate("close")}
           </button>
         </div>
         <div className="mt-5 grid gap-3">
           <label className="field-label">
-            名称
+            {translate("name")}
             <input
               autoFocus
               className="input"
@@ -1141,7 +1151,7 @@ function MemberDialog({
             />
           </label>
           <label className="field-label">
-            角色
+            {translate("role")}
             <input
               className="input"
               list="project-agent-roles"
@@ -1157,13 +1167,13 @@ function MemberDialog({
           {mode === "add" ? (
             <>
               <label className="field-label">
-                Provider
+                {translate("provider")}
                 <select
                   className="input"
                   value={provider}
                   onChange={(event) => setProvider(event.target.value)}
                 >
-                  <option value="">默认</option>
+                  <option value="">{translate("defaultValue")}</option>
                   {providers.map((item) => (
                     <option
                       key={item.name}
@@ -1176,13 +1186,13 @@ function MemberDialog({
                 </select>
               </label>
               <label className="field-label">
-                Model
+                {translate("modelLabel")}
                 <select
                   className="input"
                   value={model}
                   onChange={(event) => setModel(event.target.value)}
                 >
-                  <option value="auto">Auto</option>
+                  <option value="auto">{translate("auto")}</option>
                   {models.map((item) => (
                     <option key={item.id} value={item.id}>
                       {item.label}
@@ -1191,7 +1201,7 @@ function MemberDialog({
                 </select>
               </label>
               <label className="field-label">
-                Harness
+                {translate("harness")}
                 <select
                   className="input"
                   value={harness}
@@ -1199,7 +1209,13 @@ function MemberDialog({
                 >
                   {(harnessOptions.length
                     ? harnessOptions
-                    : [{ id: "builtin", label: "Builtin", available: true }]
+                    : [
+                        {
+                          id: "builtin",
+                          label: translate("builtIn"),
+                          available: true,
+                        },
+                      ]
                   ).map((item) => (
                     <option
                       key={item.id}
@@ -1212,37 +1228,39 @@ function MemberDialog({
                 </select>
               </label>
               <label className="field-label">
-                Mode
+                {translate("modeLabel")}
                 <select
                   className="input"
                   value={sessionMode}
                   onChange={(event) => setSessionMode(event.target.value)}
                 >
-                  <option value="Interactive">Interactive</option>
-                  <option value="Auto">Auto</option>
+                  <option value="Interactive">
+                    {translate("interactive")}
+                  </option>
+                  <option value="Auto">{translate("auto")}</option>
                 </select>
               </label>
               <label className="field-label">
-                分支（可留空）
+                {translate("branchOptional")}
                 <input
                   className="input"
                   value={branch}
                   onChange={(event) => setBranch(event.target.value)}
-                  placeholder="按角色自动命名"
+                  placeholder={translate("autoNameByRole")}
                 />
               </label>
             </>
           ) : (
             <label className="field-label">
-              状态
+              {translate("state")}
               <select
                 className="input"
                 value={state}
                 onChange={(event) => setState(event.target.value)}
               >
-                <option value="Active">Active</option>
-                <option value="Sleep">Sleep</option>
-                <option value="Paused">Paused</option>
+                <option value="Active">{translate("active")}</option>
+                <option value="Sleep">{translate("sleep")}</option>
+                <option value="Paused">{translate("paused")}</option>
               </select>
             </label>
           )}
@@ -1250,14 +1268,14 @@ function MemberDialog({
         {error && <p className="mt-3 text-sm text-danger">{error}</p>}
         <div className="mt-6 flex justify-end gap-2">
           <button type="button" className="btn" onClick={onClose}>
-            取消
+            {translate("cancel")}
           </button>
           <button
             type="submit"
             className="btn approval-primary"
             disabled={saving}
           >
-            {saving ? "保存中…" : "保存"}
+            {saving ? translate("saving") : translate("save")}
           </button>
         </div>
       </form>
@@ -1360,16 +1378,14 @@ function ProjectConfigPanel({
       enabled &&
       template.modified &&
       !window.confirm(
-        `该项目配置「${template.name}」已本地修改。重新勾选将用模板当前内容覆盖本地修改，确定继续吗？`,
+        `${translate("locallyModified")}：${template.name}。${translate("confirmOverwriteTemplate")}`,
       )
     ) {
       return;
     }
     if (
       !enabled &&
-      !window.confirm(
-        `将排除全局预设「${template.name}」在该项目中的生效，不会删除全局预设。确定继续吗？`,
-      )
+      !window.confirm(`${translate("excludeGlobalPreset")}：${template.name}。`)
     ) {
       return;
     }
@@ -1389,23 +1405,25 @@ function ProjectConfigPanel({
     <section className="mt-8 rounded-xl border border-line bg-panel p-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
-          <h2 className="text-lg font-semibold text-ink">项目配置</h2>
+          <h2 className="text-lg font-semibold text-ink">
+            {translate("projectConfig")}
+          </h2>
           <p className="mt-1 text-sm text-faint">
-            项目配置会继承到项目成员会话，全局配置仍可回退使用。
+            {translate("projectConfigDescription")}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
           {[
-            ["agents", "规则"],
-            ["experts", "专家"],
-            ["teams", "团队"],
-            ["command", "Command"],
-            ["knowledge", "Knowledge"],
-            ["playbook", "Playbook"],
-            ["mcp", "MCP"],
-            ["acp-agent", "ACP agents"],
-            ["connectors", "Connectors"],
-            ["blueprint", "Blueprint"],
+            ["agents", translate("rules")],
+            ["experts", translate("experts")],
+            ["teams", translate("teams")],
+            ["command", translate("command")],
+            ["knowledge", "knowledgeSection"],
+            ["playbook", "playbookSection"],
+            ["mcp", "mcp"],
+            ["acp-agent", "acpAgents"],
+            ["connectors", "connectors"],
+            ["blueprint", "blueprintSection"],
           ].map(([value, label]) => (
             <button
               key={value}
@@ -1415,7 +1433,7 @@ function ProjectConfigPanel({
                 reset();
               }}
             >
-              {label}
+              {translate(label)}
             </button>
           ))}
         </div>
@@ -1423,7 +1441,7 @@ function ProjectConfigPanel({
       <div className="mt-5 grid gap-3">
         <fieldset className="rounded-lg border border-line p-3">
           <legend className="px-1 text-sm font-medium">
-            全局预设（项目选择）
+            {translate("globalPresets")}
           </legend>
           <div className="grid gap-2">
             {configurationTemplates
@@ -1450,7 +1468,9 @@ function ProjectConfigPanel({
                   <label className="flex items-center gap-2 pt-1">
                     <input
                       type="checkbox"
-                      aria-label={`启用 ${template.name}`}
+                      aria-label={translate("enableTemplate", {
+                        name: template.name,
+                      })}
                       style={{ width: 16, height: 16 }}
                       checked={template.applied}
                       onChange={(event) =>
@@ -1466,10 +1486,16 @@ function ProjectConfigPanel({
                       {template.name}
                     </strong>
                     <small className="mt-1 block break-words text-faint">
-                      {template.source} ·{" "}
-                      {template.overridden ? "项目已覆盖" : "继承自全局预设"}
-                      {template.modified ? " · 已本地修改" : ""}
-                      {template.overridden ? " · 可在下方编辑" : ""}
+                      {translateBackendValue(template.source)} ·{" "}
+                      {template.overridden
+                        ? translate("projectOverridden")
+                        : translate("inheritedGlobalPreset")}
+                      {template.modified
+                        ? ` · ${translate("locallyModified")}`
+                        : ""}
+                      {template.overridden
+                        ? ` · ${translate("editBelow")}`
+                        : ""}
                     </small>
                   </div>
                   <div className="flex shrink-0 gap-2">
@@ -1480,7 +1506,9 @@ function ProjectConfigPanel({
                         onClick={() => {
                           if (
                             window.confirm(
-                              `将删除项目覆盖「${template.name}」，恢复继承全局预设。确定继续吗？`,
+                              translate("restoreProjectOverrideConfirm", {
+                                name: template.name,
+                              }),
                             )
                           ) {
                             void command("restore_project_configuration", {
@@ -1493,7 +1521,7 @@ function ProjectConfigPanel({
                           }
                         }}
                       >
-                        恢复继承
+                        {translate("restoreInheritance")}
                       </button>
                     )}
                     {!template.overridden && (
@@ -1510,7 +1538,7 @@ function ProjectConfigPanel({
                             .catch(onError);
                         }}
                       >
-                        创建项目覆盖
+                        {translate("createProjectOverride")}
                       </button>
                     )}
                   </div>
@@ -1530,7 +1558,11 @@ function ProjectConfigPanel({
                 blueprint: "blueprint",
               }[kind];
               return template.kind === selectedKind;
-            }) && <span className="text-xs text-faint">暂无可用配置模板</span>}
+            }) && (
+              <span className="text-xs text-faint">
+                {translate("noConfigTemplates")}
+              </span>
+            )}
           </div>
         </fieldset>
         {!["experts", "teams", "command"].includes(kind) &&
@@ -1556,7 +1588,7 @@ function ProjectConfigPanel({
                       setBody(asset.body);
                     }}
                   >
-                    编辑
+                    {translate("edit")}
                   </button>
                   <button
                     className="btn"
@@ -1566,7 +1598,7 @@ function ProjectConfigPanel({
                         .catch(onError)
                     }
                   >
-                    删除
+                    {translate("delete")}
                   </button>
                 </div>
               </div>
@@ -1574,32 +1606,32 @@ function ProjectConfigPanel({
         {!["experts", "teams", "command"].includes(kind) && (
           <div className="grid gap-3 rounded-lg border border-line p-4">
             <label className="field-label">
-              名称
+              {translate("name")}
               <input
                 value={title}
                 onChange={(event) => setTitle(event.target.value)}
-                placeholder="配置名称"
+                placeholder={translate("configureName")}
               />
             </label>
             <label className="field-label">
-              内容
+              {translate("body")}
               <textarea
                 value={body}
                 onChange={(event) => setBody(event.target.value)}
                 placeholder={
                   kind === "blueprint"
-                    ? "clone:\n  - git fetch"
-                    : "项目级配置内容"
+                    ? translate("cloneExample")
+                    : translate("projectConfigContent")
                 }
               />
             </label>
             <div>
               <button className="btn approval-primary" onClick={save}>
-                {editingId ? "保存更改" : "新增配置"}
+                {editingId ? translate("saveChanges") : translate("addConfig")}
               </button>
               {editingId && (
                 <button className="btn ml-2" onClick={reset}>
-                  取消编辑
+                  {translate("cancelEdit")}
                 </button>
               )}
             </div>
@@ -1609,16 +1641,18 @@ function ProjectConfigPanel({
       <div className="mt-6 border-t border-line pt-5">
         <div className="flex items-center justify-between">
           <div>
-            <h3 className="font-medium text-ink">项目 Secrets</h3>
+            <h3 className="font-medium text-ink">
+              {translate("projectSecrets")}
+            </h3>
             <p className="mt-1 text-xs text-faint">
-              项目 Secret 优先于全局同名 Secret，值不会显示。
+              {translate("projectSecretsDescription")}
             </p>
           </div>
           <button
             className="btn"
             onClick={() => setSecretFormOpen((value) => !value)}
           >
-            {secretFormOpen ? "取消" : "新增 Secret"}
+            {secretFormOpen ? translate("cancel") : translate("addSecret")}
           </button>
         </div>
         {secretFormOpen && (
@@ -1626,18 +1660,18 @@ function ProjectConfigPanel({
             <input
               value={secretName}
               onChange={(event) => setSecretName(event.target.value)}
-              placeholder="Secret 名称"
+              placeholder={translate("secretName")}
             />
             <input
               value={secretPurpose}
               onChange={(event) => setSecretPurpose(event.target.value)}
-              placeholder="用途"
+              placeholder={translate("purpose")}
             />
             <input
               type="password"
               value={secretValue}
               onChange={(event) => setSecretValue(event.target.value)}
-              placeholder="Secret 值"
+              placeholder={translate("secretValue")}
             />
             <button
               className="btn approval-primary"
@@ -1661,7 +1695,7 @@ function ProjectConfigPanel({
                   .catch(onError)
               }
             >
-              保存 Secret
+              {translate("saveSecret")}
             </button>
           </div>
         )}
@@ -1676,7 +1710,7 @@ function ProjectConfigPanel({
                 <span className="ml-2 text-xs text-faint">
                   {secret.project_id
                     ? secret.purpose
-                    : `${secret.purpose} · 全局回退`}
+                    : `${secret.purpose} · ${translate("globalFallback")}`}
                 </span>
               </span>
               {secret.project_id === project.id && (
@@ -1692,7 +1726,7 @@ function ProjectConfigPanel({
                       .catch(onError)
                   }
                 >
-                  删除
+                  {translate("delete")}
                 </button>
               )}
             </div>
@@ -1700,23 +1734,27 @@ function ProjectConfigPanel({
         </div>
       </div>
       <div className="mt-6 grid gap-3 border-t border-line pt-5">
-        <h3 className="font-medium text-ink">项目运行凭据</h3>
+        <h3 className="font-medium text-ink">
+          {translate("projectCredentials")}
+        </h3>
         <p className="text-xs text-faint">
-          凭据只显示输入状态，保存后按项目优先、全局回退读取。
+          {translate("credentialsInputOnly")}
         </p>
         <div className="grid gap-3 md:grid-cols-2">
           <div className="grid gap-2 rounded-lg border border-line p-3">
-            <strong className="text-sm text-ink">Provider key</strong>
+            <strong className="text-sm text-ink">
+              {translate("providerKey")}
+            </strong>
             <input
               value={providerName}
               onChange={(event) => setProviderName(event.target.value)}
-              placeholder="Provider ID"
+              placeholder={translate("providerId")}
             />
             <input
               type="password"
               value={providerKey}
               onChange={(event) => setProviderKey(event.target.value)}
-              placeholder="Provider key"
+              placeholder={translate("providerKey")}
             />
             <button
               className="btn"
@@ -1731,21 +1769,23 @@ function ProjectConfigPanel({
                   .catch(onError)
               }
             >
-              保存 Provider key
+              {translate("saveProviderKey")}
             </button>
           </div>
           <div className="grid gap-2 rounded-lg border border-line p-3">
-            <strong className="text-sm text-ink">MCP credential</strong>
+            <strong className="text-sm text-ink">
+              {translate("mcpCredential")}
+            </strong>
             <input
               value={mcpServerId}
               onChange={(event) => setMcpServerId(event.target.value)}
-              placeholder="MCP server ID"
+              placeholder={translate("mcpServerId")}
             />
             <input
               type="password"
               value={mcpCredential}
               onChange={(event) => setMcpCredential(event.target.value)}
-              placeholder="Credential JSON"
+              placeholder={translate("credentialJson")}
             />
             <button
               className="btn"
@@ -1760,21 +1800,23 @@ function ProjectConfigPanel({
                   .catch(onError)
               }
             >
-              保存 MCP credential
+              {translate("saveMcpCredential")}
             </button>
           </div>
           <div className="grid gap-2 rounded-lg border border-line p-3">
-            <strong className="text-sm text-ink">Connector token</strong>
+            <strong className="text-sm text-ink">
+              {translate("connectorToken")}
+            </strong>
             <input
               value={connectorKind}
               onChange={(event) => setConnectorKind(event.target.value)}
-              placeholder="Connector kind"
+              placeholder={translate("connectorKind")}
             />
             <input
               type="password"
               value={connectorToken}
               onChange={(event) => setConnectorToken(event.target.value)}
-              placeholder="Token"
+              placeholder={translate("token")}
             />
             <button
               className="btn"
@@ -1789,15 +1831,15 @@ function ProjectConfigPanel({
                   .catch(onError)
               }
             >
-              保存 Connector token
+              {translate("saveConnectorToken")}
             </button>
           </div>
           <div className="grid gap-2 rounded-lg border border-line p-3">
-            <strong className="text-sm text-ink">GitHub Enterprise 实例</strong>
+            <strong className="text-sm text-ink">
+              {translate("githubEnterpriseInstance")}
+            </strong>
             <span className="text-xs text-faint">
-              github.com 默认可用。企业实例登记后 API base 归一化为
-              https://&lt;host&gt;/api/v3，凭据使用 connector kind
-              github@&lt;host&gt;。
+              {translate("githubEnterpriseDescription")}
             </span>
             <input
               value={githubHost}
@@ -1807,7 +1849,7 @@ function ProjectConfigPanel({
             <input
               value={githubApiBase}
               onChange={(event) => setGithubApiBase(event.target.value)}
-              placeholder="API base（可选，默认 https://host/api/v3）"
+              placeholder={translate("apiBaseOptional")}
             />
             <button
               className="btn"
@@ -1825,7 +1867,7 @@ function ProjectConfigPanel({
                   .catch(onError)
               }
             >
-              登记企业实例
+              {translate("registerEnterpriseInstance")}
             </button>
             {githubInstances.map((instance) => (
               <div
@@ -1846,7 +1888,7 @@ function ProjectConfigPanel({
                       .catch(onError)
                   }
                 >
-                  删除
+                  {translate("delete")}
                 </button>
               </div>
             ))}
@@ -1934,7 +1976,7 @@ function ProjectBoard({
   const deleteMember = async (agent: ProjectAgent, force = false) => {
     if (
       !force &&
-      !window.confirm(`确定删除成员「${agent.name}」？其 worktree 将被回收。`)
+      !window.confirm(translate("deleteMemberConfirm", { name: agent.name }))
     )
       return;
     try {
@@ -1957,7 +1999,7 @@ function ProjectBoard({
   const archiveProject = async () => {
     if (
       !window.confirm(
-        `确定归档项目「${project.name}」？归档不会删除 worktree。`,
+        translate("archiveProjectConfirm", { name: project.name }),
       )
     )
       return;
@@ -1996,9 +2038,7 @@ function ProjectBoard({
   const deleteProject = async (force = false) => {
     if (
       !force &&
-      !window.confirm(
-        `确定删除项目「${project.name}」？这会回收所有成员 worktree，且不可撤销。`,
-      )
+      !window.confirm(translate("deleteProjectConfirm", { name: project.name }))
     )
       return;
     setProjectActionBusy(true);
@@ -2026,11 +2066,14 @@ function ProjectBoard({
           <div>
             <h1 className="text-2xl font-semibold text-ink">{project.name}</h1>
             <p className="text-sm text-faint mt-2">
-              {project.host_name} · {project.online === false ? "离线" : "在线"}{" "}
+              {project.host_name} ·{" "}
+              {project.online === false
+                ? translate("offline")
+                : translate("online")}{" "}
               · {project.repo_root}
             </p>
             <p className="text-sm text-faint mt-1">
-              默认分支：{project.default_branch}
+              {translate("defaultBranchLabel")}：{project.default_branch}
             </p>
           </div>
           <button
@@ -2041,7 +2084,7 @@ function ProjectBoard({
               })
             }
           >
-            添加成员
+            {translate("addMember")}
           </button>
           <button
             className="btn"
@@ -2052,21 +2095,21 @@ function ProjectBoard({
               setProjectEditing((value) => !value);
             }}
           >
-            编辑项目
+            {translate("editProject")}
           </button>
           <button
             className="btn"
             disabled={projectActionBusy}
             onClick={archiveProject}
           >
-            归档项目
+            {translate("archiveProject")}
           </button>
           <button
             className="btn quiet-deny"
             disabled={projectActionBusy}
             onClick={() => void deleteProject()}
           >
-            删除项目
+            {translate("deleteProject")}
           </button>
         </div>
         {projectActionError && (
@@ -2076,21 +2119,21 @@ function ProjectBoard({
               className="btn mt-2"
               onClick={() => void deleteProject(true)}
             >
-              强制删除并回收 worktree
+              {translate("forceDeleteWorktree")}
             </button>
           </div>
         )}
         {projectEditing && (
           <div className="mt-4 grid gap-3 rounded-lg border border-line bg-panel p-4 md:grid-cols-[1fr_1fr_auto]">
             <label className="field-label">
-              项目名称
+              {translate("projectNameLabel")}
               <input
                 value={projectName}
                 onChange={(event) => setProjectName(event.target.value)}
               />
             </label>
             <label className="field-label">
-              默认分支
+              {translate("defaultBranchLabel")}
               <input
                 value={projectBranch}
                 onChange={(event) => setProjectBranch(event.target.value)}
@@ -2106,10 +2149,10 @@ function ProjectBoard({
                 }
                 onClick={() => void saveProjectDetails()}
               >
-                保存
+                {translate("save")}
               </button>
               <button className="btn" onClick={() => setProjectEditing(false)}>
-                取消
+                {translate("cancel")}
               </button>
             </div>
           </div>
@@ -2126,22 +2169,27 @@ function ProjectBoard({
               >
                 <div className="flex items-center justify-between gap-2">
                   <span className="text-xs rounded-full bg-faint/20 px-2 py-1 text-muted">
-                    {agent.role}
+                    {translateBackendValue(agent.role)}
                   </span>
-                  <span className="text-xs text-faint">{agent.state}</span>
+                  <span className="text-xs text-faint">
+                    {translateBackendValue(agent.state)}
+                  </span>
                 </div>
                 <h2 className="mt-4 font-medium text-ink">{agent.name}</h2>
                 <p
                   className="mt-2 text-xs text-faint truncate"
                   title={agent.branch}
                 >
-                  分支：{agent.branch}
+                  {translate("branchLabelText")}
+                  {agent.branch}
                 </p>
                 <p
                   className="mt-1 text-xs text-faint truncate"
                   title={agent.worktree_path}
                 >
-                  {agent.sort_order === 0 ? "主检出：" : "Worktree："}
+                  {agent.sort_order === 0
+                    ? translate("mainCheckout")
+                    : translate("worktree")}
                   {agent.worktree_path}
                 </p>
                 <div className="mt-4 flex items-center gap-2">
@@ -2150,7 +2198,7 @@ function ProjectBoard({
                       className="btn approval-primary"
                       onClick={() => onOpenSession(session.id)}
                     >
-                      打开会话
+                      {translate("openSession")}
                     </button>
                   ) : (
                     <button
@@ -2172,14 +2220,14 @@ function ProjectBoard({
                           .catch(onError)
                       }
                     >
-                      启动会话
+                      {translate("startSession")}
                     </button>
                   )}
                   <button
                     className="btn"
                     onClick={() => setMemberForm({ mode: "edit", agent })}
                   >
-                    编辑
+                    {translate("edit")}
                   </button>
                   <button
                     className="btn"
@@ -2190,14 +2238,14 @@ function ProjectBoard({
                       }).catch(onError)
                     }
                   >
-                    另存 Agent
+                    {translate("saveAgent")}
                   </button>
                   {agent.sort_order !== 0 && (
                     <button
                       className="btn"
                       onClick={() => void deleteMember(agent)}
                     >
-                      删除
+                      {translate("delete")}
                     </button>
                   )}
                 </div>
@@ -2208,7 +2256,7 @@ function ProjectBoard({
                       className="btn mt-2"
                       onClick={() => void deleteMember(agent, true)}
                     >
-                      强制删除
+                      {translate("forceDelete")}
                     </button>
                   </div>
                 )}
@@ -2321,14 +2369,19 @@ function ProjectCoordinationPanel({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h2 className="text-lg font-semibold text-ink">
-            Workflow 与 Lead 指挥
+            {translate("workflowLeadCommand")}
           </h2>
           <p className="mt-1 text-sm text-faint">
-            当前阶段：
+            {translate("currentStage")}：
             {snapshot?.status === "done"
-              ? "已完成"
-              : snapshot?.workflow?.workflow?.[snapshot.stage_index]?.stage ||
-                "未启动"}
+              ? translate("completed")
+              : (() => {
+                  const stage =
+                    snapshot?.workflow?.workflow?.[snapshot.stage_index]?.stage;
+                  return stage
+                    ? translateBackendValue(stage)
+                    : translate("notStarted");
+                })()}
           </p>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -2342,21 +2395,21 @@ function ProjectCoordinationPanel({
                 .catch(onError)
             }
           >
-            启动全部
+            {translate("startAll")}
           </button>
           <button
             className="btn"
             disabled={loading}
             onClick={() => void setAllRoles("paused")}
           >
-            暂停
+            {translate("pause")}
           </button>
           <button
             className="btn"
             disabled={loading}
             onClick={() => void setAllRoles("active")}
           >
-            恢复
+            {translate("resume")}
           </button>
           <button
             className="btn"
@@ -2367,16 +2420,17 @@ function ProjectCoordinationPanel({
                 .catch(onError)
             }
           >
-            推进阶段
+            {translate("advanceStage")}
           </button>
         </div>
       </div>
       <div className="mt-5 grid gap-3">
         <div className="grid gap-2 rounded-lg border border-line p-4">
-          <h3 className="font-medium text-ink">Workflow 定义</h3>
+          <h3 className="font-medium text-ink">
+            {translate("workflowDefinition")}
+          </h3>
           <p className="text-xs text-faint">
-            使用 {"{ workflow: [{ stage, roles, gate }], serial }"} 格式；gate
-            支持 none、build+test、accept、pass。
+            {translate("workflowFormatHint")}
           </p>
           <textarea
             value={workflowText}
@@ -2395,24 +2449,24 @@ function ProjectCoordinationPanel({
                 .catch(onError)
             }
           >
-            保存 Workflow
+            {translate("saveWorkflow")}
           </button>
         </div>
         <div className="grid gap-2 rounded-lg border border-line p-4">
-          <h3 className="font-medium text-ink">任务</h3>
+          <h3 className="font-medium text-ink">{translate("task")}</h3>
           <div className="grid gap-2 md:grid-cols-[1fr_180px_auto]">
             <input
               value={taskTitle}
               onChange={(event) => setTaskTitle(event.target.value)}
-              placeholder="任务标题"
+              placeholder={translate("taskTitle")}
             />
             <input
               value={taskAssignee}
               onChange={(event) => setTaskAssignee(event.target.value)}
-              placeholder="指派角色 ID"
+              placeholder={translate("assigneeRoleId")}
             />
             <button className="btn approval-primary" onClick={createTask}>
-              新建任务
+              {translate("createTask")}
             </button>
           </div>
           <div className="grid gap-2">
@@ -2424,7 +2478,8 @@ function ProjectCoordinationPanel({
                 <span>
                   <strong>{task.title}</strong>
                   <span className="ml-2 text-faint">
-                    {task.phase} · {task.assignee || "未指派"}
+                    {translateBackendValue(task.phase)} ·{" "}
+                    {task.assignee || translate("unassigned")}
                   </span>
                 </span>
                 <div className="flex gap-2">
@@ -2440,7 +2495,7 @@ function ProjectCoordinationPanel({
                           .catch(onError)
                       }
                     >
-                      租约指派
+                      {translate("claimLease")}
                     </button>
                   )}
                   <button
@@ -2455,7 +2510,7 @@ function ProjectCoordinationPanel({
                         .catch(onError)
                     }
                   >
-                    同步回执
+                    {translate("syncReceipt")}
                   </button>
                 </div>
               </div>
@@ -2463,7 +2518,9 @@ function ProjectCoordinationPanel({
           </div>
         </div>
         <div className="grid gap-2 rounded-lg border border-line p-4">
-          <h3 className="font-medium text-ink">协同消息历史</h3>
+          <h3 className="font-medium text-ink">
+            {translate("coordinationMessageHistory")}
+          </h3>
           {(snapshot?.messages || []).map((message: any) => (
             <div
               className="rounded-lg border border-line p-3 text-xs"
@@ -2478,7 +2535,9 @@ function ProjectCoordinationPanel({
             </div>
           ))}
           {!snapshot?.messages?.length && (
-            <p className="text-sm text-faint">暂无协同消息。</p>
+            <p className="text-sm text-faint">
+              {translate("noCoordinationMessages")}
+            </p>
           )}
         </div>
       </div>
@@ -2910,7 +2969,7 @@ function SurfaceView({
         )}
         {busy && (
           <div className="surface-status muted">
-            Connecting to the bound remote host…
+            {translate("connectingRemoteHost")}
           </div>
         )}
         {surfaceError && !sleeping && !showSurfaceRetry && (
@@ -2929,21 +2988,23 @@ function SurfaceView({
         {tab === "browser" && (
           <div className="browser-preview">
             <div className="surface-status muted">
-              Read-only remote browser preview
+              {translate("remoteBrowserPreview")}
             </div>
             {browserFrame ? (
               <img
                 className="browser-preview-image"
                 src={`data:${browserFrame.mime};base64,${browserFrame.image}`}
-                alt="Remote browser page"
+                alt={translate("remoteBrowserPage")}
               />
             ) : !surfaceFailed ? (
               <div className="empty-surface">
                 <Icon name="image" size={32} />
-                <p>Waiting for a remote browser page target…</p>
+                <p>{translate("waitingBrowserTarget")}</p>
               </div>
             ) : null}
-            <p className="surface-status muted">Remote browser preview (CDP)</p>
+            <p className="surface-status muted">
+              {translate("remoteBrowserCdp")}
+            </p>
           </div>
         )}
       </div>
@@ -2953,12 +3014,12 @@ function SurfaceView({
       <div className="surface-panel">
         {busy && (
           <div className="surface-status muted">
-            Connecting to the bound remote host…
+            {translate("connectingRemoteHost")}
           </div>
         )}
         {ideUrl && !ideError ? (
           <iframe
-            title={translate("Remote Web IDE")}
+            title={translate("remoteWebIde")}
             src={ideUrl}
             className="ide-frame"
           />
@@ -2966,12 +3027,12 @@ function SurfaceView({
           <div className="empty-surface ide-error">
             <Icon name="code" size={32} />
             <p>{ideError}</p>
-            <p className="muted">No local fallback is used.</p>
+            <p className="muted">{translate("noLocalFallback")}</p>
           </div>
         ) : (
           <div className="empty-surface">
             <Icon name="code" size={32} />
-            <p>{translate("Start the remote IDE for this bound session.")}</p>
+            <p>{translate("startRemoteIde")}</p>
           </div>
         )}
       </div>
@@ -3027,17 +3088,14 @@ function ReviewView({
   if (!selected.workspace) {
     return (
       <div className="surface-panel">
-        <div className="warning">
-          This session has no workspace configured. Review is unavailable until
-          the session is recreated with a remote workspace.
-        </div>
+        <div className="warning">{translate("noWorkspaceReview")}</div>
       </div>
     );
   }
   return (
     <div className="surface-panel review-panel">
       <div className="surface-toolbar">
-        <span>{translate("Remote review")}</span>
+        <span>{translate("remoteReview")}</span>
         <div>
           <input value={cwd} onChange={(event) => setCwd(event.target.value)} />
           <input
@@ -3055,14 +3113,14 @@ function ReviewView({
                 .catch(onError)
             }
           >
-            Refresh
+            {translate("refresh")}
           </Button>
         </div>
       </div>
       {review ? (
         <div className="review-grid">
           <div>
-            <h3>{translate("Changed files")}</h3>
+            <h3>{translate("changedFiles")}</h3>
             {changes.map((change) => {
               const file =
                 typeof change === "object" &&
@@ -3125,11 +3183,7 @@ function ReviewView({
         </div>
       ) : (
         <div className="empty-surface">
-          <p>
-            {translate(
-              "Load the remote status and changes from the bound host.",
-            )}
-          </p>
+          <p>{translate("loadRemoteChanges")}</p>
         </div>
       )}
     </div>
@@ -3147,7 +3201,7 @@ function PRView({
   return (
     <div className="surface-panel">
       <div className="surface-toolbar">
-        <span>Git workflow and pull requests</span>
+        <span>{translate("gitWorkflowPullRequests")}</span>
         <input value={cwd} onChange={(event) => setCwd(event.target.value)} />
       </div>
       <GitActions selected={selected} cwd={cwd} onError={onError} />
@@ -3172,7 +3226,7 @@ function GitActions({
   const [lifecycleResult, setLifecycleResult] = useState<unknown>(null);
   return (
     <div className="git-actions">
-      <h3>{translate("Git workflow")}</h3>
+      <h3>{translate("gitWorkflow")}</h3>
       <SelectMenu
         value={operation}
         onChange={setOperation}
@@ -3184,7 +3238,7 @@ function GitActions({
       <input
         value={value}
         onChange={(event) => setValue(event.target.value)}
-        placeholder={translate("slug, files, or commit message")}
+        placeholder={translate("slugFilesCommit")}
       />
       <Button
         onClick={() =>
@@ -3203,7 +3257,7 @@ function GitActions({
             .catch(onError)
         }
       >
-        Run {operation}
+        {translate("runOperation", { operation })}
       </Button>
       {lifecycleResult ? (
         <pre className="code-block">
@@ -3211,16 +3265,16 @@ function GitActions({
         </pre>
       ) : null}
       <details>
-        <summary>{translate("Create GitHub PR")}</summary>
+        <summary>{translate("createGithubPr")}</summary>
         <input
           value={repo}
           onChange={(event) => setRepo(event.target.value)}
-          placeholder={translate("owner/repository")}
+          placeholder={translate("ownerRepository")}
         />
         <input
           value={pr}
           onChange={(event) => setPr(event.target.value)}
-          placeholder={translate("PR title")}
+          placeholder={translate("prTitle")}
         />
         <Button
           onClick={() =>
@@ -3235,17 +3289,14 @@ function GitActions({
             }).catch(onError)
           }
         >
-          Create PR
+          {translate("createPr")}
         </Button>
-        <p className="muted small">
-          The configured GitHub secret is read only by Rust; it is never
-          displayed.
-        </p>
+        <p className="muted small">{translate("githubSecretNotice")}</p>
       </details>
       <CiMonitorPanel selected={selected} onError={onError} />
       <RunnerPanel selected={selected} onError={onError} />
       <details>
-        <summary>处理 GitHub PR 评论</summary>
+        <summary>{translate("processPrComments")}</summary>
         <input
           value={commentPrUrl}
           onChange={(event) => setCommentPrUrl(event.target.value)}
@@ -3262,12 +3313,9 @@ function GitActions({
               .catch(onError)
           }
         >
-          拉取并处理评论
+          {translate("fetchAndProcessComments")}
         </Button>
-        <p className="muted small">
-          Bot 评论和未满足 agent mention 策略的评论会被跳过；凭据只在 Rust
-          后端使用。
-        </p>
+        <p className="muted small">{translate("botCommentNotice")}</p>
       </details>
     </div>
   );
@@ -3343,11 +3391,11 @@ function CiMonitorPanel({
       .catch(onError);
   return (
     <details>
-      <summary>GitHub CI failure monitor and event source</summary>
+      <summary>{translate("ciMonitorTitle")}</summary>
       <input
         value={monitorId}
         onChange={(event) => setMonitorId(event.target.value)}
-        placeholder="monitor id"
+        placeholder={translate("monitorId")}
       />
       <input
         value={repo}
@@ -3357,25 +3405,23 @@ function CiMonitorPanel({
       <input
         value={pullRequest}
         onChange={(event) => setPullRequest(event.target.value)}
-        placeholder="PR number"
+        placeholder={translate("prNumber")}
       />
       <input
         value={branch}
         onChange={(event) => setBranch(event.target.value)}
-        placeholder="branch"
+        placeholder={translate("branch")}
       />
-      <Button onClick={save}>Save monitor</Button>
+      <Button onClick={save}>{translate("saveMonitor")}</Button>
       {monitor ? (
         <Button onClick={toggle}>
-          {enabled ? "Disable monitoring" : "Enable monitoring"}
+          {enabled
+            ? translate("disableMonitoring")
+            : translate("enableMonitoring")}
         </Button>
       ) : null}
-      <Button onClick={refresh}>Refresh status</Button>
-      <p className="muted small">
-        Enabling this monitor explicitly authorizes the bounded CI repair loop
-        for this PR. The runner remains separately controlled by the global
-        runner setting. Disable the monitor to revoke its repair authorization.
-      </p>
+      <Button onClick={refresh}>{translate("refreshStatus")}</Button>
+      <p className="muted small">{translate("ciAuthorizationNotice")}</p>
       {repairItems.length > 0 ? (
         <div className="stack">
           {repairItems.map((item) => {
@@ -3408,23 +3454,42 @@ function CiMonitorPanel({
             const signatures = state.failure_signatures ?? [];
             return (
               <article key={record.queue_id ?? JSON.stringify(item)}>
-                <strong>{record.queue_id ?? "ci_repair_loop"}</strong>
-                <div>Status: {record.status ?? "unknown"}</div>
-                <div>Phase: {state.phase ?? "queued"}</div>
+                <strong>{record.queue_id ?? translate("ciRepairLoop")}</strong>
                 <div>
-                  Attempts: {state.repair_attempts ?? 0} /{" "}
+                  {translate("status")}: {translateBackendValue(record.status)}
+                </div>
+                <div>
+                  {translate("phase")}: {translateBackendValue(state.phase)}
+                </div>
+                <div>
+                  {translate("attempts")}: {state.repair_attempts ?? 0} /{" "}
                   {state.max_repair_attempts ?? 3}
                 </div>
                 <div>
-                  Polls: {state.poll_count ?? 0} / {state.max_polls ?? 20}
+                  {translate("polls")}: {state.poll_count ?? 0} /{" "}
+                  {state.max_polls ?? 20}
                 </div>
-                <div>Deadline: {state.deadline ?? "not set"}</div>
-                <div>Current SHA: {state.head_sha ?? "not set"}</div>
-                <div>Expected SHA: {state.expected_head_sha ?? "not set"}</div>
-                <div>Stop reason: {state.stop_reason ?? "none"}</div>
                 <div>
-                  Signatures:{" "}
-                  {signatures.length > 0 ? signatures.join(" → ") : "none"}
+                  {translate("deadline")}:{" "}
+                  {state.deadline ?? translate("notSet")}
+                </div>
+                <div>
+                  {translate("currentSha")}:{" "}
+                  {state.head_sha ?? translate("notSet")}
+                </div>
+                <div>
+                  {translate("expectedSha")}:{" "}
+                  {state.expected_head_sha ?? translate("notSet")}
+                </div>
+                <div>
+                  {translate("stopReason")}:{" "}
+                  {state.stop_reason ?? translate("none")}
+                </div>
+                <div>
+                  {translate("signatures")}:{" "}
+                  {signatures.length > 0
+                    ? signatures.join(" → ")
+                    : translate("none")}
                 </div>
               </article>
             );
@@ -3496,52 +3561,49 @@ function RunnerPanel({
       .catch(onError);
   return (
     <details>
-      <summary>Autonomous runner profile</summary>
-      <p className="muted small">
-        The runner is disabled by default. A profile explicitly selects the
-        host, provider, model, and workspace for sessionless work items.
-      </p>
+      <summary>{translate("autonomousRunnerProfile")}</summary>
+      <p className="muted small">{translate("runnerDescription")}</p>
       <input
         value={hostId}
         onChange={(event) => setHostId(event.target.value)}
-        placeholder="host id"
+        placeholder={translate("hostId")}
       />
       <input
         value={provider}
         onChange={(event) => setProvider(event.target.value)}
-        placeholder="provider"
+        placeholder={translate("provider")}
       />
       <input
         value={model}
         onChange={(event) => setModel(event.target.value)}
-        placeholder="model"
+        placeholder={translate("model")}
       />
       <input
         value={workspace}
         onChange={(event) => setWorkspace(event.target.value)}
-        placeholder="workspace"
+        placeholder={translate("workspace")}
       />
-      <Button onClick={save}>Save runner profile</Button>
+      <Button onClick={save}>{translate("saveRunnerProfile")}</Button>
       <label>
         <input
           type="checkbox"
           checked={enabled}
           onChange={(event) => setEnabled(event.target.checked)}
         />
-        Profile enabled
+        {translate("profileEnabled")}
       </label>
       <input
         value={maxConcurrency}
         onChange={(event) => setMaxConcurrency(event.target.value)}
         inputMode="numeric"
-        placeholder="max concurrency"
+        placeholder={translate("maxConcurrency")}
       />
       <Button onClick={toggleRunner}>
         {runnerEnabled
-          ? "Disable background runner"
-          : "Enable background runner"}
+          ? translate("disableBackgroundRunner")
+          : translate("enableBackgroundRunner")}
       </Button>
-      <Button onClick={refresh}>Refresh runner settings</Button>
+      <Button onClick={refresh}>{translate("refreshRunnerSettings")}</Button>
     </details>
   );
 }
@@ -3550,7 +3612,7 @@ function DiffView({ diff }: { diff: Record<string, unknown> | null }) {
   if (!diff)
     return (
       <div className="diff-view empty-surface">
-        {translate("Select a changed file.")}
+        {translate("selectChangedFile")}
       </div>
     );
   const text =
@@ -3650,20 +3712,17 @@ function WorklogView({
   return (
     <div className="surface-panel">
       <div className="surface-toolbar">
-        <span>{translate("Worklog timeline")}</span>
+        <span>{translate("worklogTimeline")}</span>
         <Button onClick={load}>
-          <Icon name="refresh" /> Reload
+          <Icon name="refresh" /> {translate("reload")}
         </Button>
       </div>
       {Boolean(worklog?.window_lost) && (
-        <div className="warning">
-          The requested worklog window was lost. Reloaded from the current
-          window.
-        </div>
+        <div className="warning">{translate("worklogWindowLost")}</div>
       )}
       {!worklog && (
         <div className="empty-surface">
-          <p>{translate("Load the remote worklog for this session.")}</p>
+          <p>{translate("loadRemoteWorklog")}</p>
           <Button onClick={load}>{translate("openWorklog")}</Button>
         </div>
       )}
@@ -3996,46 +4055,43 @@ function ManageSections({
       .catch(onError);
   }, [tab, selected, onError]);
   const sectionCopy: Record<SettingsSection, [string, string]> = {
-    provider: [
-      "Provider",
-      "Choose a provider and validate its connection key.",
+    provider: [translate("provider"), translate("chooseProvider")],
+    hosts: [translate("hosts"), translate("hostsDescription")],
+    agents: [translate("rulesSection"), translate("rulesDescription")],
+    instructions: [
+      translate("instructionsSection"),
+      translate("instructionsDescription"),
     ],
-    hosts: ["Hosts", "Bind and test the remote hosts used by OPCOS sessions."],
-    agents: ["规则", "仓库级运行规则（对应仓库中的 AGENTS.md 文件）。"],
-    instructions: ["全局指令", "应用于所有新会话的全局指令。"],
-    knowledge: ["Knowledge", "Reusable reference material added to context."],
-    playbook: ["Playbook", "Repeatable workflows available to automation."],
-    skill: ["Skill", "Focused capability and instruction bundles."],
-    mcp: ["MCP", "Control the tools exposed by the selected remote host."],
-    connectors: [
-      "Connectors",
-      "Linear is connected locally with a Personal API Key. Other connectors are not integrated.",
+    knowledge: [
+      translate("knowledgeSection"),
+      translate("knowledgeDescription"),
     ],
+    playbook: [translate("playbookSection"), translate("playbookDescription")],
+    skill: [translate("skillSection"), translate("skillDescription")],
+    mcp: [translate("mcp"), translate("mcpDescription")],
+    connectors: [translate("connectors"), translate("connectorsDescription")],
     ingress: [
-      "External events",
-      "Poll GitHub and RSS/Atom sources that can wake OPCOS event rules.",
+      translate("externalEvents"),
+      translate("externalEventsDescription"),
     ],
     index: [
-      "Repository index",
-      "Build a host-backed path and symbol index before asking the agent to change code.",
+      translate("repositoryIndex"),
+      translate("repositoryIndexDescription"),
     ],
-    secrets: [
-      "Secrets",
-      "Inspect secret metadata without exposing secret values.",
+    secrets: [translate("secretsSection"), translate("secretsDescription")],
+    blueprint: [
+      translate("blueprintSection"),
+      translate("blueprintDescription"),
     ],
-    blueprint: ["Blueprint", "Read and manage the selected host blueprint."],
     appearance: [translate("general"), translate("appearanceDescription")],
-    agent: [
-      "Agent defaults",
-      "控制会话默认值、Computer use、用量上限和 Pull request 策略。",
-    ],
+    agent: [translate("agentDefaults"), translate("agentDefaultsDescription")],
     environment: [
-      "Environment",
-      "管理 Blueprint、固定环境说明、有序仓库 setup 和长期主机。",
+      translate("environmentSection"),
+      translate("environmentDescription"),
     ],
-    experts: ["专家", "管理可供项目启用的专家库。"],
-    teams: ["团队", "管理可供项目启用的团队库。"],
-    command: ["Command", "管理可供项目启用的命令库。"],
+    experts: [translate("expertsSection"), translate("expertsDescription")],
+    teams: [translate("teamsSection"), translate("teamsDescription")],
+    command: [translate("commandSection"), translate("commandDescription")],
   };
   const assetKinds = [
     "agents",
@@ -4057,10 +4113,6 @@ function ManageSections({
         : tab === "command"
           ? "command"
           : libraryKind;
-  const assetLabel =
-    assetTabKind === "agents"
-      ? "规则"
-      : assetTabKind[0].toUpperCase() + assetTabKind.slice(1);
   useEffect(() => {
     if (tab !== "instructions") return;
     setInstructionsDraft(
@@ -4214,10 +4266,10 @@ function ManageSections({
             <div className="flex gap-2 border-b border-line pb-2">
               {(
                 [
-                  ["blueprints", "Blueprints"],
-                  ["snapshots", "Snapshots"],
-                  ["advanced", "Advanced"],
-                  ["outposts", "Outposts"],
+                  ["blueprints", "blueprints"],
+                  ["snapshots", "snapshots"],
+                  ["advanced", "advanced"],
+                  ["outposts", "outposts"],
                 ] as const
               ).map(([value, label]) => (
                 <button
@@ -4230,28 +4282,28 @@ function ManageSections({
                   onClick={() => setEnvironmentTab(value)}
                   type="button"
                 >
-                  {label}
+                  {translate(label)}
                 </button>
               ))}
             </div>
             {environmentTab === "blueprints" && (
               <section className="rounded-lg border border-line p-4 space-y-3">
                 <div>
-                  <strong>Blueprints</strong>
+                  <strong>{translate("blueprints")}</strong>
                   <small className="block">
-                    当前生效来源：
+                    {translate("currentSource")}
                     {blueprintStatus?.source === "project"
-                      ? "项目 Blueprint"
+                      ? translate("projectBlueprint")
                       : blueprintStatus?.source === "global"
-                        ? "全局 Blueprint"
+                        ? translate("globalBlueprint")
                         : blueprintStatus?.source === "repository"
-                          ? "仓库 .devin/blueprint.yaml"
-                          : "未读取"}
+                          ? translate("repositoryBlueprint")
+                          : translate("notRead")}
                   </small>
                 </div>
                 {!selected ? (
                   <div className="text-sm text-muted">
-                    请先打开一个项目会话查看 Blueprint
+                    {translate("openProjectSessionBlueprint")}
                   </div>
                 ) : (
                   <>
@@ -4261,7 +4313,7 @@ function ManageSections({
                       onChange={(event) =>
                         setBlueprintDraft(event.target.value)
                       }
-                      placeholder="YAML Blueprint"
+                      placeholder={translate("yamlBlueprint")}
                     />
                     <div className="flex justify-end gap-2">
                       <Button
@@ -4276,7 +4328,7 @@ function ManageSections({
                             .catch(onError)
                         }
                       >
-                        重新读取
+                        {translate("reloadBlueprint")}
                       </Button>
                       <Button
                         className="primary"
@@ -4293,12 +4345,12 @@ function ManageSections({
                             enabled: true,
                           })
                             .then(() =>
-                              setEnvironmentStatus("Blueprint 已保存"),
+                              setEnvironmentStatus(translate("blueprintSaved")),
                             )
                             .catch(onError)
                         }
                       >
-                        保存当前作用域
+                        {translate("saveCurrentScope")}
                       </Button>
                     </div>
                     {environmentStatus && (
@@ -4310,19 +4362,18 @@ function ManageSections({
             )}
             {environmentTab === "snapshots" && (
               <section className="rounded-lg border border-line p-4">
-                <strong>Snapshots</strong>
+                <strong>{translate("snapshots")}</strong>
                 <p className="mt-2 text-sm text-muted">
-                  本产品不适用：Local/RVM
-                  是长期固定环境，不提供快照，也不伪造等价的快照能力。
+                  {translate("snapshotsNotApplicable")}
                 </p>
               </section>
             )}
             {environmentTab === "advanced" && (
               <section className="rounded-lg border border-line p-4 space-y-3">
                 <div>
-                  <strong>Advanced · Repositories</strong>
+                  <strong>{translate("advancedRepositories")}</strong>
                   <small className="block">
-                    setup executor 会按此列表顺序执行 clone 与 setup。
+                    {translate("setupExecutorDescription")}
                   </small>
                 </div>
                 {environmentRepositories.map((item, index) => (
@@ -4332,7 +4383,7 @@ function ManageSections({
                   >
                     <input
                       value={item.repository}
-                      placeholder="仓库 URL"
+                      placeholder={translate("repositoryUrl")}
                       onChange={(event) =>
                         setEnvironmentRepositories((current) =>
                           current.map((entry, entryIndex) =>
@@ -4345,7 +4396,7 @@ function ManageSections({
                     />
                     <input
                       value={item.setup_command}
-                      placeholder="setup 命令（可留空）"
+                      placeholder={translate("setupCommand")}
                       onChange={(event) =>
                         setEnvironmentRepositories((current) =>
                           current.map((entry, entryIndex) =>
@@ -4396,7 +4447,7 @@ function ManageSections({
                           )
                         }
                       >
-                        删除
+                        {translate("deleteRepository")}
                       </Button>
                     </div>
                   </div>
@@ -4414,7 +4465,7 @@ function ManageSections({
                       ])
                     }
                   >
-                    添加仓库
+                    {translate("addRepository")}
                   </Button>
                   <Button
                     className="primary"
@@ -4423,11 +4474,13 @@ function ManageSections({
                         projectId: settingsProjectId,
                         repositories: environmentRepositories,
                       })
-                        .then(() => setEnvironmentStatus("顺序与设置已保存"))
+                        .then(() =>
+                          setEnvironmentStatus(translate("savedOrder")),
+                        )
                         .catch(onError)
                     }
                   >
-                    保存顺序
+                    {translate("saveOrder")}
                   </Button>
                 </div>
                 {environmentStatus && (
@@ -4437,14 +4490,15 @@ function ManageSections({
             )}
             {environmentTab === "outposts" && (
               <section className="rounded-lg border border-line p-4">
-                <strong>Outposts</strong>
+                <strong>{translate("outposts")}</strong>
                 <p className="mt-2 text-sm text-muted">
-                  OPCOS 将 Outposts 映射为已登记的长期主机（Local/RVM）；
-                  这里展示主机清单，不额外虚构独立 Outpost 资源。
+                  {translate("outpostsDescription")}
                 </p>
                 <div className="mt-3 space-y-2">
                   {hosts.length === 0 ? (
-                    <div className="text-sm text-muted">暂无已登记主机</div>
+                    <div className="text-sm text-muted">
+                      {translate("noRegisteredHosts")}
+                    </div>
                   ) : (
                     hosts.map((host) => (
                       <div
@@ -4453,7 +4507,13 @@ function ManageSections({
                       >
                         <span>{host.name}</span>
                         <span className="text-xs text-muted">
-                          {host.id} · {host.online === false ? "离线" : "在线"}
+                          {host.id === "local"
+                            ? translate("localHost")
+                            : host.id}{" "}
+                          ·{" "}
+                          {host.online === false
+                            ? translate("offline")
+                            : translate("online")}
                         </span>
                       </div>
                     ))
@@ -4467,14 +4527,14 @@ function ManageSections({
           <div className="divide-y divide-line">
             <label className="settings-row">
               <div>
-                <strong>配置作用域</strong>
-                <small>项目设置覆盖全局设置；未选择项目时编辑全局设置。</small>
+                <strong>{translate("configurationScope")}</strong>
+                <small>{translate("configurationScopeDescription")}</small>
               </div>
               <SelectMenu
                 value={settingsProjectId || ""}
                 onChange={(value) => setSettingsProjectId(value || null)}
                 options={[
-                  { value: "", label: "全局" },
+                  { value: "", label: translate("global") },
                   ...projects.map((project) => ({
                     value: project.id,
                     label: project.name,
@@ -4484,8 +4544,8 @@ function ManageSections({
             </label>
             <div className="settings-row">
               <div>
-                <strong>Computer use</strong>
-                <small>关闭后不允许打开远程桌面和浏览器控制面。</small>
+                <strong>{translate("computerUse")}</strong>
+                <small>{translate("computerUseDescription")}</small>
               </div>
               <input
                 type="checkbox"
@@ -4500,15 +4560,15 @@ function ManageSections({
             </div>
             {(
               [
-                ["default_agent", "Default agent"],
-                ["api_default_agent", "API default agent"],
-                ["default_platform", "Default platform"],
+                ["default_agent", "defaultAgent"],
+                ["api_default_agent", "apiDefaultAgent"],
+                ["default_platform", "defaultPlatform"],
               ] as const
             ).map(([keyName, label]) => (
               <label className="settings-row" key={keyName}>
                 <div>
-                  <strong>{label}</strong>
-                  <small>用于没有显式覆盖的新建会话。</small>
+                  <strong>{translate(label)}</strong>
+                  <small>{translate("newSessionDefaults")}</small>
                 </div>
                 <input
                   value={agentSettings[keyName]}
@@ -4523,8 +4583,8 @@ function ManageSections({
             ))}
             <label className="settings-row">
               <div>
-                <strong>Batch limit</strong>
-                <small>一分钟内最多创建的会话数（1–500）。</small>
+                <strong>{translate("batchLimit")}</strong>
+                <small>{translate("batchLimitDescription")}</small>
               </div>
               <input
                 type="number"
@@ -4541,8 +4601,8 @@ function ManageSections({
             </label>
             <label className="settings-row">
               <div>
-                <strong>Message usage limit</strong>
-                <small>单条消息允许消耗的 token 数，0 表示不限制。</small>
+                <strong>{translate("messageUsageLimit")}</strong>
+                <small>{translate("messageUsageLimitDescription")}</small>
               </div>
               <input
                 type="number"
@@ -4558,15 +4618,15 @@ function ManageSections({
             </label>
             {(
               [
-                ["share_prompts_in_prs", "Share prompts in PRs"],
-                ["require_agent_mention", "Require the agent to respond"],
-                ["auto_add_reviewer", "Auto-add reviewer"],
+                ["share_prompts_in_prs", "sharePromptsInPrs"],
+                ["require_agent_mention", "requireAgentMention"],
+                ["auto_add_reviewer", "autoAddReviewer"],
               ] as const
             ).map(([keyName, label]) => (
               <label className="settings-row" key={keyName}>
                 <div>
-                  <strong>{label}</strong>
-                  <small>应用于后续 Pull request 工作流。</small>
+                  <strong>{translate(label)}</strong>
+                  <small>{translate("pullRequestWorkflow")}</small>
                 </div>
                 <input
                   type="checkbox"
@@ -4582,8 +4642,8 @@ function ManageSections({
             ))}
             <label className="settings-row">
               <div>
-                <strong>Reviewer</strong>
-                <small>自动添加 reviewer 时使用的 GitHub 用户名。</small>
+                <strong>{translate("reviewer")}</strong>
+                <small>{translate("reviewerDescription")}</small>
               </div>
               <input
                 value={agentSettings.reviewer}
@@ -4597,8 +4657,8 @@ function ManageSections({
             </label>
             <label className="settings-row">
               <div>
-                <strong>Open PRs as</strong>
-                <small>创建 Pull request 时的初始状态。</small>
+                <strong>{translate("openPrsAs")}</strong>
+                <small>{translate("openPrsAsDescription")}</small>
               </div>
               <SelectMenu
                 value={agentSettings.open_prs_as}
@@ -4609,15 +4669,15 @@ function ManageSections({
                   })
                 }
                 options={[
-                  { value: "ready", label: "Ready" },
-                  { value: "draft", label: "Draft" },
+                  { value: "ready", label: translate("ready") },
+                  { value: "draft", label: translate("draft") },
                 ]}
               />
             </label>
             <label className="settings-row">
               <div>
-                <strong>Responding to bots</strong>
-                <small>是否响应机器人触发的消息。</small>
+                <strong>{translate("respondingToBots")}</strong>
+                <small>{translate("respondingToBotsDescription")}</small>
               </div>
               <SelectMenu
                 value={agentSettings.responding_to_bots}
@@ -4628,8 +4688,8 @@ function ManageSections({
                   })
                 }
                 options={[
-                  { value: "ignore", label: "Ignore" },
-                  { value: "respond", label: "Respond" },
+                  { value: "ignore", label: translate("ignore") },
+                  { value: "respond", label: translate("respond") },
                 ]}
               />
             </label>
@@ -4642,19 +4702,19 @@ function ManageSections({
                     projectId: settingsProjectId,
                     value: agentSettings,
                   })
-                    .then(() => setAgentSettingsStatus("已保存"))
+                    .then(() => setAgentSettingsStatus(translate("saved")))
                     .catch(onError)
                 }
               >
-                保存 Agent 设置
+                {translate("saveAgentSettings")}
               </Button>
             </div>
             <div className="pt-5">
               <div className="flex items-center justify-between mb-3">
                 <div>
-                  <strong>Manage commands</strong>
+                  <strong>{translate("manageCommands")}</strong>
                   <small className="block">
-                    System 命令可覆盖或 Reset；Custom 命令可添加、编辑和删除。
+                    {translate("commandManagementDescription")}
                   </small>
                 </div>
                 <Button
@@ -4672,7 +4732,7 @@ function ManageSections({
                       .catch(onError)
                   }
                 >
-                  Reset system
+                  {translate("resetSystem")}
                 </Button>
               </div>
               <div className="space-y-2">
@@ -4684,7 +4744,9 @@ function ManageSections({
                     <div className="flex items-center gap-2">
                       <code className="text-accent">{item.name}</code>
                       <span className="text-[11px] text-muted">
-                        {item.kind === "system" ? "System" : "Custom"}
+                        {item.kind === "system"
+                          ? translate("system")
+                          : translate("custom")}
                       </span>
                       <span className="ml-auto flex gap-2">
                         {item.kind === "system" && (
@@ -4704,7 +4766,7 @@ function ManageSections({
                                 .catch(onError)
                             }
                           >
-                            Reset
+                            {translate("resetSystem")}
                           </Button>
                         )}
                         {item.kind === "custom" && (
@@ -4724,7 +4786,7 @@ function ManageSections({
                                 .catch(onError)
                             }
                           >
-                            删除
+                            {translate("delete")}
                           </Button>
                         )}
                       </span>
@@ -4754,14 +4816,14 @@ function ManageSections({
                           }).catch(onError)
                         }
                       >
-                        保存
+                        {translate("save")}
                       </Button>
                     </div>
                   </div>
                 ))}
               </div>
               <div className="mt-4 rounded-lg border border-dashed border-line p-3">
-                <strong>Add Command</strong>
+                <strong>{translate("addCommand")}</strong>
                 <div className="mt-2 grid gap-2">
                   <input
                     placeholder="/command"
@@ -4778,11 +4840,13 @@ function ManageSections({
                       )
                     }
                   >
-                    <option value="custom">Custom</option>
-                    <option value="system">System override</option>
+                    <option value="custom">{translate("custom")}</option>
+                    <option value="system">
+                      {translate("systemOverride")}
+                    </option>
                   </select>
                   <textarea
-                    placeholder="命令提示模板"
+                    placeholder={translate("commandPromptTemplate")}
                     value={slashCommandBody}
                     onChange={(event) =>
                       setSlashCommandBody(event.target.value)
@@ -4810,7 +4874,7 @@ function ManageSections({
                         .catch(onError)
                     }
                   >
-                    Add Command
+                    {translate("addCommand")}
                   </Button>
                 </div>
               </div>
@@ -4834,7 +4898,7 @@ function ManageSections({
                     setCustomProviderEditorOpen(true);
                   }}
                 >
-                  添加自定义 Provider
+                  {translate("addCustomProvider")}
                 </Button>
               </div>
               <div className="grid grid-cols-[repeat(auto-fill,minmax(min(100%,440px),440px))] gap-2.5">
@@ -4850,10 +4914,10 @@ function ManageSections({
                       badge={{
                         label:
                           descriptor.available === false
-                            ? "Not integrated"
+                            ? translate("notIntegrated")
                             : config?.configured
-                              ? "Enabled"
-                              : "Not configured",
+                              ? translate("enabled")
+                              : translate("notConfigured"),
                         tone:
                           descriptor.available === false || !config?.configured
                             ? "neutral"
@@ -4861,10 +4925,10 @@ function ManageSections({
                       }}
                       description={
                         descriptor.available === false
-                          ? "Not integrated."
+                          ? translate("notIntegrated")
                           : config?.configured
-                            ? "Configured securely."
-                            : config?.base_url || "Not configured yet."
+                            ? translate("configuredSecurely")
+                            : config?.base_url || translate("notConfiguredYet")
                       }
                       disabled={descriptor.available === false}
                       onClick={() => {
@@ -4921,7 +4985,7 @@ function ManageSections({
                     className="text-[12.5px] text-muted hover:text-ink"
                     onClick={() => setSelectedProvider(null)}
                   >
-                    ‹ All providers
+                    {`‹ ${translate("allProviders")}`}
                   </button>
                   <div className="flex items-center gap-3 mt-3 mb-1">
                     <span className="rounded-lg border border-line grid place-items-center shrink-0 w-9 h-9 bg-paper">
@@ -4935,14 +4999,16 @@ function ManageSections({
                       </span>
                       <span className="block text-[11.5px] text-faint">
                         {config?.configured
-                          ? "✓ Configured securely."
-                          : "Not configured yet."}
+                          ? translate("configuredSecurely")
+                          : translate("notConfiguredYet")}
                       </span>
                     </span>
                   </div>
                   <div className="form-grid mt-4">
                     <label>
-                      {isCloudflare ? "Base URL (derived)" : "Base URL"}
+                      {isCloudflare
+                        ? translate("baseUrlDerived")
+                        : translate("baseUrl")}
                       <input
                         type="url"
                         value={currentUrl}
@@ -4997,12 +5063,14 @@ function ManageSections({
                     )}
                     {descriptor.needs_key && (
                       <label>
-                        Provider key
+                        {translate("providerKey")}
                         <input
                           type="password"
                           value={providerKeys[descriptor.name] || ""}
                           placeholder={
-                            config?.configured ? "Stored securely" : ""
+                            config?.configured
+                              ? translate("storedSecurely")
+                              : ""
                           }
                           onChange={(event) =>
                             setProviderKeys((items) => ({
@@ -5014,7 +5082,7 @@ function ManageSections({
                       </label>
                     )}
                     <label>
-                      Model
+                      {translate("model")}
                       <SelectMenu
                         value={
                           providerModels[descriptor.name] ||
@@ -5037,7 +5105,7 @@ function ManageSections({
                           )
                           .map((item) => ({
                             value: item.id,
-                            label: `${item.label}${item.capabilities_known ? "" : " (能力未知)"}`,
+                            label: `${item.label}${item.capabilities_known ? "" : ` (${translate("unknownCapabilities")})`}`,
                           }))}
                       />
                     </label>
@@ -5045,11 +5113,11 @@ function ManageSections({
                   {providerModelOptions[descriptor.name] && (
                     <div className="flex items-center gap-2 mt-2 text-[11.5px] text-faint">
                       <span>
-                        来源：
+                        {translate("sourceLabel")}
                         {providerModelOptions[descriptor.name].source === "live"
-                          ? "API 实时发现"
-                          : `内置回退（${providerModelOptions[descriptor.name].fallback_reason || "未知原因"}）`}
-                        ，上次刷新：
+                          ? translate("liveApiDiscovery")
+                          : `${translate("builtIn")} (${providerModelOptions[descriptor.name].fallback_reason || translate("unknownReason")})`}
+                        {` ${translate("lastRefresh")}`}
                         {providerModelOptions[descriptor.name].discovered_at}
                       </span>
                       {providerModelOptions[descriptor.name].models.some(
@@ -5064,8 +5132,8 @@ function ManageSections({
                           }
                         >
                           {showAllProviderModels[descriptor.name]
-                            ? "收起非对话模型"
-                            : "显示全部模型"}
+                            ? translate("collapseNonChat")
+                            : translate("showAllModels")}
                         </Button>
                       )}
                       <Button
@@ -5081,7 +5149,7 @@ function ManageSections({
                           )
                         }
                       >
-                        刷新
+                        {translate("reload")}
                       </Button>
                     </div>
                   )}
@@ -5136,7 +5204,7 @@ function ManageSections({
                           )
                       }
                     >
-                      Test / Save
+                      {translate("testSave")}
                     </Button>
                     {config?.configured && (
                       <Button
@@ -5156,7 +5224,7 @@ function ManageSections({
                             .catch(onError)
                         }
                       >
-                        Clear key
+                        {translate("clearKey")}
                       </Button>
                     )}
                   </div>
@@ -5179,10 +5247,8 @@ function ManageSections({
           <div className="divide-y divide-line">
             <div className="settings-row">
               <div>
-                <strong>{translate("Provider")}</strong>
-                <small>
-                  {translate("Choose the model provider for new sessions.")}
-                </small>
+                <strong>{translate("provider")}</strong>
+                <small>{translate("providerDescription")}</small>
               </div>
               <SelectMenu
                 value={provider}
@@ -5197,10 +5263,8 @@ function ManageSections({
             </div>
             <div className="settings-row">
               <div>
-                <strong>{translate("Base URL")}</strong>
-                <small>
-                  {translate("Optional provider-compatible endpoint.")}
-                </small>
+                <strong>{translate("baseUrl")}</strong>
+                <small>{translate("optionalProviderEndpoint")}</small>
               </div>
               <input
                 type="url"
@@ -5210,10 +5274,8 @@ function ManageSections({
             </div>
             <div className="settings-row">
               <div>
-                <strong>{translate("Provider key")}</strong>
-                <small>
-                  {translate("Stored securely and never returned to the UI.")}
-                </small>
+                <strong>{translate("providerKey")}</strong>
+                <small>{translate("secureProviderKeyNotice")}</small>
               </div>
               <input
                 type="password"
@@ -5255,7 +5317,7 @@ function ManageSections({
                     })
                 }
               >
-                Save and validate
+                {translate("saveAndValidate")}
               </Button>
             </div>
             {providerStatus && (
@@ -5281,8 +5343,8 @@ function ManageSections({
               <div className="flex items-center justify-between">
                 <strong>
                   {customProviderId
-                    ? "编辑自定义 Provider"
-                    : "添加自定义 Provider"}
+                    ? translate("editCustomProvider")
+                    : translate("addCustomProvider")}
                 </strong>
                 <button
                   className="text-muted hover:text-ink"
@@ -5293,7 +5355,7 @@ function ManageSections({
               </div>
               <div className="form-grid">
                 <label>
-                  Name
+                  {translate("name")}
                   <input
                     className="input"
                     value={customProviderName}
@@ -5304,7 +5366,7 @@ function ManageSections({
                   />
                 </label>
                 <label>
-                  API dialect
+                  {translate("apiDialect")}
                   <select
                     className="input"
                     value={customProviderDialect}
@@ -5312,12 +5374,16 @@ function ManageSections({
                       setCustomProviderDialect(event.target.value)
                     }
                   >
-                    <option value="openai-compatible">OpenAI-compatible</option>
-                    <option value="cloudflare">Cloudflare</option>
+                    <option value="openai-compatible">
+                      {translate("openaiCompatible")}
+                    </option>
+                    <option value="cloudflare">
+                      {translate("cloudflare")}
+                    </option>
                   </select>
                 </label>
                 <label>
-                  Base URL
+                  {translate("baseUrl")}
                   <input
                     className="input"
                     type="url"
@@ -5329,7 +5395,7 @@ function ManageSections({
                   />
                 </label>
                 <label>
-                  Model
+                  {translate("model")}
                   <input
                     className="input"
                     value={customProviderModel}
@@ -5340,7 +5406,7 @@ function ManageSections({
                   />
                 </label>
                 <label className="sm:col-span-2">
-                  Key
+                  {translate("key")}
                   <input
                     className="input"
                     type="password"
@@ -5348,13 +5414,15 @@ function ManageSections({
                     onChange={(event) =>
                       setCustomProviderKey(event.target.value)
                     }
-                    placeholder={customProviderId ? "Stored securely" : ""}
+                    placeholder={
+                      customProviderId ? translate("storedSecurely") : ""
+                    }
                   />
                 </label>
               </div>
               <div className="flex items-center justify-end gap-2">
                 <Button onClick={() => setCustomProviderEditorOpen(false)}>
-                  关闭
+                  {translate("close")}
                 </Button>
                 <Button
                   className="primary"
@@ -5406,7 +5474,7 @@ function ManageSections({
                       );
                   }}
                 >
-                  验证并保存
+                  {translate("validateAndSave")}
                 </Button>
               </div>
               {customProviderStatus && (
@@ -5440,7 +5508,7 @@ function ManageSections({
                   setHostFormOpen(true);
                 }}
               >
-                Add host
+                {translate("addHost")}
               </Button>
             }
             bare
@@ -5453,12 +5521,14 @@ function ManageSections({
                       icon={host.name.slice(0, 1).toUpperCase()}
                       title={host.name}
                       badge={{
-                        label: hostStatusLabel(host),
+                        label: translateBackendValue(hostStatusLabel(host)),
                         tone: host.online === true ? "success" : "neutral",
                       }}
                       description={
                         host.online === false ? (
-                          <span className="status-offline">Offline</span>
+                          <span className="status-offline">
+                            {translate("offline")}
+                          </span>
                         ) : undefined
                       }
                       actions={
@@ -5471,7 +5541,7 @@ function ManageSections({
                                   .catch(onError);
                               }}
                             >
-                              Edit
+                              {translate("edit")}
                             </Button>
                           )}
                           <Button
@@ -5483,7 +5553,9 @@ function ManageSections({
                                 .finally(() => setTestingHostId(null));
                             }}
                           >
-                            {testingHostId === host.id ? "Testing…" : "Test"}
+                            {testingHostId === host.id
+                              ? translate("testing")
+                              : translate("test")}
                           </Button>
                           <Button
                             className="danger"
@@ -5499,8 +5571,8 @@ function ManageSections({
                             }}
                           >
                             {confirmDeleteHostId === host.id
-                              ? "Confirm delete"
-                              : "Delete"}
+                              ? translate("confirmDelete")
+                              : translate("delete")}
                           </Button>
                         </>
                       }
@@ -5522,13 +5594,13 @@ function ManageSections({
                   <input
                     value={hostName}
                     onChange={(event) => setHostName(event.target.value)}
-                    placeholder={translate("Host name")}
+                    placeholder={translate("hostName")}
                     required
                   />
                   <input
                     value={hostUrl}
                     onChange={(event) => setHostUrl(event.target.value)}
-                    placeholder={translate("Remote URL")}
+                    placeholder={translate("remoteUrl")}
                     type="url"
                     required
                   />
@@ -5537,8 +5609,8 @@ function ManageSections({
                     onChange={(event) => setHostToken(event.target.value)}
                     placeholder={
                       editingHostId
-                        ? "留空保持原 token"
-                        : translate("Bearer token")
+                        ? translate("keepExistingToken")
+                        : translate("bearerToken")
                     }
                     type="password"
                     required={!editingHostId}
@@ -5546,11 +5618,11 @@ function ManageSections({
                   <input
                     value={vncPassword}
                     onChange={(event) => setVncPassword(event.target.value)}
-                    placeholder="Optional VNC password"
+                    placeholder={translate("optionalVncPassword")}
                     type="password"
                   />
                   <Button type="submit" className="primary">
-                    {editingHostId ? "Save" : "Add host"}
+                    {editingHostId ? translate("save") : translate("addHost")}
                   </Button>
                   <Button
                     type="button"
@@ -5563,7 +5635,7 @@ function ManageSections({
                       setHostFormOpen(false);
                     }}
                   >
-                    Cancel
+                    {translate("cancel")}
                   </Button>
                 </form>
               ) : undefined
@@ -5580,7 +5652,8 @@ function ManageSections({
                 command("save_asset", {
                   id: instructions?.id || "global-instructions",
                   kind: "instructions",
-                  title: instructions?.title || "全局指令",
+                  title:
+                    instructions?.title || translate("instructionsSection"),
                   body: instructionsDraft,
                   trigger: null,
                   scope: null,
@@ -5596,10 +5669,10 @@ function ManageSections({
                 <>
                   <div className="rounded-xl2 border border-line bg-panel p-5">
                     <h2 className="text-[15px] font-semibold text-ink">
-                      全局指令
+                      {translate("globalInstructions")}
                     </h2>
                     <p className="text-[13px] text-muted mt-1">
-                      这里的内容会追加到所有会话的系统指令中。
+                      {translate("globalInstructionsDescription")}
                     </p>
                     <textarea
                       className="mt-4 min-h-[260px] w-full"
@@ -5607,11 +5680,11 @@ function ManageSections({
                       onChange={(event) =>
                         setInstructionsDraft(event.target.value)
                       }
-                      placeholder="输入全局指令内容"
+                      placeholder={translate("globalInstructionsPlaceholder")}
                     />
                     <div className="inline-actions">
                       <Button className="primary" onClick={saveInstructions}>
-                        保存指令
+                        {translate("saveInstructions")}
                       </Button>
                       {instructions && (
                         <Button
@@ -5627,7 +5700,7 @@ function ManageSections({
                               .catch(onError);
                           }}
                         >
-                          版本历史
+                          {translate("versionHistory")}
                         </Button>
                       )}
                     </div>
@@ -5635,7 +5708,7 @@ function ManageSections({
                   {versionHistoryAsset && (
                     <div className="manage-card mt-4">
                       <div className="flex items-center justify-between">
-                        <strong>版本历史</strong>
+                        <strong>{translate("versionHistory")}</strong>
                         <Button
                           className="bordered"
                           onClick={() => {
@@ -5644,7 +5717,7 @@ function ManageSections({
                             setCompareVersionId(null);
                           }}
                         >
-                          关闭
+                          {translate("close")}
                         </Button>
                       </div>
                       {assetVersions.map((version) => {
@@ -5656,7 +5729,7 @@ function ManageSections({
                             <span>
                               <strong>
                                 v{String(version.version)}
-                                {isCurrent ? " · 当前" : ""}
+                                {isCurrent ? ` · ${translate("current")}` : ""}
                               </strong>
                               <small>{String(version.created_at)}</small>
                             </span>
@@ -5671,7 +5744,7 @@ function ManageSections({
                                   .catch(onError)
                               }
                             >
-                              回滚
+                              {translate("rollback")}
                             </Button>
                           </div>
                         );
@@ -5692,7 +5765,7 @@ function ManageSections({
                   value={libraryProjectId}
                   onChange={(event) => setLibraryProjectId(event.target.value)}
                 >
-                  <option value="">选择项目进行仓库同步</option>
+                  <option value="">{translate("syncRepositoryProject")}</option>
                   {projects.map((project) => (
                     <option key={project.id} value={project.id}>
                       {project.name}
@@ -5707,7 +5780,9 @@ function ManageSections({
                     void command("import_repository_templates", {
                       projectId: libraryProjectId,
                     })
-                      .then(() => setTemplateDraftStatus("已从仓库导入专家"))
+                      .then(() =>
+                        setTemplateDraftStatus(translate("importedExpert")),
+                      )
                       .then(() =>
                         command<LibraryEntry[]>("list_configured_library").then(
                           setLibraryEntries,
@@ -5716,7 +5791,7 @@ function ManageSections({
                       .catch(onError)
                   }
                 >
-                  从仓库导入专家
+                  {translate("importExpertFromRepository")}
                 </button>
               </div>
             )}
@@ -5727,7 +5802,9 @@ function ManageSections({
                   value={libraryProjectId}
                   onChange={(event) => setLibraryProjectId(event.target.value)}
                 >
-                  <option value="">选择项目导入/导出团队</option>
+                  <option value="">
+                    {translate("importExportTeamProject")}
+                  </option>
                   {projects.map((project) => (
                     <option key={project.id} value={project.id}>
                       {project.name}
@@ -5743,7 +5820,7 @@ function ManageSections({
                       projectId: libraryProjectId,
                     })
                       .then(() =>
-                        setTemplateDraftStatus("当前项目已另存为 Team 模板"),
+                        setTemplateDraftStatus(translate("savedAsTeam")),
                       )
                       .then(() =>
                         command<LibraryEntry[]>("list_configured_library").then(
@@ -5753,7 +5830,7 @@ function ManageSections({
                       .catch(onError)
                   }
                 >
-                  当前项目另存为 Team
+                  {translate("saveProjectAsTeam")}
                 </button>
               </div>
             )}
@@ -5770,7 +5847,7 @@ function ManageSections({
                   setTemplateEditorOpen(true);
                 }}
               >
-                添加
+                {translate("add")}
               </button>
             </div>
             {templateEditorOpen && (
@@ -5783,13 +5860,17 @@ function ManageSections({
                   onClick={(event) => event.stopPropagation()}
                 >
                   <div className="flex items-center justify-between">
-                    <strong>{templateDraftId ? "编辑模板" : "添加模板"}</strong>
+                    <strong>
+                      {templateDraftId
+                        ? translate("editTemplate")
+                        : translate("addTemplate")}
+                    </strong>
                     <button
                       type="button"
                       className="btn"
                       onClick={() => setTemplateEditorOpen(false)}
                     >
-                      关闭
+                      {translate("close")}
                     </button>
                   </div>
                   <div className="grid gap-2 md:grid-cols-2">
@@ -5799,7 +5880,7 @@ function ManageSections({
                       onChange={(event) =>
                         setTemplateDraftName(event.target.value)
                       }
-                      placeholder="模板名称"
+                      placeholder={translate("templateName")}
                     />
                     <input
                       className="input"
@@ -5807,7 +5888,7 @@ function ManageSections({
                       onChange={(event) =>
                         setTemplateDraftDescription(event.target.value)
                       }
-                      placeholder="描述"
+                      placeholder={translate("description")}
                     />
                   </div>
                   <textarea
@@ -5839,7 +5920,7 @@ function ManageSections({
                           content: templateDraftContent,
                         })
                           .then(() => {
-                            setTemplateDraftStatus("已保存");
+                            setTemplateDraftStatus(translate("saved"));
                             setTemplateDraftName("");
                             setTemplateDraftId(null);
                             setTemplateEditorOpen(false);
@@ -5851,7 +5932,7 @@ function ManageSections({
                           .catch(onError);
                       }}
                     >
-                      保存
+                      {translate("save")}
                     </button>
                   </div>
                 </section>
@@ -5871,38 +5952,44 @@ function ManageSections({
                           {template.name}
                         </strong>
                         <small className="block text-muted">
-                          {template.source ||
-                            (template.status === "builtin"
-                              ? "内置"
-                              : "自定义")}{" "}
+                          {translateBackendValue(
+                            template.source ||
+                              (template.status === "builtin"
+                                ? "builtin"
+                                : "custom"),
+                          )}{" "}
                           · v{template.version}
                         </small>
                       </div>
                       <span className="max-w-[45%] break-words text-right text-xs text-muted">
-                        {template.kind}
+                        {translateBackendValue(template.kind)}
                       </span>
                     </div>
                     <p className="mt-2 break-words text-sm text-muted">
-                      {template.description || "无描述"}
+                      {template.description || translate("noDescription")}
                     </p>
                     <pre className="mt-2 max-h-28 max-w-full overflow-auto whitespace-pre-wrap break-words text-xs text-muted">
                       {template.content}
                     </pre>
                     {template.readonly && (
                       <div className="mt-2 flex items-center justify-between">
-                        <small className="text-muted">内置模板只读。</small>
+                        <small className="text-muted">
+                          {translate("builtInTemplateReadonly")}
+                        </small>
                         <button
                           type="button"
                           className="btn"
                           onClick={() => {
-                            setTemplateDraftName(`${template.name} 副本`);
+                            setTemplateDraftName(
+                              `${template.name} ${translate("copySuffix")}`,
+                            );
                             setTemplateDraftId(null);
                             setTemplateDraftDescription(template.description);
                             setTemplateDraftContent(template.content);
                             setTemplateEditorOpen(true);
                           }}
                         >
-                          另存为
+                          {translate("saveAs")}
                         </button>
                       </div>
                     )}
@@ -5920,14 +6007,16 @@ function ManageSections({
                               projectId: libraryProjectId,
                             })
                               .then(() =>
-                                setTemplateDraftStatus("已导出到仓库"),
+                                setTemplateDraftStatus(
+                                  translate("exportedRepository"),
+                                ),
                               )
                               .catch((reason) => {
                                 const message = errorMessage(reason);
                                 if (
                                   message.includes("confirm overwrite") &&
                                   window.confirm(
-                                    `目标文件已有不同内容，确定覆盖吗？\n${message}`,
+                                    `${translate("overwriteDifferentFileConfirm")}\n${message}`,
                                   )
                                 ) {
                                   return command(
@@ -5938,14 +6027,16 @@ function ManageSections({
                                       overwrite: true,
                                     },
                                   ).then(() =>
-                                    setTemplateDraftStatus("已覆盖导出到仓库"),
+                                    setTemplateDraftStatus(
+                                      translate("overwrittenRepository"),
+                                    ),
                                   );
                                 }
                                 onError(reason);
                               })
                           }
                         >
-                          导出到仓库
+                          {translate("exportToRepository")}
                         </button>
                       )}
                     {!template.readonly && (
@@ -5967,13 +6058,19 @@ function ManageSections({
                             setTemplateEditorOpen(true);
                           }}
                         >
-                          编辑
+                          {translate("edit")}
                         </button>
                         <button
                           type="button"
                           className="btn danger"
                           onClick={() => {
-                            if (!window.confirm(`删除「${template.name}」？`))
+                            if (
+                              !window.confirm(
+                                translate("deleteTemplateConfirm", {
+                                  name: template.name,
+                                }),
+                              )
+                            )
                               return;
                             void command("delete_template", {
                               id: template.id,
@@ -5987,7 +6084,7 @@ function ManageSections({
                               .catch(onError);
                           }}
                         >
-                          删除
+                          {translate("delete")}
                         </button>
                       </div>
                     )}
@@ -5996,21 +6093,25 @@ function ManageSections({
             </div>
             {!libraryEntries.some(
               (template) => template.kind === activeLibraryKind,
-            ) && <div className="py-8 text-sm text-muted">暂无模板</div>}
+            ) && (
+              <div className="py-8 text-sm text-muted">
+                {translate("noTemplates")}
+              </div>
+            )}
           </div>
         )}
         {tab === "skill" && (
           <div className="space-y-6">
             <label className="settings-row">
               <div>
-                <strong>Skills & Rules 作用域</strong>
-                <small>项目视图只统计该项目下会话的真实技能调用。</small>
+                <strong>{translate("skillsRulesScope")}</strong>
+                <small>{translate("skillsRulesScopeDescription")}</small>
               </div>
               <SelectMenu
                 value={settingsProjectId || ""}
                 onChange={(value) => setSettingsProjectId(value || null)}
                 options={[
-                  { value: "", label: "全局" },
+                  { value: "", label: translate("global") },
                   ...projects.map((project) => ({
                     value: project.id,
                     label: project.name,
@@ -6021,19 +6122,21 @@ function ManageSections({
             <section className="rounded-lg border border-line p-4">
               <div className="flex items-center justify-between mb-3">
                 <div>
-                  <strong>技能用量</strong>
+                  <strong>{translate("skillUsage")}</strong>
                   <small className="block">
-                    数据来自技能实际注入会话上下文时的埋点；同一会话同一技能只计一次。
+                    {translate("skillUsageDescription")}
                   </small>
                 </div>
               </div>
               {!skillUsage?.skills.length ? (
-                <div className="text-sm text-muted py-6">暂无技能启用记录</div>
+                <div className="text-sm text-muted py-6">
+                  {translate("noSkillUsage")}
+                </div>
               ) : (
                 <>
                   <div className="grid grid-cols-3 gap-2 mb-4">
                     <div className="rounded-md bg-panel p-3">
-                      <small>启用次数</small>
+                      <small>{translate("activationCount")}</small>
                       <strong className="block text-lg">
                         {skillUsage.skills.reduce(
                           (sum, item) => sum + item.calls,
@@ -6042,13 +6145,13 @@ function ManageSections({
                       </strong>
                     </div>
                     <div className="rounded-md bg-panel p-3">
-                      <small>涉及技能</small>
+                      <small>{translate("involvedSkills")}</small>
                       <strong className="block text-lg">
                         {skillUsage.skills.length}
                       </strong>
                     </div>
                     <div className="rounded-md bg-panel p-3">
-                      <small>时间范围</small>
+                      <small>{translate("timeRange")}</small>
                       <strong className="block text-lg">
                         {skillUsage.timeline.length
                           ? `${skillUsage.timeline[0].date} – ${skillUsage.timeline.at(-1)?.date}`
@@ -6064,15 +6167,16 @@ function ManageSections({
                       >
                         <code className="flex-1">{item.name}</code>
                         <span className="text-xs text-muted">
-                          {item.calls} 次 · {item.sessions} 个会话 · 最近启用{" "}
-                          {item.last_used}
+                          {item.calls} {translate("activations")} ·{" "}
+                          {item.sessions} {translate("sessionsCount")} ·{" "}
+                          {translate("recentlyEnabled")} {item.last_used}
                         </span>
                       </div>
                     ))}
                   </div>
                   {skillUsage.timeline.length > 0 && (
                     <div className="mt-4 text-xs text-muted">
-                      随时间变化（启用）：
+                      {translate("enabledOverTime")}
                       {skillUsage.timeline
                         .map((item) => ` ${item.date} (${item.calls})`)
                         .join(" · ")}
@@ -6084,24 +6188,30 @@ function ManageSections({
             <section className="rounded-lg border border-line p-4">
               <div className="flex items-center justify-between mb-3">
                 <div>
-                  <strong>Browse</strong>
+                  <strong>{translate("browse")}</strong>
                   <small className="block">
-                    浏览仓库发现的 .agents/skills 与规则文件；Skill 不在此创建。
+                    {translate("browseRepositoryAssets")}
                   </small>
                 </div>
               </div>
               {!selected ? (
                 <div className="text-sm text-muted py-6">
-                  请先打开一个项目会话以浏览仓库技能和规则
+                  {translate("openProjectSessionAssets")}
                 </div>
               ) : !skillBrowse ? (
-                <div className="text-sm text-muted py-6">正在读取仓库资产…</div>
+                <div className="text-sm text-muted py-6">
+                  {translate("readingRepositoryAssets")}
+                </div>
               ) : (
                 <div className="space-y-4">
                   <div>
-                    <h4 className="font-medium mb-2">Skills · 仓库来源</h4>
+                    <h4 className="font-medium mb-2">
+                      {translate("skillsRepositorySource")}
+                    </h4>
                     {!skillBrowse.skills.length ? (
-                      <div className="text-sm text-muted">暂无仓库 Skill</div>
+                      <div className="text-sm text-muted">
+                        {translate("noRepositorySkills")}
+                      </div>
                     ) : (
                       skillBrowse.skills.map((item) => (
                         <details
@@ -6122,9 +6232,13 @@ function ManageSections({
                     )}
                   </div>
                   <div>
-                    <h4 className="font-medium mb-2">Rules · 仓库来源</h4>
+                    <h4 className="font-medium mb-2">
+                      {translate("rulesRepositorySource")}
+                    </h4>
                     {!skillBrowse.rules.length ? (
-                      <div className="text-sm text-muted">暂无仓库规则</div>
+                      <div className="text-sm text-muted">
+                        {translate("noRepositoryRules")}
+                      </div>
                     ) : (
                       skillBrowse.rules.map((item) => (
                         <details
@@ -6150,39 +6264,27 @@ function ManageSections({
           <div>
             {(
               [
-                [
-                  "agents",
-                  "规则",
-                  "仓库级运行规则（对应仓库中的 AGENTS.md 文件）。",
-                ],
-                ["instructions", "全局指令", "应用于所有新会话的全局指令。"],
-                [
-                  "knowledge",
-                  "Knowledge",
-                  "Reusable reference material added to the knowledge context.",
-                ],
-                [
-                  "playbook",
-                  "Playbook",
-                  "A repeatable workflow that can be run by an automation.",
-                ],
-                [
-                  "skill",
-                  "Skill",
-                  "A focused capability or instruction bundle available to the agent.",
-                ],
+                ["agents", "rulesSection"],
+                ["instructions", "instructionsSection"],
+                ["knowledge", "knowledgeSection"],
+                ["playbook", "playbookSection"],
+                ["skill", "skillSection"],
               ] as const
             )
               .filter(
                 ([kind]) => kind === assetTabKind && kind !== "instructions",
               )
-              .map(([kind, label, description]) => (
+              .map(([kind, labelKey]) => (
                 <CollectionPage
                   key={kind}
                   search={assetSearch}
                   onSearch={setAssetSearch}
                   searchPlaceholder={
-                    kind === "agents" ? "搜索规则" : `Search ${label}`
+                    kind === "agents"
+                      ? translate("searchRules")
+                      : translate("searchAssetsWithLabel", {
+                          label: translate(labelKey),
+                        })
                   }
                   actions={
                     tab === "knowledge" || tab === "playbook" ? (
@@ -6208,8 +6310,8 @@ function ManageSections({
                               }
                             >
                               {remoteAssetAction === "discovering"
-                                ? "Discovering…"
-                                : "Discover remote"}
+                                ? translate("discovering")
+                                : translate("discoverRemote")}
                             </Button>
                             <Button
                               className="bordered"
@@ -6230,8 +6332,8 @@ function ManageSections({
                               }
                             >
                               {remoteAssetAction === "importing"
-                                ? "Importing…"
-                                : "Import"}
+                                ? translate("importing")
+                                : translate("import")}
                             </Button>
                           </>
                         )}
@@ -6252,15 +6354,20 @@ function ManageSections({
                           }
                         >
                           {remoteAssetAction === "exporting"
-                            ? "Exporting…"
-                            : "Export"}
+                            ? translate("exporting")
+                            : translate("export")}
                         </Button>
                       </div>
                     ) : undefined
                   }
                   columns={
                     kind === "agents"
-                      ? ["标题", "触发条件", "范围", "状态"]
+                      ? [
+                          translate("titleLabel"),
+                          translate("triggerCondition"),
+                          translate("scopeLabel"),
+                          translate("statusLabel"),
+                        ]
                       : ["Title", "Trigger", "Scope", "Status"]
                   }
                   renderCard={() => (
@@ -6286,11 +6393,11 @@ function ManageSections({
                               <span className="text-[11px] text-muted">
                                 {kind === "agents"
                                   ? asset.enabled
-                                    ? "已启用"
-                                    : "已禁用"
+                                    ? translate("enabled")
+                                    : translate("disabled")
                                   : asset.enabled
-                                    ? "Enabled"
-                                    : "Disabled"}
+                                    ? translate("enabled")
+                                    : translate("disabled")}
                               </span>
                             </div>
                             <p className="mt-2 text-[13px] text-muted line-clamp-2">
@@ -6299,8 +6406,8 @@ function ManageSections({
                             <small className="mt-3 block text-muted">
                               {asset.trigger ||
                                 (kind === "agents"
-                                  ? "未设置触发条件"
-                                  : "No trigger")}
+                                  ? translate("noTrigger")
+                                  : translate("noTrigger"))}
                             </small>
                           </div>
                         ))}
@@ -6317,7 +6424,11 @@ function ManageSections({
                         setAssetFormOpen(true);
                       }}
                     >
-                      {kind === "agents" ? "新建规则" : `New ${label}`}
+                      {kind === "agents"
+                        ? translate("newRule")
+                        : translate("newAssetWithLabel", {
+                            label: translate(labelKey),
+                          })}
                     </Button>
                   }
                   rows={
@@ -6340,11 +6451,11 @@ function ManageSections({
                               <small>
                                 {kind === "agents"
                                   ? asset.enabled
-                                    ? "已启用"
-                                    : "已禁用"
+                                    ? translate("enabled")
+                                    : translate("disabled")
                                   : asset.enabled
-                                    ? "Enabled"
-                                    : "Disabled"}
+                                    ? translate("enabled")
+                                    : translate("disabled")}
                                 {asset.trigger ? ` · ${asset.trigger}` : ""}
                               </small>
                             </span>
@@ -6372,15 +6483,15 @@ function ManageSections({
                               >
                                 {assetPending === asset.id
                                   ? kind === "agents"
-                                    ? "保存中…"
-                                    : "Saving…"
+                                    ? translate("saving")
+                                    : translate("saving")
                                   : asset.enabled
                                     ? kind === "agents"
-                                      ? "停用"
-                                      : "Disable"
+                                      ? translate("disable")
+                                      : translate("disable")
                                     : kind === "agents"
-                                      ? "启用"
-                                      : "Enable"}
+                                      ? translate("enable")
+                                      : translate("enable")}
                               </Button>
                               <Button
                                 className="bordered"
@@ -6397,7 +6508,7 @@ function ManageSections({
                                     .catch(onError);
                                 }}
                               >
-                                History
+                                {translate("history")}
                               </Button>
                               <Button
                                 className="bordered"
@@ -6416,7 +6527,9 @@ function ManageSections({
                                   );
                                 }}
                               >
-                                {kind === "agents" ? "编辑" : "Edit"}
+                                {kind === "agents"
+                                  ? translate("editLabel")
+                                  : translate("edit")}
                               </Button>
                               <Button
                                 className="danger"
@@ -6431,7 +6544,9 @@ function ManageSections({
                                     .finally(() => setAssetPending(null));
                                 }}
                               >
-                                {kind === "agents" ? "删除" : "Delete"}
+                                {kind === "agents"
+                                  ? translate("deleteLabel")
+                                  : translate("delete")}
                               </Button>
                             </span>
                           </div>
@@ -6439,21 +6554,27 @@ function ManageSections({
                       {!assets.some((asset) => asset.kind === kind) && (
                         <p className="px-4 py-6 text-[13px] text-muted">
                           {kind === "agents"
-                            ? "暂无规则。"
-                            : `No ${label} assets yet.`}
+                            ? translate("noRules")
+                            : translate("noAssetsForLabel", {
+                                label: translate(labelKey),
+                              })}
                         </p>
                       )}
                     </>
                   }
                   empty={
-                    kind === "agents" ? "暂无规则。" : `No ${label} assets yet.`
+                    kind === "agents"
+                      ? translate("noRules")
+                      : translate("noAssetsForLabel", {
+                          label: translate(labelKey),
+                        })
                   }
                 />
               ))}
             {versionHistoryAsset && (
               <div className="manage-card mt-4">
                 <div className="flex items-center justify-between">
-                  <strong>Version history</strong>
+                  <strong>{translate("versionHistory")}</strong>
                   <Button
                     className="bordered"
                     onClick={() => {
@@ -6462,7 +6583,7 @@ function ManageSections({
                       setCompareVersionId(null);
                     }}
                   >
-                    Close
+                    {translate("close")}
                   </Button>
                 </div>
                 {assetVersions.map((version) => {
@@ -6475,7 +6596,7 @@ function ManageSections({
                       <span>
                         <strong>
                           v{String(version.version)}
-                          {isCurrent ? " · current" : ""}
+                          {isCurrent ? ` · ${translate("current")}` : ""}
                         </strong>
                         <small>{String(version.created_at)}</small>
                       </span>
@@ -6502,7 +6623,7 @@ function ManageSections({
                             }
                           }}
                         >
-                          Compare
+                          {translate("compare")}
                         </Button>
                         <Button
                           className="bordered"
@@ -6515,7 +6636,7 @@ function ManageSections({
                               .catch(onError)
                           }
                         >
-                          Roll back
+                          {translate("rollback")}
                         </Button>
                       </span>
                     </div>
@@ -6531,51 +6652,51 @@ function ManageSections({
                 <h2 className="text-[15px] font-semibold text-ink">
                   {assetTabKind === "agents"
                     ? editingAssetId
-                      ? "编辑规则"
-                      : "新建规则"
+                      ? translate("editRule")
+                      : translate("newRule")
                     : assetTabKind === "instructions"
                       ? editingAssetId
-                        ? "编辑全局指令"
-                        : "新建全局指令"
+                        ? translate("editGlobalInstructions")
+                        : translate("newGlobalInstructions")
                       : editingAssetId
-                        ? "Edit asset"
-                        : "New asset"}
+                        ? translate("editAsset")
+                        : translate("newAsset")}
                 </h2>
                 <div className="form-grid mt-4">
                   <label className="field-label">
-                    {assetTabKind === "agents" ? "标题" : "Title"}
+                    {translate("titleLabel")}
                     <input
                       value={assetTitle}
                       onChange={(event) => setAssetTitle(event.target.value)}
-                      placeholder={translate("Asset title")}
+                      placeholder={translate("assetTitle")}
                     />
                   </label>
                   <label className="field-label">
-                    {assetTabKind === "agents" ? "内容" : "Body"}
+                    {translate("contentLabel")}
                     <textarea
                       value={assetBody}
                       onChange={(event) => setAssetBody(event.target.value)}
-                      placeholder={translate("Asset content")}
+                      placeholder={translate("assetContent")}
                     />
                   </label>
                   {(assetTabKind === "knowledge" ||
                     assetTabKind === "skill") && (
                     <label className="field-label">
-                      Trigger
+                      {translate("triggerLabel")}
                       <input
                         value={assetTrigger}
                         onChange={(event) =>
                           setAssetTrigger(event.target.value)
                         }
-                        placeholder={translate("Optional trigger")}
+                        placeholder={translate("optionalTrigger")}
                       />
                     </label>
                   )}
                   <label className="field-label">
                     {assetTabKind === "agents" ||
                     assetTabKind === "instructions"
-                      ? "适用范围"
-                      : "Scope"}
+                      ? translate("applyScope")
+                      : translate("scopeLabel")}
                     <select
                       value={assetScopeKind}
                       onChange={(event) =>
@@ -6584,13 +6705,13 @@ function ManageSections({
                         )
                       }
                     >
-                      <option value="global">Global</option>
-                      <option value="repo">Repository</option>
+                      <option value="global">{translate("global")}</option>
+                      <option value="repo">{translate("repository")}</option>
                     </select>
                     <input
                       value={assetScope}
                       onChange={(event) => setAssetScope(event.target.value)}
-                      placeholder={translate("Workspace path (absolute)")}
+                      placeholder={translate("workspacePathAbsolute")}
                       disabled={
                         assetScopeKind === "global" ||
                         assetTabKind === "instructions"
@@ -6624,15 +6745,15 @@ function ManageSections({
                   >
                     {assetTabKind === "agents"
                       ? editingAssetId
-                        ? "保存更改"
-                        : "创建规则"
+                        ? translate("saveChanges")
+                        : translate("createRule")
                       : assetTabKind === "instructions"
                         ? editingAssetId
-                          ? "保存更改"
-                          : "保存全局指令"
+                          ? translate("saveChanges")
+                          : translate("saveGlobalInstructions")
                         : editingAssetId
-                          ? "Save changes"
-                          : "Create asset"}
+                          ? translate("saveChanges")
+                          : translate("createAsset")}
                   </Button>
                 </div>
               </div>
@@ -6650,34 +6771,31 @@ function ManageSections({
           <div className="space-y-5">
             <div className="rounded-xl2 border border-line bg-panel p-5">
               <h2 className="text-[15px] font-semibold text-ink">
-                External event sources
+                {translate("externalEventSources")}
               </h2>
+              <p className="muted mt-1">{translate("ingressDisabledNotice")}</p>
               <p className="muted mt-1">
-                Sources are disabled when created. Polling never exposes a
-                public listener.
-              </p>
-              <p className="muted mt-1">
-                GitHub repository events are best-effort polling: GitHub
-                documents up to 300 events from the last 30 days and may delay
-                delivery. Pull requests, comments, and issues are mapped.
-                Check-run state is not exposed by this Events API source; use
-                the later webhook/Checks integration for CI state triggers.
+                {translate("githubEventsDescription")}
               </p>
               <div className="form-grid mt-4">
                 <label className="field-label">
-                  Provider
+                  {translate("provider")}
                   <select
                     value={ingressProvider}
                     onChange={(event) =>
                       setIngressProvider(event.target.value as "github" | "rss")
                     }
                   >
-                    <option value="github">GitHub repository events</option>
-                    <option value="rss">RSS / Atom feed</option>
+                    <option value="github">
+                      {translate("githubRepositoryEvents")}
+                    </option>
+                    <option value="rss">{translate("rssAtomFeed")}</option>
                   </select>
                 </label>
                 <label className="field-label">
-                  {ingressProvider === "github" ? "Repository" : "Feed URL"}
+                  {ingressProvider === "github"
+                    ? translate("repository")
+                    : translate("feedUrl")}
                   <input
                     value={ingressTarget}
                     onChange={(event) => setIngressTarget(event.target.value)}
@@ -6689,15 +6807,15 @@ function ManageSections({
                   />
                 </label>
                 <label className="field-label">
-                  Poll interval
+                  {translate("pollInterval")}
                   <select
                     value={ingressInterval}
                     onChange={(event) => setIngressInterval(event.target.value)}
                   >
-                    <option value="30">30 seconds</option>
-                    <option value="60">1 minute</option>
-                    <option value="300">5 minutes</option>
-                    <option value="900">15 minutes</option>
+                    <option value="30">{translate("seconds30")}</option>
+                    <option value="60">{translate("minute1")}</option>
+                    <option value="300">{translate("minutes5")}</option>
+                    <option value="900">{translate("fifteenMinutes")}</option>
                   </select>
                 </label>
                 <div className="flex items-end gap-2">
@@ -6734,7 +6852,9 @@ function ManageSections({
                         .catch(onError);
                     }}
                   >
-                    {editingIngressId ? "Save changes" : "Add source"}
+                    {editingIngressId
+                      ? translate("saveChanges")
+                      : translate("addSource")}
                   </Button>
                   {editingIngressId && (
                     <Button
@@ -6744,7 +6864,7 @@ function ManageSections({
                         setIngressTarget("");
                       }}
                     >
-                      Cancel
+                      {translate("cancel")}
                     </Button>
                   )}
                 </div>
@@ -6756,7 +6876,7 @@ function ManageSections({
             <div className="manage-list">
               {ingressSources.length === 0 && (
                 <div className="manage-card muted">
-                  No external event sources configured.
+                  {translate("noIngressSources")}
                 </div>
               )}
               {ingressSources.map((source) => {
@@ -6774,13 +6894,17 @@ function ManageSections({
                         {target}
                       </div>
                       <small>
-                        {source.enabled ? "Enabled" : "Disabled"} · last success{" "}
-                        {source.last_success_at || "never"} · failures{" "}
-                        {source.consecutive_failures}
+                        {source.enabled
+                          ? translate("enabled")
+                          : translate("disabled")}{" "}
+                        · {translate("lastSuccess")}{" "}
+                        {source.last_success_at || translate("never")} ·{" "}
+                        {translate("failures")} {source.consecutive_failures}
                       </small>
                       {circuitOpen && (
                         <div className="failure">
-                          Circuit open until {source.circuit_open_until}
+                          {translate("circuitOpenUntil")}{" "}
+                          {source.circuit_open_until}
                         </div>
                       )}
                       {source.last_error && (
@@ -6806,7 +6930,7 @@ function ManageSections({
                           setEditingIngressId(source.source_id);
                         }}
                       >
-                        Edit
+                        {translate("edit")}
                       </Button>
                       <Button
                         className="bordered"
@@ -6818,7 +6942,7 @@ function ManageSections({
                             .catch(onError)
                         }
                       >
-                        Poll now
+                        {translate("pollNow")}
                       </Button>
                       <Button
                         className={source.enabled ? "bordered" : "primary"}
@@ -6831,15 +6955,15 @@ function ManageSections({
                             .catch(onError)
                         }
                       >
-                        {source.enabled ? "Disable" : "Enable"}
+                        {source.enabled
+                          ? translate("disable")
+                          : translate("enable")}
                       </Button>
                       <Button
                         className="bordered"
                         onClick={() => {
                           if (
-                            !window.confirm(
-                              "Delete this external event source?",
-                            )
+                            !window.confirm(translate("deleteIngressConfirm"))
                           )
                             return;
                           void command("delete_external_ingress_source", {
@@ -6849,7 +6973,7 @@ function ManageSections({
                             .catch(onError);
                         }}
                       >
-                        Delete
+                        {translate("delete")}
                       </Button>
                     </div>
                   </div>
@@ -6864,11 +6988,10 @@ function ManageSections({
               {!openConnector && (
                 <>
                   <h2 className="text-[15px] font-semibold text-ink">
-                    OpenWorker connector directory
+                    {translate("openWorkerDirectory")}
                   </h2>
                   <p className="muted mt-1">
-                    Default connector catalog from OpenWorker. OPCOS only
-                    enables integrations that are implemented locally.
+                    {translate("connectorCatalogDescription")}
                   </p>
                 </>
               )}
@@ -6884,12 +7007,12 @@ function ManageSections({
                     const status = configurable
                       ? tokenStatus?.connected
                         ? `Connected as ${tokenStatus.identity || "bot"}`
-                        : "Configurable"
+                        : "configurable"
                       : connector.name === "Linear"
                         ? linearStatus.includes("Connected")
-                          ? "Connected"
-                          : "Configurable"
-                        : "Not integrated";
+                          ? "connected"
+                          : "configurable"
+                        : "notIntegrated";
                     return (
                       <IntegrationCard
                         key={connector.name}
@@ -6898,21 +7021,21 @@ function ManageSections({
                         badge={{
                           label:
                             configurable && tokenStatus?.connected
-                              ? "Connected"
-                              : status === "Configurable"
-                                ? "Configurable"
-                                : status === "Connected"
-                                  ? "Connected"
-                                  : "Not integrated",
+                              ? translate("connected")
+                              : status === "configurable"
+                                ? translate("configurable")
+                                : status === "connected"
+                                  ? translate("connected")
+                                  : translate("notIntegrated"),
                           tone:
                             (configurable && tokenStatus?.connected) ||
-                            status === "Connected"
+                            status === "connected"
                               ? "success"
-                              : status === "Configurable"
+                              : status === "configurable"
                                 ? "info"
                                 : "neutral",
                         }}
-                        description={connector.description}
+                        description={translate(connector.description)}
                         disabled={!configurable}
                         onClick={
                           configurable
@@ -6937,12 +7060,12 @@ function ManageSections({
                               }
                             >
                               {openConnector === connectorKind
-                                ? "Close"
-                                : "Configure"}
+                                ? translate("closeConnector")
+                                : translate("configure")}
                             </Button>
                           ) : !integrated ? (
                             <Button className="bordered" disabled>
-                              Unavailable
+                              {translate("unavailable")}
                             </Button>
                           ) : undefined
                         }
@@ -6959,7 +7082,7 @@ function ManageSections({
                         className="bordered"
                         onClick={() => setOpenConnector(null)}
                       >
-                        ‹ All connectors
+                        {translate("allConnectors")}
                       </Button>
                       <div>
                         <h3 className="text-[15px] font-semibold text-ink">
@@ -6976,7 +7099,7 @@ function ManageSections({
                       </div>
                       {connectorStatuses[openConnector]?.connected && (
                         <span className="status-success ml-auto">
-                          Connected
+                          {translate("connected")}
                         </span>
                       )}
                     </div>
@@ -6984,8 +7107,7 @@ function ManageSections({
                       openConnector as (typeof OAUTH_CONNECTOR_KINDS)[number],
                     ) && (
                       <p className="muted col-span-full">
-                        Use your own OAuth application credentials. OPCOS opens
-                        the provider authorization page in your browser.
+                        {translate("oauthCredentialsDescription")}
                       </p>
                     )}
                     {(CONNECTOR_FIELDS[openConnector] || []).map((field) => (
@@ -7002,7 +7124,7 @@ function ManageSections({
                           placeholder={
                             field.key === "token" &&
                             connectorStatuses[openConnector]?.connected
-                              ? "Stored securely"
+                              ? translate("storedSecurely")
                               : field.placeholder
                           }
                           onChange={(event) => {
@@ -7082,10 +7204,10 @@ function ManageSections({
                       {OAUTH_CONNECTOR_KINDS.includes(
                         openConnector as (typeof OAUTH_CONNECTOR_KINDS)[number],
                       )
-                        ? "Connect"
+                        ? translate("connect")
                         : openConnector === "browser"
-                          ? "Connect"
-                          : "Save & verify"}
+                          ? translate("connect")
+                          : translate("saveAndVerify")}
                     </Button>
                     {connectorMessages[openConnector] && (
                       <small
@@ -7104,19 +7226,18 @@ function ManageSections({
                 )}
             </div>
             <div className="rounded-xl2 border border-line bg-panel p-5">
-              <h2 className="text-[15px] font-semibold text-ink">Linear</h2>
-              <p className="muted mt-1">
-                Direct GraphQL integration using a Personal API Key stored in
-                SecretStore. No OAuth callback or public listener is used.
-              </p>
+              <h2 className="text-[15px] font-semibold text-ink">
+                {translate("linear")}
+              </h2>
+              <p className="muted mt-1">{translate("linearDescription")}</p>
               <div className="form-grid mt-4">
                 <label className="field-label">
-                  Linear Personal API Key
+                  {translate("linearApiKeyLabel")}
                   <input
                     type="password"
                     value={linearPat}
                     onChange={(event) => setLinearPat(event.target.value)}
-                    placeholder="lin_api_…"
+                    placeholder={translate("linearApiKey")}
                   />
                 </label>
                 <div className="flex gap-2 items-end">
@@ -7136,7 +7257,7 @@ function ManageSections({
                         .catch(onError)
                     }
                   >
-                    Save key
+                    {translate("saveKey")}
                   </Button>
                   <Button
                     className="bordered"
@@ -7157,7 +7278,7 @@ function ManageSections({
                         })
                     }
                   >
-                    Test connection
+                    {translate("testConnection")}
                   </Button>
                 </div>
               </div>
@@ -7165,13 +7286,13 @@ function ManageSections({
             </div>
             <div className="rounded-xl2 border border-line bg-panel p-5">
               <h3 className="text-[14px] font-semibold text-ink">
-                Issue tools
+                {translate("issueTools")}
               </h3>
               <div className="flex gap-2 mt-3">
                 <input
                   value={linearIssueId}
                   onChange={(event) => setLinearIssueId(event.target.value)}
-                  placeholder="Issue identifier, e.g. ENG-123"
+                  placeholder={translate("issueIdentifierExample")}
                 />
                 <Button
                   className="bordered"
@@ -7183,7 +7304,7 @@ function ManageSections({
                       .catch(onError)
                   }
                 >
-                  Read issue
+                  {translate("readIssue")}
                 </Button>
                 <Button
                   className="bordered"
@@ -7196,7 +7317,7 @@ function ManageSections({
                       .catch(onError)
                   }
                 >
-                  List mine
+                  {translate("listMine")}
                 </Button>
               </div>
               {linearIssue && (
@@ -7225,7 +7346,7 @@ function ManageSections({
           <CollectionPage
             search=""
             onSearch={() => undefined}
-            searchPlaceholder="Repository index"
+            searchPlaceholder={translate("repositoryIndex")}
             primary={
               <Button
                 className="primary"
@@ -7241,33 +7362,35 @@ function ManageSections({
               >
                 {indexStatus?.status === "ready" ||
                 indexStatus?.status === "limited"
-                  ? "Refresh index"
-                  : "Build index"}
+                  ? translate("refreshIndex")
+                  : translate("buildIndex")}
               </Button>
             }
             rows={
               indexStatus ? (
                 <div className="manage-row px-4">
                   <span>
-                    <strong>{indexStatus.status}</strong>
+                    <strong>{translateBackendValue(indexStatus.status)}</strong>
                     <small>
-                      {indexStatus.file_count} files ·{" "}
-                      {indexStatus.symbol_count} symbols
-                      {indexStatus.truncated ? " · limited by size" : ""}
+                      {indexStatus.file_count} {translate("files")} ·{" "}
+                      {indexStatus.symbol_count} {translate("symbols")}
+                      {indexStatus.truncated
+                        ? ` · ${translate("limitedBySize")}`
+                        : ""}
                     </small>
                   </span>
                   <span className="muted">
                     {indexStatus.built_at
                       ? new Date(indexStatus.built_at).toLocaleString()
-                      : "not built"}
+                      : translate("notBuilt")}
                   </span>
                 </div>
               ) : null
             }
             empty={
               selected
-                ? "Repository index has not been built for this session host."
-                : "Select a session to manage its repository index."
+                ? translate("repositoryIndexNotBuilt")
+                : translate("selectSessionRepositoryIndex")
             }
           />
         )}
@@ -7281,7 +7404,7 @@ function ManageSections({
                 className="primary"
                 onClick={() => setSecretFormOpen((open) => !open)}
               >
-                {secretFormOpen ? "Cancel" : translate("addSecret")}
+                {secretFormOpen ? translate("cancel") : translate("addSecret")}
               </Button>
             }
             rows={
@@ -7290,7 +7413,7 @@ function ManageSections({
                   <div className="manage-row px-4">
                     <div className="form-grid w-full">
                       <label className="field-label">
-                        Name
+                        {translate("name")}
                         <input
                           value={secretName}
                           onChange={(event) =>
@@ -7299,7 +7422,7 @@ function ManageSections({
                         />
                       </label>
                       <label className="field-label">
-                        Scope
+                        {translate("scope")}
                         <input
                           value={secretScope}
                           onChange={(event) =>
@@ -7308,7 +7431,7 @@ function ManageSections({
                         />
                       </label>
                       <label className="field-label">
-                        Purpose
+                        {translate("purpose")}
                         <input
                           value={secretPurpose}
                           onChange={(event) =>
@@ -7317,7 +7440,7 @@ function ManageSections({
                         />
                       </label>
                       <label className="field-label">
-                        Value
+                        {translate("value")}
                         <input
                           type="password"
                           value={secretValue}
@@ -7350,7 +7473,7 @@ function ManageSections({
                           !secretValue
                         }
                       >
-                        Save secret
+                        {translate("saveSecret")}
                       </Button>
                     </div>
                   </div>
@@ -7392,7 +7515,7 @@ function ManageSections({
         )}
         {tab === "blueprint" && (
           <div className="form-grid">
-            <h2>{translate("Remote blueprint")}</h2>
+            <h2>{translate("remoteBlueprint")}</h2>
             <Button
               onClick={() =>
                 selected &&
@@ -7403,7 +7526,7 @@ function ManageSections({
                   .catch(onError)
               }
             >
-              Read blueprint
+              {translate("readBlueprint")}
             </Button>
             {blueprint && (
               <pre className="code-block">
@@ -7413,7 +7536,7 @@ function ManageSections({
             <textarea
               value={blueprintCommand}
               onChange={(event) => setBlueprintCommand(event.target.value)}
-              placeholder="Run remote command"
+              placeholder={translate("runRemoteCommand")}
             />
             <div className="inline-actions">
               <Button
@@ -7430,7 +7553,7 @@ function ManageSections({
                     .catch(onError)
                 }
               >
-                Run remote command
+                {translate("runRemoteCommand")}
               </Button>
               <Button
                 disabled={!selected}
@@ -7443,7 +7566,7 @@ function ManageSections({
                     .catch(onError)
                 }
               >
-                Run blueprint
+                {translate("runBlueprint")}
               </Button>
             </div>
           </div>
@@ -7726,14 +7849,20 @@ function McpManage({
     <>
       <section className="panel mb-4">
         <div className="flex items-center justify-between gap-2">
-          <h2>{editingServerId ? "Edit MCP server" : "Add MCP server"}</h2>
-          {editingServerId && <Button onClick={resetServerForm}>Cancel</Button>}
+          <h2>
+            {editingServerId
+              ? translate("editMcpServer")
+              : translate("addMcpServer")}
+          </h2>
+          {editingServerId && (
+            <Button onClick={resetServerForm}>{translate("cancel")}</Button>
+          )}
         </div>
         <div className="grid gap-2 md:grid-cols-2">
           <input
             value={serverName}
             onChange={(event) => setServerName(event.target.value)}
-            placeholder="Server name"
+            placeholder={translate("serverName")}
           />
           <select
             value={serverTransport}
@@ -7743,33 +7872,33 @@ function McpManage({
               )
             }
           >
-            <option value="streamable-http">Streamable HTTP</option>
-            <option value="http-sse">HTTP + SSE</option>
-            <option value="stdio">stdio</option>
+            <option value="streamable-http">
+              {translate("streamableHttp")}
+            </option>
+            <option value="http-sse">{translate("httpSse")}</option>
+            <option value="stdio">{translate("stdio")}</option>
           </select>
           {serverTransport === "stdio" ? (
             <>
               <input
                 value={serverCommand}
                 onChange={(event) => setServerCommand(event.target.value)}
-                placeholder="Command"
+                placeholder={translate("commandInput")}
               />
               <textarea
                 value={serverArgs}
                 onChange={(event) => setServerArgs(event.target.value)}
-                placeholder="Arguments, one per line"
+                placeholder={translate("argumentsPerLine")}
                 rows={3}
               />
               <textarea
                 value={serverEnv}
                 onChange={(event) => setServerEnv(event.target.value)}
-                placeholder="Environment, KEY=VALUE per line"
+                placeholder={translate("environmentPerLine")}
                 rows={3}
               />
               <p className="text-xs text-slate-500 md:col-span-2">
-                Use environment entries for non-sensitive runtime settings.
-                Store bearer tokens in the secure token field below, not in
-                environment variables.
+                {translate("secureTokenNotice")}
               </p>
             </>
           ) : (
@@ -7784,7 +7913,7 @@ function McpManage({
             type="password"
             value={serverToken}
             onChange={(event) => setServerToken(event.target.value)}
-            placeholder="Bearer token (stored securely)"
+            placeholder={translate("bearerToken")}
           />
           <label className="flex items-center gap-2">
             <input
@@ -7792,7 +7921,7 @@ function McpManage({
               checked={serverEnabled}
               onChange={(event) => setServerEnabled(event.target.checked)}
             />
-            Enabled
+            {translate("enabled")}
           </label>
           <label className="flex items-center gap-2">
             <input
@@ -7802,7 +7931,7 @@ function McpManage({
                 setServerRequiresApproval(event.target.checked)
               }
             />
-            Require approval for tools
+            {translate("requireApprovalTools")}
           </label>
         </div>
         <div className="mt-3 flex gap-2">
@@ -7815,7 +7944,9 @@ function McpManage({
             }
             onClick={saveServer}
           >
-            {editingServerId ? "Save and verify" : "Create and verify"}
+            {editingServerId
+              ? translate("saveAndVerify")
+              : translate("createAndVerify")}
           </Button>
         </div>
       </section>
@@ -7838,7 +7969,9 @@ function McpManage({
                     icon={String(server.name).slice(0, 1).toUpperCase()}
                     title={String(server.name)}
                     badge={{
-                      label: String(server.status || "configured"),
+                      label: translateBackendValue(
+                        server.status || "configured",
+                      ),
                       tone:
                         String(server.status || "").toLowerCase() === "error"
                           ? "neutral"
@@ -7846,7 +7979,7 @@ function McpManage({
                     }}
                     description={
                       <>
-                        {`${String(server.transport || "remote")} · ${String(server.url || "configured")}`}
+                        {`${server.transport === "stdio" ? translate("stdio") : String(server.transport || "remote")} · ${server.url ? String(server.url) : translateBackendValue("configured")}`}
                         {server.last_error
                           ? ` · ${String(server.last_error)}`
                           : ""}
@@ -7857,10 +7990,10 @@ function McpManage({
                         {isUserMcpServer(server) && (
                           <>
                             <Button onClick={() => editServer(server)}>
-                              Edit
+                              {translate("edit")}
                             </Button>
                             <Button onClick={() => removeServer(server)}>
-                              Delete
+                              {translate("delete")}
                             </Button>
                           </>
                         )}
@@ -7875,11 +8008,11 @@ function McpManage({
                               }).catch(onError)
                             }
                           >
-                            Authorize
+                            {translate("authorize")}
                           </Button>
                         )}
                         <Button onClick={() => loadServerCatalog(server)}>
-                          Resources / prompts
+                          {translate("resourcesPrompts")}
                         </Button>
                         <Button
                           onClick={() =>
@@ -7895,7 +8028,7 @@ function McpManage({
                               .catch(onError)
                           }
                         >
-                          Retry
+                          {translate("retry")}
                         </Button>
                       </div>
                     }
@@ -7907,7 +8040,10 @@ function McpManage({
                   icon={String(tool.name).slice(0, 1).toUpperCase()}
                   title={String(tool.name)}
                   badge={{
-                    label: tool.enabled === true ? "Enabled" : "Disabled",
+                    label:
+                      tool.enabled === true
+                        ? translate("enabled")
+                        : translate("disabled"),
                     tone: tool.enabled === true ? "success" : "neutral",
                   }}
                   description={`${String(tool.transport || "remote")} · ${String(tool.command || tool.url || "host-provided")}`}
@@ -7931,7 +8067,9 @@ function McpManage({
                           .catch(onError)
                       }
                     >
-                      {tool.enabled === true ? "Disable" : "Enable"}
+                      {tool.enabled === true
+                        ? translate("disable")
+                        : translate("enable")}
                     </Button>
                   }
                   key={String(tool.name)}
@@ -7942,16 +8080,16 @@ function McpManage({
         }
         empty={
           selected
-            ? "No MCP tools available."
-            : "Select a session to inspect its host MCP tools."
+            ? translate("noMcpToolsAvailable")
+            : translate("selectSessionMcpTools")
         }
       />
       {selectedServer && (
         <section className="panel mt-4">
           <h2>
-            {String(selectedServer.name)} resources ({resources.length}) ·
-            prompts ({prompts.length}) · tools (
-            {Number(selectedServer.tool_count || 0)})
+            {String(selectedServer.name)} {translate("resources")} (
+            {resources.length}) · {translate("prompts")} ({prompts.length}) ·{" "}
+            {translate("tools")} ({Number(selectedServer.tool_count || 0)})
           </h2>
           <div className="grid gap-2">
             {resources.map((resource) => (
@@ -7960,7 +8098,7 @@ function McpManage({
                 <small>{mcpResourceSummary(resource)}</small>
                 <div className="inline-actions">
                   <Button onClick={() => previewResource(resource)}>
-                    Preview
+                    {translate("preview")}
                   </Button>
                   <Button
                     disabled={!selected}
@@ -7982,7 +8120,7 @@ function McpManage({
                         .catch(onError)
                     }
                   >
-                    Add to current context
+                    {translate("addCurrentContext")}
                   </Button>
                 </div>
               </div>
@@ -7990,7 +8128,9 @@ function McpManage({
             {prompts.map((prompt) => (
               <div className="integration-card" key={String(prompt.name)}>
                 <strong>{String(prompt.title || prompt.name)}</strong>
-                <small>{String(prompt.description || "MCP prompt")}</small>
+                <small>
+                  {String(prompt.description || translate("mcpPrompt"))}
+                </small>
                 {Array.isArray(prompt.arguments) &&
                   prompt.arguments.map((argument) => {
                     const argumentName = String(
@@ -8034,7 +8174,7 @@ function McpManage({
                       .catch(onError)
                   }
                 >
-                  Load into composer
+                  {translate("loadComposer")}
                 </Button>
               </div>
             ))}
@@ -8043,7 +8183,11 @@ function McpManage({
                 {JSON.stringify(resourcePreview, null, 2)}
               </pre>
             )}
-            <h4>Current context resources ({contextResources.length})</h4>
+            <h4>
+              {translate("currentContextResources", {
+                count: contextResources.length,
+              })}
+            </h4>
             {contextResources.map((resource) => (
               <div
                 className="inline-actions"
@@ -8069,7 +8213,7 @@ function McpManage({
                       .catch(onError)
                   }
                 >
-                  Remove
+                  {translate("remove")}
                 </Button>
               </div>
             ))}
@@ -8111,7 +8255,7 @@ function Automations({
       <div className="flex min-h-full">
         <nav className="page-subnav w-[208px] shrink-0 border-r border-line bg-panel/40 px-3 py-4">
           <div className="px-2 text-[13.5px] font-semibold mb-3 flex items-center gap-2">
-            <Icon name="clock" size={16} /> Automations
+            <Icon name="clock" size={16} /> {translate("automations")}
           </div>
           {(["schedules", "runs"] as const).map((item) => (
             <button
@@ -8127,18 +8271,24 @@ function Automations({
                 name={item === "schedules" ? "refresh" : "code"}
                 size={15}
               />
-              {item === "schedules" ? "Schedules" : "Runs"}
+              {item === "schedules"
+                ? translate("schedules")
+                : translate("runs")}
             </button>
           ))}
         </nav>
         <div className="flex-1 min-w-0 overflow-y-auto">
           <div className="w-full px-7 py-6">
             <PageHeader
-              title={automationTab === "schedules" ? "Schedules" : "Runs"}
+              title={
+                automationTab === "schedules"
+                  ? translate("schedules")
+                  : translate("runs")
+              }
               subtitle={
                 automationTab === "schedules"
-                  ? "Create and manage recurring OPCOS playbook runs."
-                  : "Review the latest results reported by scheduled runs."
+                  ? translate("automationDescription")
+                  : translate("runsDescription")
               }
             />
             {automationTab === "schedules" ? (
@@ -8152,7 +8302,7 @@ function Automations({
                       className="primary"
                       onClick={() => setScheduleFormOpen(true)}
                     >
-                      New schedule
+                      {translate("newSchedule")}
                     </Button>
                   }
                   rows={
@@ -8163,8 +8313,9 @@ function Automations({
                             <span>
                               <strong>{schedule.name}</strong>
                               <small>
-                                {schedule.trigger || "cron"} · {schedule.cron} ·{" "}
-                                {schedule.last_result || "never run"}
+                                {schedule.trigger || translate("cron")} ·{" "}
+                                {schedule.cron} ·{" "}
+                                {schedule.last_result || translate("neverRun")}
                               </small>
                             </span>
                             <Button
@@ -8176,7 +8327,7 @@ function Automations({
                                   .catch(onError)
                               }
                             >
-                              Run now
+                              {translate("runNow")}
                             </Button>
                           </div>
                         ))}
@@ -8188,14 +8339,14 @@ function Automations({
                     scheduleFormOpen ? (
                       <div className="manage-card form-grid">
                         <label>
-                          Name
+                          {translate("name")}
                           <input
                             value={name}
                             onChange={(event) => setName(event.target.value)}
                           />
                         </label>
                         <label>
-                          Session
+                          {translate("sessionLabel")}
                           <SelectMenu
                             value={sessionId}
                             onChange={setSessionId}
@@ -8206,7 +8357,7 @@ function Automations({
                           />
                         </label>
                         <label>
-                          Playbook
+                          {translate("playbook")}
                           <SelectMenu
                             value={playbookId}
                             onChange={setPlaybookId}
@@ -8219,23 +8370,23 @@ function Automations({
                           />
                         </label>
                         <label>
-                          Trigger
+                          {translate("triggerLabel")}
                           <SelectMenu
                             value={trigger}
                             onChange={(value) =>
                               setTrigger(value as "cron" | "filesystem")
                             }
                             options={[
-                              { value: "cron", label: "Cron" },
+                              { value: "cron", label: translate("cron") },
                               {
                                 value: "filesystem",
-                                label: "File changes (local only)",
+                                label: translate("fileChangesLocal"),
                               },
                             ]}
                           />
                         </label>
                         <label>
-                          Cron
+                          {translate("cron")}
                           <input
                             value={cron}
                             onChange={(event) => setCron(event.target.value)}
@@ -8270,7 +8421,7 @@ function Automations({
                               .catch(onError)
                           }
                         >
-                          Save automation
+                          {translate("saveAutomation")}
                         </Button>
                       </div>
                     ) : undefined
@@ -8290,7 +8441,8 @@ function Automations({
                           <span>
                             <strong>{schedule.name}</strong>
                             <small>
-                              {schedule.last_result || "No run recorded yet"}
+                              {schedule.last_result ||
+                                translate("noRunRecorded")}
                             </small>
                           </span>
                         </div>
@@ -8390,7 +8542,7 @@ function Activity({
       <div className="flex flex-1 min-w-0 min-h-0">
         <nav className="page-subnav w-[208px] shrink-0 border-r border-line bg-panel/40 px-3 py-4">
           <div className="px-2 text-[13.5px] font-semibold mb-3 flex items-center gap-2">
-            <Icon name="audit" size={16} /> Activity
+            <Icon name="audit" size={16} /> {translate("activity")}
           </div>
           {(
             [
@@ -8523,7 +8675,23 @@ function Activity({
                 }
                 size={15}
               />
-              {item[0].toUpperCase() + item.slice(1)}
+              {translate(
+                (
+                  {
+                    audit: "activityAudit",
+                    actions: "activityActions",
+                    queue: "activityQueue",
+                    events: "activityEvents",
+                    goals: "activityGoals",
+                    board: "activityBoard",
+                    roles: "activityRoles",
+                    tasks: "activityTasks",
+                    messages: "activityMessages",
+                    worklog: "activityWorklog",
+                    insights: "activityInsights",
+                  } as const
+                )[item],
+              )}
             </button>
           ))}
         </nav>
@@ -8531,29 +8699,39 @@ function Activity({
           <div className="activity-body w-full px-7 py-6">
             <header className="mb-5">
               <h1 className="text-[22px] font-semibold text-ink">
-                {activityTab[0].toUpperCase() + activityTab.slice(1)}
+                {translate(
+                  (
+                    {
+                      audit: "activityAudit",
+                      actions: "activityActions",
+                      queue: "activityQueue",
+                      events: "activityEvents",
+                      goals: "activityGoals",
+                      board: "activityBoard",
+                      roles: "activityRoles",
+                      tasks: "activityTasks",
+                      messages: "activityMessages",
+                      worklog: "activityWorklog",
+                      insights: "activityInsights",
+                    } as const
+                  )[activityTab],
+                )}
               </h1>
               <p className="text-[13px] text-muted mt-1">
                 {
                   (
                     {
-                      audit:
-                        "Review durable security and configuration events.",
-                      actions:
-                        "Review cross-session records of OPCOS external actions.",
-                      queue:
-                        "Review durable work items, retries, and dead-letter records.",
-                      events:
-                        "Review durable events, causal chains, and bounded effect rules.",
-                      goals:
-                        "Define bounded autonomous goals and review planning rounds.",
-                      board: "Start or observe the active coordination board.",
-                      roles: "Review board roles and their current state.",
-                      tasks:
-                        "Create, claim, complete, and verify coordination tasks.",
-                      messages: "Send and review coordination messages.",
-                      worklog: "Inspect the remote session worklog timeline.",
-                      insights: "Review cross-session activity insights.",
+                      audit: translate("reviewSecurityEvents"),
+                      actions: translate("reviewExternalActions"),
+                      queue: translate("reviewWorkQueue"),
+                      events: translate("reviewEventRules"),
+                      goals: translate("reviewGoals"),
+                      board: translate("reviewBoard"),
+                      roles: translate("reviewRoles"),
+                      tasks: translate("reviewTasks"),
+                      messages: translate("reviewMessages"),
+                      worklog: translate("reviewWorklog"),
+                      insights: translate("reviewInsights"),
                     } as const
                   )[activityTab]
                 }
@@ -8583,7 +8761,7 @@ function Activity({
               <CollectionPage
                 search=""
                 onSearch={() => undefined}
-                searchPlaceholder="Filter audit events"
+                searchPlaceholder={translate("filterAudit")}
                 rows={
                   auditEvents.length ? (
                     <>
@@ -8601,14 +8779,14 @@ function Activity({
                     </>
                   ) : null
                 }
-                empty="No audit events recorded yet."
+                empty={translate("noAuditEvents")}
               />
             )}
             {activityTab === "actions" && (
               <CollectionPage
                 search=""
                 onSearch={() => undefined}
-                searchPlaceholder="Filter action history"
+                searchPlaceholder={translate("filterActionHistory")}
                 rows={
                   actionLedger.length ? (
                     <>
@@ -8623,7 +8801,7 @@ function Activity({
                               {String(action.platform)}
                             </strong>
                             <small>
-                              {String(action.status)} ·{" "}
+                              {translateBackendValue(action.status)} ·{" "}
                               {String(action.account_id)} ·{" "}
                               {String(action.idempotency_key)}
                             </small>
@@ -8633,14 +8811,14 @@ function Activity({
                     </>
                   ) : null
                 }
-                empty="No action ledger records yet."
+                empty={translate("noActionLedger")}
               />
             )}
             {activityTab === "queue" && (
               <CollectionPage
                 search=""
                 onSearch={() => undefined}
-                searchPlaceholder="Filter durable work queue"
+                searchPlaceholder={translate("filterWorkQueue")}
                 rows={
                   workQueue.length ? (
                     <>
@@ -8651,10 +8829,11 @@ function Activity({
                         >
                           <span>
                             <strong>
-                              {String(item.task_type)} · {String(item.status)}
+                              {translateBackendValue(item.task_type)} ·{" "}
+                              {translateBackendValue(item.status)}
                             </strong>
                             <small>
-                              attempts {String(item.attempts)}/
+                              {translate("attempts")} {String(item.attempts)}/
                               {String(item.max_attempts)} ·{" "}
                               {String(item.queue_id)}
                               {item.status === "pending_approval" && (
@@ -8674,7 +8853,7 @@ function Activity({
                                       .catch(onError)
                                   }
                                 >
-                                  approve
+                                  {translate("approve")}
                                 </button>
                               )}
                             </small>
@@ -8684,7 +8863,7 @@ function Activity({
                     </>
                   ) : null
                 }
-                empty="No durable work queue records yet."
+                empty={translate("noWorkQueue")}
               />
             )}
             {activityTab === "events" && (
@@ -8692,7 +8871,7 @@ function Activity({
                 <CollectionPage
                   search=""
                   onSearch={() => undefined}
-                  searchPlaceholder="Filter event stream"
+                  searchPlaceholder={translate("filterEventStream")}
                   rows={
                     events.length ? (
                       <>
@@ -8703,11 +8882,11 @@ function Activity({
                           >
                             <span>
                               <strong>
-                                {String(event.kind)} · seq{" "}
+                                {String(event.kind)} · {translate("sequence")}{" "}
                                 {String(event.sequence)}
                               </strong>
                               <small>
-                                {String(event.source)} · caused by{" "}
+                                {String(event.source)} · {translate("causedBy")}{" "}
                                 {String(event.caused_by ?? "none")} ·{" "}
                                 {JSON.stringify(event.payload)}
                               </small>
@@ -8717,12 +8896,12 @@ function Activity({
                       </>
                     ) : null
                   }
-                  empty="No durable events yet."
+                  empty={translate("noEvents")}
                 />
                 <CollectionPage
                   search=""
                   onSearch={() => undefined}
-                  searchPlaceholder="Filter event rules"
+                  searchPlaceholder={translate("filterEventRules")}
                   rows={
                     eventRules.length ? (
                       <>
@@ -8737,8 +8916,10 @@ function Activity({
                                 {String(rule.effect_kind)}
                               </strong>
                               <small>
-                                {rule.enabled ? "enabled" : "disabled"} ·{" "}
-                                {String(rule.trigger_count)}/
+                                {rule.enabled
+                                  ? translate("enabled")
+                                  : translate("disabled")}{" "}
+                                · {String(rule.trigger_count)}/
                                 {String(rule.max_triggers)} per{" "}
                                 {String(rule.window_seconds)}s
                                 <button
@@ -8758,7 +8939,9 @@ function Activity({
                                       .catch(onError)
                                   }
                                 >
-                                  {rule.enabled ? "disable" : "enable"}
+                                  {rule.enabled
+                                    ? translate("disable")
+                                    : translate("enable")}
                                 </button>
                               </small>
                             </span>
@@ -8767,20 +8950,23 @@ function Activity({
                       </>
                     ) : null
                   }
-                  empty="No event rules configured."
+                  empty={translate("noEventRules")}
                 />
               </div>
             )}
             {activityTab === "goals" && (
               <div className="space-y-5">
                 <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
-                  <h2 className="text-[15px] font-semibold">Current plan</h2>
+                  <h2 className="text-[15px] font-semibold">
+                    {translate("currentPlan")}
+                  </h2>
                   {currentPlan ? (
                     <>
                       <div className="text-[13px]">
                         <strong>{String(currentPlan.title)}</strong>{" "}
                         <span className="text-muted">
-                          revision {String(currentPlan.revision)}
+                          {translate("revisionLabel")}{" "}
+                          {String(currentPlan.revision)}
                         </span>
                       </div>
                       <p className="text-[12px] text-muted">
@@ -8802,7 +8988,7 @@ function Activity({
                                 {String(item.description)}
                               </span>
                               <span className="text-muted">
-                                {String(item.status)}
+                                {translateBackendValue(item.status)}
                               </span>
                             </div>
                           );
@@ -8811,24 +8997,24 @@ function Activity({
                     </>
                   ) : (
                     <p className="text-[12px] text-muted">
-                      No tracked plan for the selected session.
+                      {translate("noTrackedPlan")}
                     </p>
                   )}
                 </div>
                 <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
                   <h2 className="text-[15px] font-semibold">
-                    Account host bindings
+                    {translate("accountHostBindings")}
                   </h2>
                   <div className="grid grid-cols-2 gap-3">
                     <input
                       value={accountId}
                       onChange={(event) => setAccountId(event.target.value)}
-                      placeholder="Account ID"
+                      placeholder={translate("accountId")}
                     />
                     <input
                       value={accountHostId}
                       onChange={(event) => setAccountHostId(event.target.value)}
-                      placeholder="Remote host ID"
+                      placeholder={translate("remoteHostId")}
                     />
                   </div>
                   <Button
@@ -8849,12 +9035,12 @@ function Activity({
                     }
                     disabled={!accountId.trim() || !accountHostId.trim()}
                   >
-                    Bind account to host
+                    {translate("bindAccountHost")}
                   </Button>
                   <CollectionPage
                     search=""
                     onSearch={() => undefined}
-                    searchPlaceholder="Filter bindings"
+                    searchPlaceholder={translate("filterBindings")}
                     rows={
                       accountBindings.length ? (
                         <>
@@ -8865,32 +9051,37 @@ function Activity({
                             >
                               <span>
                                 <strong>{String(binding.account_id)}</strong>
-                                <small>host · {String(binding.host_id)}</small>
+                                <small>
+                                  {translate("host")} ·{" "}
+                                  {String(binding.host_id)}
+                                </small>
                               </span>
                             </div>
                           ))}
                         </>
                       ) : null
                     }
-                    empty="No account host bindings."
+                    empty={translate("noBindings")}
                   />
                 </div>
                 <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
-                  <h2 className="text-[15px] font-semibold">Login state</h2>
+                  <h2 className="text-[15px] font-semibold">
+                    {translate("loginState")}
+                  </h2>
                   <div className="grid grid-cols-2 gap-3">
                     <input
                       value={loginProfilePath}
                       onChange={(event) =>
                         setLoginProfilePath(event.target.value)
                       }
-                      placeholder="Remote browser profile path"
+                      placeholder={translate("remoteBrowserProfilePath")}
                     />
                     <input
                       value={loginBackupDir}
                       onChange={(event) =>
                         setLoginBackupDir(event.target.value)
                       }
-                      placeholder="Remote backup directory"
+                      placeholder={translate("remoteBackupDirectory")}
                     />
                   </div>
                   <div className="flex gap-2">
@@ -8915,7 +9106,7 @@ function Activity({
                         !loginBackupDir.trim()
                       }
                     >
-                      Save profile
+                      {translate("saveProfile")}
                     </Button>
                     <Button
                       onClick={() =>
@@ -8935,12 +9126,12 @@ function Activity({
                       }
                       disabled={!accountId.trim() || !loginProfile}
                     >
-                      Backup
+                      {translate("backup")}
                     </Button>
                   </div>
                   {loginProfile ? (
                     <small className="text-muted">
-                      validation ·{" "}
+                      {translate("validation")} ·{" "}
                       {String(
                         loginProfile.latest_validation_status ?? "not checked",
                       )}{" "}
@@ -8953,21 +9144,21 @@ function Activity({
                       onChange={(event) =>
                         setLoginValidationUrl(event.target.value)
                       }
-                      placeholder="Validation URL"
+                      placeholder={translate("validationUrl")}
                     />
                     <input
                       value={loginExpectedSignal}
                       onChange={(event) =>
                         setLoginExpectedSignal(event.target.value)
                       }
-                      placeholder="Expected signal"
+                      placeholder={translate("expectedSignal")}
                     />
                     <input
                       value={loginObservedSignal}
                       onChange={(event) =>
                         setLoginObservedSignal(event.target.value)
                       }
-                      placeholder="Observed signal (optional)"
+                      placeholder={translate("observedSignalOptional")}
                     />
                   </div>
                   <Button
@@ -9000,12 +9191,12 @@ function Activity({
                       !loginExpectedSignal.trim()
                     }
                   >
-                    Check login
+                    {translate("checkLogin")}
                   </Button>
                   <CollectionPage
                     search=""
                     onSearch={() => undefined}
-                    searchPlaceholder="Filter login backups"
+                    searchPlaceholder={translate("filterLoginBackups")}
                     rows={
                       loginBackups.length ? (
                         <>
@@ -9017,8 +9208,8 @@ function Activity({
                               <span>
                                 <strong>{String(backup.created_at)}</strong>
                                 <small>
-                                  {String(backup.size)} bytes · hash{" "}
-                                  {String(backup.hash)}
+                                  {String(backup.size)} {translate("bytes")} ·{" "}
+                                  {translate("hash")} {String(backup.hash)}
                                 </small>
                               </span>
                               <Button
@@ -9032,18 +9223,20 @@ function Activity({
                                   }).catch(onError)
                                 }
                               >
-                                Restore
+                                {translate("restore")}
                               </Button>
                             </div>
                           ))}
                         </>
                       ) : null
                     }
-                    empty="No login-state backups."
+                    empty={translate("noLoginBackups")}
                   />
                 </div>
                 <div className="rounded-xl2 border border-line bg-panel p-5 space-y-3">
-                  <h2 className="text-[15px] font-semibold">New goal</h2>
+                  <h2 className="text-[15px] font-semibold">
+                    {translate("newGoal")}
+                  </h2>
                   <input
                     className="w-full"
                     value={goalDescription}
@@ -9051,8 +9244,7 @@ function Activity({
                     placeholder="Describe the outcome this company is pursuing"
                   />
                   <p className="text-[12px] text-muted">
-                    New goals default to propose mode, one planning round per
-                    hour, and a bounded queue.
+                    {translate("goalsDescription")}
                   </p>
                   <Button
                     className="primary"
@@ -9077,13 +9269,13 @@ function Activity({
                     }
                     disabled={!goalDescription.trim() || !selected}
                   >
-                    Create goal
+                    {translate("createGoal")}
                   </Button>
                 </div>
                 <CollectionPage
                   search=""
                   onSearch={() => undefined}
-                  searchPlaceholder="Filter goals"
+                  searchPlaceholder={translate("filterGoals")}
                   rows={
                     goals.length ? (
                       <>
@@ -9095,10 +9287,11 @@ function Activity({
                             <span>
                               <strong>
                                 {String(goal.description)} ·{" "}
-                                {String(goal.status)}
+                                {translateBackendValue(goal.status)}
                               </strong>
                               <small>
-                                {String(goal.autonomy_level)} · failures{" "}
+                                {String(goal.autonomy_level)} ·{" "}
+                                {translate("failuresLabel")}{" "}
                                 {String(goal.consecutive_failures)}/
                                 {String(goal.failure_limit)}
                                 <button
@@ -9117,7 +9310,7 @@ function Activity({
                                       .catch(onError)
                                   }
                                 >
-                                  plan now
+                                  {translate("planNow")}
                                 </button>
                               </small>
                             </span>
@@ -9126,12 +9319,12 @@ function Activity({
                       </>
                     ) : null
                   }
-                  empty="No autonomous goals yet."
+                  empty={translate("noGoals")}
                 />
                 <CollectionPage
                   search=""
                   onSearch={() => undefined}
-                  searchPlaceholder="Filter planning rounds"
+                  searchPlaceholder={translate("filterPlanningRounds")}
                   rows={
                     planningHistory.length ? (
                       <>
@@ -9142,12 +9335,15 @@ function Activity({
                           >
                             <span>
                               <strong>
-                                {String(round.status)} · goal{" "}
-                                {String(round.goal_id)}
+                                {translateBackendValue(round.status)} ·{" "}
+                                {translate("goalLabel")} {String(round.goal_id)}
                               </strong>
                               <small>
-                                produced {String(round.produced_count)} ·{" "}
-                                {String(round.reason ?? "completed")}
+                                {translate("produced")}{" "}
+                                {String(round.produced_count)} ·{" "}
+                                {translateBackendValue(
+                                  round.reason ?? "completed",
+                                )}
                               </small>
                             </span>
                           </div>
@@ -9155,7 +9351,7 @@ function Activity({
                       </>
                     ) : null
                   }
-                  empty="No planning rounds yet."
+                  empty={translate("noPlanningRounds")}
                 />
               </div>
             )}
@@ -9163,10 +9359,22 @@ function Activity({
               <div className="rounded-xl2 border border-line bg-panel p-5">
                 {!selected ? (
                   <p className="empty-state">
-                    Select a session to load insights.
+                    {translate("selectSessionInsights")}
                   </p>
                 ) : (
-                  <pre>{JSON.stringify(insights, null, 2)}</pre>
+                  <dl className="space-y-3 text-left">
+                    {insights &&
+                      Object.entries(insights)
+                        .filter(([key]) => key !== "session_id")
+                        .map(([key, value]) => (
+                          <div key={key}>
+                            <dt className="text-muted">
+                              {insightFieldLabel(key)}
+                            </dt>
+                            <dd>{formatInsightValue(key, value)}</dd>
+                          </div>
+                        ))}
+                  </dl>
                 )}
               </div>
             )}
@@ -9176,20 +9384,20 @@ function Activity({
                   <div className="rounded-xl2 border border-line bg-panel p-5 space-y-4">
                     <div>
                       <label className="field-label">
-                        Coordination task ID
+                        {translate("coordinationTaskId")}
                       </label>
                       <input
                         value={taskId}
                         onChange={(event) => setTaskId(event.target.value)}
-                        placeholder={translate("e.g. task-123")}
+                        placeholder={translate("taskIdExample")}
                       />
                       <p className="field-help">
-                        The durable coordination board to observe or update.
+                        {translate("coordinationDescription")}
                       </p>
                     </div>
                     <div>
                       <label className="field-label">
-                        {translate("Initial roles")}
+                        {translate("initialRoles")}
                       </label>
                       <textarea
                         value={rolesText}
@@ -9197,8 +9405,7 @@ function Activity({
                         placeholder='[{"id":"leader","sort_order":0,"session_id":"","state":"Active"}]'
                       />
                       <p className="field-help">
-                        Use the JSON shape shown above when starting a new
-                        board.
+                        {translate("boardJsonDescription")}
                       </p>
                     </div>
                     <Button
@@ -9215,17 +9422,17 @@ function Activity({
                             })
                             .catch(onError);
                         } catch {
-                          onError("Roles must be valid JSON.");
+                          onError(translate("rolesValidJson"));
                         }
                       }}
                     >
-                      Start board
+                      {translate("startBoard")}
                     </Button>
                     <Button className="bordered" onClick={load}>
-                      Observe
+                      {translate("observe")}
                     </Button>
                     <label className="field-label">
-                      Role ID
+                      {translate("roleId")}
                       <input
                         value={roleId}
                         onChange={(event) => setRoleId(event.target.value)}
@@ -9237,7 +9444,7 @@ function Activity({
                       onChange={setRoleState}
                       options={["active", "sleep", "paused"].map((value) => ({
                         value,
-                        label: value,
+                        label: translateBackendValue(value),
                       }))}
                     />
                     <Button
@@ -9253,7 +9460,7 @@ function Activity({
                           .catch(onError)
                       }
                     >
-                      Set role
+                      {translate("setRole")}
                     </Button>
                   </div>
                 )}
@@ -9274,7 +9481,8 @@ function Activity({
                                 <span>
                                   <strong>{String(role.id)}</strong>
                                   <small>
-                                    {String(role.state)} · Session{" "}
+                                    {translateBackendValue(role.state)} ·{" "}
+                                    {translate("sessionLabel")}{" "}
                                     {String(role.session_id)}
                                   </small>
                                 </span>
@@ -9296,7 +9504,7 @@ function Activity({
                           className="primary"
                           onClick={() => setTaskFormOpen(true)}
                         >
-                          New task
+                          {translate("newTaskAction")}
                         </Button>
                       }
                       rows={
@@ -9311,7 +9519,9 @@ function Activity({
                                   <strong>
                                     {String(task.title || task.id)}
                                   </strong>
-                                  <small>{String(task.phase)}</small>
+                                  <small>
+                                    {translateBackendValue(task.phase)}
+                                  </small>
                                 </span>
                                 <span className="inline-actions">
                                   <Button
@@ -9325,7 +9535,7 @@ function Activity({
                                         .catch(onError)
                                     }
                                   >
-                                    Claim
+                                    {translate("claim")}
                                   </Button>
                                   <Button
                                     className="bordered"
@@ -9339,7 +9549,7 @@ function Activity({
                                         .catch(onError)
                                     }
                                   >
-                                    Complete
+                                    {translate("complete")}
                                   </Button>
                                 </span>
                               </div>
@@ -9357,21 +9567,21 @@ function Activity({
                                 onChange={(event) =>
                                   setTaskTitle(event.target.value)
                                 }
-                                placeholder={translate("New task")}
+                                placeholder={translate("newTask")}
                               />
                               <input
                                 value={worker}
                                 onChange={(event) =>
                                   setWorker(event.target.value)
                                 }
-                                placeholder={translate("Worker / assignee")}
+                                placeholder={translate("workerAssignee")}
                               />
                               <input
                                 value={prUrl}
                                 onChange={(event) =>
                                   setPrUrl(event.target.value)
                                 }
-                                placeholder={translate("Verified PR URL")}
+                                placeholder={translate("verifiedPrUrl")}
                               />
                               <Button
                                 className="primary"
@@ -9386,7 +9596,7 @@ function Activity({
                                     .catch(onError)
                                 }
                               >
-                                Create
+                                {translate("create")}
                               </Button>
                             </div>
                           </div>
@@ -9404,7 +9614,7 @@ function Activity({
                           className="primary"
                           onClick={() => setMessageFormOpen(true)}
                         >
-                          New message
+                          {translate("newMessage")}
                         </Button>
                       }
                       rows={
@@ -9420,7 +9630,8 @@ function Activity({
                                     {String(item.from)} → {String(item.to)}
                                   </strong>
                                   <small>
-                                    Kind: {String(item.kind)} · Message:{" "}
+                                    {translate("kindLabel")} {String(item.kind)}{" "}
+                                    · {translate("messageLabel")}{" "}
                                     {String(item.msg_id)}
                                   </small>
                                 </span>
@@ -9429,12 +9640,12 @@ function Activity({
                           </>
                         ) : null
                       }
-                      empty="No coordination messages yet."
+                      empty={translate("noCoordinationMessages")}
                       form={
                         messageFormOpen ? (
                           <div className="rounded-xl2 border border-line bg-panel p-5">
                             <label className="field-label">
-                              Message envelope
+                              {translate("messageEnvelope")}
                             </label>
                             <textarea
                               value={message}
@@ -9459,11 +9670,11 @@ function Activity({
                                     })
                                     .catch(onError);
                                 } catch {
-                                  onError("Message must be valid JSON.");
+                                  onError(translate("validJson"));
                                 }
                               }}
                             >
-                              Send message
+                              {translate("sendMessage")}
                             </Button>
                           </div>
                         ) : undefined
@@ -9472,12 +9683,12 @@ function Activity({
                   )}
                   <section className="hidden">
                     <div className="inline-actions mb-3">
-                      <input placeholder={translate("Search tasks")} />
+                      <input placeholder={translate("searchTasksInput")} />
                       <Button
                         className="primary"
                         onClick={() => setTaskFormOpen(true)}
                       >
-                        New task
+                        {translate("newTaskAction")}
                       </Button>
                     </div>
                     {taskFormOpen && (
@@ -9485,17 +9696,17 @@ function Activity({
                         <input
                           value={taskTitle}
                           onChange={(event) => setTaskTitle(event.target.value)}
-                          placeholder={translate("New task")}
+                          placeholder={translate("newTask")}
                         />
                         <input
                           value={worker}
                           onChange={(event) => setWorker(event.target.value)}
-                          placeholder={translate("Worker / assignee")}
+                          placeholder={translate("workerAssignee")}
                         />
                         <input
                           value={prUrl}
                           onChange={(event) => setPrUrl(event.target.value)}
-                          placeholder={translate("Verified PR URL")}
+                          placeholder={translate("verifiedPrUrl")}
                         />
                         <Button
                           className="primary"
@@ -9510,7 +9721,7 @@ function Activity({
                               .catch(onError)
                           }
                         >
-                          Create
+                          {translate("create")}
                         </Button>
                       </div>
                     )}
@@ -9521,7 +9732,7 @@ function Activity({
                           key={String(task.id || task.title)}
                         >
                           <strong>{String(task.title || task.id)}</strong>
-                          <span>{String(task.phase)}</span>
+                          <span>{translateBackendValue(task.phase)}</span>
                           <div className="inline-actions">
                             <Button
                               className="bordered"
@@ -9534,7 +9745,7 @@ function Activity({
                                   .catch(onError)
                               }
                             >
-                              Claim
+                              {translate("claim")}
                             </Button>
                             <Button
                               className="bordered"
@@ -9548,15 +9759,13 @@ function Activity({
                                   .catch(onError)
                               }
                             >
-                              Complete
+                              {translate("complete")}
                             </Button>
                             <Button
                               className="bordered"
                               onClick={() => {
                                 if (!task.verified_pr_url && !task.pr) {
-                                  onError(
-                                    "Cannot accept task without a verified PR URL.",
-                                  );
+                                  onError(translate("verifiedPrRequired"));
                                   return;
                                 }
                                 void command("coordination_accept_task", {
@@ -9566,31 +9775,29 @@ function Activity({
                                   .catch(onError);
                               }}
                             >
-                              Accept
+                              {translate("accept")}
                             </Button>
                           </div>
                         </div>
                       ))
                     ) : (
-                      <p className="empty-state">
-                        {translate("No coordination tasks yet.")}
-                      </p>
+                      <p className="empty-state">{translate("noTasks")}</p>
                     )}
                   </section>
                   <section className="hidden">
                     <div className="inline-actions mb-3">
-                      <input placeholder={translate("Search messages")} />
+                      <input placeholder={translate("searchMessages")} />
                       <Button
                         className="primary"
                         onClick={() => setMessageFormOpen(true)}
                       >
-                        New message
+                        {translate("newMessage")}
                       </Button>
                     </div>
                     {messageFormOpen && (
                       <>
                         <label className="field-label">
-                          {translate("Message envelope")}
+                          {translate("messageEnvelope")}
                         </label>
                         <textarea
                           value={message}
@@ -9598,8 +9805,7 @@ function Activity({
                           placeholder='{"kind":"status","payload":{}}'
                         />
                         <p className="field-help">
-                          Messages use the coordination envelope accepted by the
-                          remote host.
+                          {translate("coordinationEnvelopeDescription")}
                         </p>
                         <Button
                           className="bordered"
@@ -9617,11 +9823,11 @@ function Activity({
                                 })
                                 .catch(onError);
                             } catch {
-                              onError("Message must be valid JSON.");
+                              onError(translate("validJson"));
                             }
                           }}
                         >
-                          Send message
+                          {translate("sendMessage")}
                         </Button>
                       </>
                     )}
@@ -9631,15 +9837,22 @@ function Activity({
                           <strong>
                             {String(item.from)} → {String(item.to)}
                           </strong>
-                          <span>Kind: {String(item.kind)}</span>
-                          <span>Message: {String(item.msg_id)}</span>
-                          <span>Reply: {String(item.reply_to || "—")}</span>
+                          <span>
+                            {translate("kindLabel")} {String(item.kind)}
+                          </span>
+                          <span>
+                            {translate("messageLabel")} {String(item.msg_id)}
+                          </span>
+                          <span>
+                            {translate("replyLabel")}{" "}
+                            {String(item.reply_to || "—")}
+                          </span>
                           <pre>{JSON.stringify(item.payload, null, 2)}</pre>
                         </div>
                       ))
                     ) : (
                       <p className="empty-state">
-                        No coordination messages yet.
+                        {translate("noCoordinationMessages")}
                       </p>
                     )}
                   </section>
@@ -9752,8 +9965,8 @@ function StandalonePane({ route }: { route: PaneRoute }) {
         <strong className="drawer-title">{route.tab}</strong>
         <button
           className="drawer-action"
-          title="关闭窗口"
-          aria-label="关闭窗口"
+          title={translate("closeWindow")}
+          aria-label={translate("closeWindow")}
           onClick={close}
         >
           <Icon name="x" />
@@ -9761,25 +9974,27 @@ function StandalonePane({ route }: { route: PaneRoute }) {
       </header>
       <div className="tab-body">
         {error && <div className="error-banner">{error}</div>}
-        {!error && !selected && <div className="muted">Loading…</div>}
+        {!error && !selected && (
+          <div className="muted">{translate("loading")}</div>
+        )}
         {selected && route.tab === "info" && (
           <div className="info">
-            <Field k={translate("Session ID")} v={selected.id} />
-            <Field k={translate("Status")} v="Ready" />
-            <Field k={translate("Host")} v={selected.host_name} />
+            <Field k={translate("sessionId")} v={selected.id} />
+            <Field k={translate("status")} v={translate("ready")} />
+            <Field k={translate("host")} v={selected.host_name} />
             <Field
-              k={translate("Workspace")}
-              v={selected.workspace || translate("Not set")}
+              k={translate("workspace")}
+              v={selected.workspace || translate("notSet")}
             />
-            <Field k={translate("Model")} v={selected.model} />
+            <Field k={translate("model")} v={selected.model} />
             <div className="field">
-              <label>Provider</label>
+              <label>{translate("provider")}</label>
               <select
                 value={selected.provider || ""}
                 onChange={() => undefined}
-                aria-label="Provider"
+                aria-label={translate("provider")}
               >
-                <option value="">Global default</option>
+                <option value="">{translate("globalDefault")}</option>
                 {providers.map((provider) => (
                   <option key={provider.name} value={provider.name}>
                     {provider.title}
@@ -9814,6 +10029,35 @@ function StandalonePane({ route }: { route: PaneRoute }) {
   );
 }
 
+const insightFieldKeys: Record<string, string> = {
+  message_count: "messageCount",
+  tool_calls: "toolCalls",
+  approval_count: "approvalCount",
+  token_usage: "tokenUsage",
+  duration_ms: "duration",
+};
+
+function insightFieldLabel(key: string): string {
+  const translationKey = insightFieldKeys[key];
+  return translationKey ? translate(translationKey) : key;
+}
+
+function formatInsightValue(key: string, value: unknown): string {
+  if (key === "duration_ms" && typeof value === "number") return `${value} ms`;
+  if (
+    key === "token_usage" &&
+    value &&
+    typeof value === "object" &&
+    !Array.isArray(value)
+  ) {
+    const usage = value as Record<string, unknown>;
+    return `${translate("input")}: ${String(usage.input ?? 0)} · ${translate(
+      "output",
+    )}: ${String(usage.output ?? 0)}`;
+  }
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
 function StandaloneInsights({
   selected,
   onError,
@@ -9831,7 +10075,7 @@ function StandaloneInsights({
       .then(setInsights)
       .catch(onError);
   }, [selected.id, onError]);
-  if (!insights) return <div className="muted">Loading…</div>;
+  if (!insights) return <div className="muted">{translate("loading")}</div>;
   return (
     <div className="info">
       {Object.entries(insights)
@@ -9839,8 +10083,8 @@ function StandaloneInsights({
         .map(([key, value]) => (
           <Field
             key={key}
-            k={key}
-            v={typeof value === "string" ? value : JSON.stringify(value)}
+            k={insightFieldLabel(key)}
+            v={formatInsightValue(key, value)}
           />
         ))}
     </div>
@@ -9972,14 +10216,14 @@ function ArtifactsPane({ selected }: { selected: Session }) {
           <button
             className="artifact-icon-btn"
             onClick={() => setOpened(null)}
-            aria-label="Back to artifacts"
-            title="Back"
+            aria-label={translate("backToArtifacts")}
+            title={translate("back")}
           >
             <RailIcon name="back" size={16} />
           </button>
           <div className="artifact-heading">
             <div className="artifact-title">
-              <span>Artifacts</span>
+              <span>{translate("artifacts")}</span>
               <span className="artifact-sep">/</span>
               <span>{opened.path.split(/[\\/]/).pop()}</span>
             </div>
@@ -9988,7 +10232,7 @@ function ArtifactsPane({ selected }: { selected: Session }) {
         </div>
         <div className="artifact-preview">
           {!content ? (
-            <div className="rail-muted">Loading…</div>
+            <div className="rail-muted">{translate("loading")}</div>
           ) : content.error ? (
             <div className="rail-error">{String(content.error)}</div>
           ) : typeof content.content_base64 === "string" ? (
@@ -10000,10 +10244,12 @@ function ArtifactsPane({ selected }: { selected: Session }) {
           ) : opened.kind === "recording_manifest" && manifest ? (
             <div className="grid gap-3">
               <div className="flex items-center justify-between text-sm">
-                <strong>Sampled screenshot timeline</strong>
+                <strong>{translate("sampledScreenshotTimeline")}</strong>
                 <span>
-                  {manifest.frames?.length ?? 0} frames
-                  {manifest.truncated ? " · truncated at limit" : ""}
+                  {manifest.frames?.length ?? 0} {translate("framesLabel")}
+                  {manifest.truncated
+                    ? ` · ${translate("truncatedAtLimit")}`
+                    : ""}
                 </span>
               </div>
               {selectedFrame &&
@@ -10011,7 +10257,9 @@ function ArtifactsPane({ selected }: { selected: Session }) {
                   <img
                     className="artifact-image max-w-full"
                     src={`data:image/png;base64,${frameContent.content_base64}`}
-                    alt={`Recording frame ${frameIndex + 1}`}
+                    alt={translate("recordingFrame", {
+                      index: frameIndex + 1,
+                    })}
                   />
                 )}
               <input
@@ -10055,12 +10303,13 @@ function ArtifactsPane({ selected }: { selected: Session }) {
     <section className="rail-section">
       <div className="rail-section-head">
         <strong>
-          Artifacts{artifacts.length ? ` (${artifacts.length})` : ""}
+          {translate("artifactsLabel")}
+          {artifacts.length ? ` (${artifacts.length})` : ""}
         </strong>
         <button
           className="rail-mini-btn"
           onClick={refresh}
-          title="Refresh artifacts"
+          title={translate("refreshArtifacts")}
         >
           <RailIcon name="refresh" size={16} />
         </button>
@@ -10069,7 +10318,7 @@ function ArtifactsPane({ selected }: { selected: Session }) {
         {loadError ? (
           <div className="rail-error">{loadError}</div>
         ) : artifacts.length === 0 ? (
-          <div className="rail-muted">No artifacts yet.</div>
+          <div className="rail-muted">{translate("noArtifacts")}</div>
         ) : (
           <div className="artifact-list">
             {artifacts.slice(0, 16).map((artifact) => (
@@ -10085,12 +10334,14 @@ function ArtifactsPane({ selected }: { selected: Session }) {
                   {artifact.path.split(/[\\/]/).pop() || artifact.path}
                   <span className="artifact-row-meta">
                     {formatBytes(artifact.size_bytes)}
-                    {artifact.sha256 ? "" : " · Hash not calculated"}
+                    {artifact.sha256
+                      ? ""
+                      : ` · ${translate("hashNotCalculated")}`}
                     {" · "}
                     {new Date(artifact.created_at).toLocaleString()}
                   </span>
                 </span>
-                <span className="artifact-open">Open</span>
+                <span className="artifact-open">{translate("open")}</span>
               </button>
             ))}
           </div>
@@ -10125,11 +10376,11 @@ function ShellHistoryPane({ selected }: { selected: Session }) {
   return (
     <section className="rail-section">
       <div className="rail-section-head">
-        <strong>Shell</strong>
+        <strong>{translate("shell")}</strong>
         <button
           className="rail-mini-btn"
           onClick={refresh}
-          title="Refresh shell history"
+          title={translate("refreshShellHistory")}
         >
           <RailIcon name="refresh" size={16} />
         </button>
@@ -10138,7 +10389,7 @@ function ShellHistoryPane({ selected }: { selected: Session }) {
         {error ? (
           <div className="rail-error">{error}</div>
         ) : items.length === 0 ? (
-          <div className="rail-muted">No shell commands recorded yet.</div>
+          <div className="rail-muted">{translate("noShellCommands")}</div>
         ) : (
           <div className="rail-event-list">
             {items.map((item) => (
@@ -10149,23 +10400,27 @@ function ShellHistoryPane({ selected }: { selected: Session }) {
                     setOpen(open === item.call_id ? null : item.call_id)
                   }
                 >
-                  <code>{item.command || "(empty command)"}</code>
+                  <code>{item.command || translate("emptyCommand")}</code>
                   <span
                     className={item.exit_code === 0 ? "rail-ok" : "rail-muted"}
                   >
                     {item.exit_code == null
-                      ? "running"
-                      : `exit ${item.exit_code}`}
+                      ? translate("running")
+                      : `${translate("exitLabel")} ${item.exit_code}`}
                   </span>
                 </button>
                 <div className="rail-event-meta">
-                  {item.duration_ms == null ? "" : `${item.duration_ms} ms`}
+                  {item.duration_ms == null
+                    ? ""
+                    : `${item.duration_ms} ${translate("milliseconds")}`}
                 </div>
                 {open === item.call_id &&
                   (item.output || item.output_truncated) && (
                     <pre className="rail-event-output">
                       {item.output}
-                      {item.output_truncated ? "\n[Output truncated]" : ""}
+                      {item.output_truncated
+                        ? `\n[${translate("outputTruncated")}]`
+                        : ""}
                     </pre>
                   )}
               </div>
@@ -10185,19 +10440,30 @@ function IterationStatsPane({ events }: { events: TimelineEvent[] }) {
   const summary = summarizeIterationStats(events);
   return (
     <section className="mt-4 rounded-lg border border-line p-3">
-      <h3 className="text-sm font-semibold text-ink">Iteration stats</h3>
+      <h3 className="text-sm font-semibold text-ink">
+        {translate("iterationStats")}
+      </h3>
       <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
-        <Field k="Iterations" v={String(summary.iterations.length)} />
-        <Field k="Input tokens" v={formatStat(summary.totalInputTokens)} />
-        <Field k="Output tokens" v={formatStat(summary.totalOutputTokens)} />
         <Field
-          k="Total duration"
+          k={translate("iterations")}
+          v={String(summary.iterations.length)}
+        />
+        <Field
+          k={`${translate("input")} tokens`}
+          v={formatStat(summary.totalInputTokens)}
+        />
+        <Field
+          k={`${translate("output")} tokens`}
+          v={formatStat(summary.totalOutputTokens)}
+        />
+        <Field
+          k={translate("totalDuration")}
           v={formatStat(summary.totalDurationMs, " ms")}
         />
-        <Field k="Retries" v={formatStat(summary.totalRetries)} />
+        <Field k={translate("retries")} v={formatStat(summary.totalRetries)} />
         <Field
-          k="Compactions"
-          v={`${summary.totalCompactions} (${summary.automaticCompactions} automatic, ${summary.manualCompactions} manual)`}
+          k={translate("compactions")}
+          v={`${summary.totalCompactions} (${summary.automaticCompactions} ${translate("automaticCompactions")}, ${summary.manualCompactions} ${translate("manualCompactions")})`}
         />
       </div>
       {summary.iterations.length > 0 && (
@@ -10208,21 +10474,42 @@ function IterationStatsPane({ events }: { events: TimelineEvent[] }) {
               className="rounded border border-line"
             >
               <summary className="cursor-pointer px-2 py-1 text-xs text-muted">
-                Iteration {item.iteration} · #{item.detailIndex} ·{" "}
-                {item.toolCalls} tool calls
+                {translate("iterationLabel")} {item.iteration} · #
+                {item.detailIndex} · {item.toolCalls} {translate("toolCalls")}
               </summary>
               <div className="grid grid-cols-2 gap-1 px-2 pb-2 text-xs">
-                <Field k="Duration" v={formatStat(item.durationMs, " ms")} />
-                <Field k="Inference" v={formatStat(item.inferenceMs, " ms")} />
                 <Field
-                  k="Tool execution"
+                  k={translate("duration")}
+                  v={formatStat(item.durationMs, " ms")}
+                />
+                <Field
+                  k={translate("inference")}
+                  v={formatStat(item.inferenceMs, " ms")}
+                />
+                <Field
+                  k={translate("toolExecution")}
                   v={formatStat(item.toolExecMs, " ms")}
                 />
-                <Field k="Harness" v={formatStat(item.harnessMs, " ms")} />
-                <Field k="Input" v={formatStat(item.inputTokens)} />
-                <Field k="Output" v={formatStat(item.outputTokens)} />
-                <Field k="Retries" v={formatStat(item.retryCount)} />
-                <Field k="Compactions" v={formatStat(item.compactionCount)} />
+                <Field
+                  k={translate("harness")}
+                  v={formatStat(item.harnessMs, " ms")}
+                />
+                <Field
+                  k={`${translate("input")} tokens`}
+                  v={formatStat(item.inputTokens)}
+                />
+                <Field
+                  k={`${translate("output")} tokens`}
+                  v={formatStat(item.outputTokens)}
+                />
+                <Field
+                  k={translate("retries")}
+                  v={formatStat(item.retryCount)}
+                />
+                <Field
+                  k={translate("compactions")}
+                  v={formatStat(item.compactionCount)}
+                />
               </div>
             </details>
           ))}
@@ -10338,11 +10625,11 @@ function ChangesPane({ selected }: { selected: Session }) {
   return (
     <section className="rail-section">
       <div className="rail-section-head">
-        <strong>Changes</strong>
+        <strong>{translate("changes")}</strong>
         <button
           className="rail-mini-btn"
           onClick={refresh}
-          title="Refresh changes"
+          title={translate("refreshChanges")}
         >
           <RailIcon name="refresh" size={16} />
         </button>
@@ -10350,7 +10637,7 @@ function ChangesPane({ selected }: { selected: Session }) {
       <div className="rail-section-body">
         {error && <div className="rail-error">{error}</div>}
         {items.length === 0 ? (
-          <div className="rail-muted">No file edits recorded yet.</div>
+          <div className="rail-muted">{translate("noFileEdits")}</div>
         ) : (
           <div className="rail-event-list">
             {items.map((item) => (
@@ -10360,7 +10647,9 @@ function ChangesPane({ selected }: { selected: Session }) {
                   onClick={() => setOpen(open === item.path ? null : item.path)}
                 >
                   <code>{item.path}</code>
-                  <span className="rail-muted">{item.edit_count} edits</span>
+                  <span className="rail-muted">
+                    {item.edit_count} {translate("editsLabel")}
+                  </span>
                 </button>
                 {open === item.path &&
                   item.edits.map((edit, index) => (
@@ -10374,14 +10663,12 @@ function ChangesPane({ selected }: { selected: Session }) {
         )}
         {Array.isArray(changes) && changes.length > 0 && (
           <details className="rail-git-diff">
-            <summary>Current git diff</summary>
+            <summary>{translate("currentGitDiff")}</summary>
             <pre>{JSON.stringify(changes, null, 2)}</pre>
           </details>
         )}
         {!gitDiff && selected.workspace && (
-          <div className="rail-muted">
-            Git diff unavailable for this host/workspace.
-          </div>
+          <div className="rail-muted">{translate("gitDiffUnavailable")}</div>
         )}
       </div>
     </section>
@@ -10416,12 +10703,12 @@ function ProgressPane({ selected }: { selected: Session }) {
   return (
     <section className="rail-section">
       <div className="rail-section-head">
-        <strong>Progress</strong>
+        <strong>{translate("progress")}</strong>
         <select
           value={category}
           onChange={(event) => setCategory(event.target.value)}
         >
-          <option value="">All</option>
+          <option value="">{translate("all")}</option>
           {categories.map((item) => (
             <option key={item} value={item}>
               {item}
@@ -10433,7 +10720,7 @@ function ProgressPane({ selected }: { selected: Session }) {
         {error ? (
           <div className="rail-error">{error}</div>
         ) : events.length === 0 ? (
-          <div className="rail-muted">No progress events recorded yet.</div>
+          <div className="rail-muted">{translate("noProgressEvents")}</div>
         ) : (
           <div className="rail-event-list">
             {events.map((event) => (
@@ -10442,7 +10729,9 @@ function ProgressPane({ selected }: { selected: Session }) {
                 key={`${event.sequence}-${event.event_type}`}
               >
                 <div className="rail-event-head">
-                  <strong>{event.event_type || "working_event"}</strong>
+                  <strong>
+                    {event.event_type || translate("workingEvent")}
+                  </strong>
                   <span className="rail-muted">{event.category}</span>
                 </div>
                 <div className="rail-event-meta">
@@ -10515,13 +10804,10 @@ function AgentRosterPane({
     return (
       <section className="rail-section">
         <div className="rail-section-head">
-          <strong>Agents</strong>
+          <strong>{translate("panelAgents")}</strong>
         </div>
         <div className="rail-section-body">
-          <div className="rail-muted">
-            This session is not associated with a project, so no project agent
-            roster is available.
-          </div>
+          <div className="rail-muted">{translate("sessionNotAssociated")}</div>
         </div>
       </section>
     );
@@ -10553,12 +10839,12 @@ function AgentRosterPane({
   return (
     <section className="rail-section">
       <div className="rail-section-head">
-        <strong>Agents</strong>
+        <strong>{translate("panelAgents")}</strong>
         <button
           className="rail-mini-btn"
           onClick={refresh}
-          title="Refresh agents"
-          aria-label="Refresh agents"
+          title={translate("refreshAgents")}
+          aria-label={translate("refreshAgents")}
         >
           <Icon name="refresh" size={16} />
         </button>
@@ -10567,60 +10853,71 @@ function AgentRosterPane({
         {error && <div className="rail-error">{error}</div>}
         {workflow && (
           <div className="rail-muted agent-roster-workflow">
-            Workflow stage:{" "}
+            {translate("workflowStage")}{" "}
             {typeof workflow.stage_index === "number"
               ? workflow.stage_index + 1
-              : "Unknown"}{" "}
-            · Status: {workflow.status?.trim() || "Unknown"}
+              : translate("stageUnknown")}{" "}
+            · {translate("statusLabelInline")}{" "}
+            {translateBackendValue(workflow.status)}
             {Array.isArray(workflow.tasks) &&
-              ` · Tasks: ${workflow.tasks.length}`}
+              ` · ${translate("tasksCount", { count: workflow.tasks.length })}`}
           </div>
         )}
         {rows.length === 0 ? (
-          <div className="rail-muted">This project has no agents.</div>
+          <div className="rail-muted">{translate("noAgents")}</div>
         ) : (
           <div className="rail-event-list">
             {rows.map(({ agent, session }) => {
               return (
                 <div className="rail-event-card" key={agent.id}>
                   <div className="rail-event-head">
-                    <strong>{projectAgentRosterValue(agent.name)}</strong>
+                    <strong>
+                      {projectAgentRosterValue(agent.name) ||
+                        translate("unknownValue")}
+                    </strong>
                     <span className="rail-muted">
-                      {projectAgentRosterValue(agent.state)}
+                      {translateBackendValue(agent.state)}
                     </span>
                   </div>
                   <dl className="agent-roster-details">
                     <div>
-                      <dt>Role</dt>
-                      <dd>{projectAgentRosterValue(agent.role)}</dd>
+                      <dt>{translate("roleLabel")}</dt>
+                      <dd>{translateBackendValue(agent.role)}</dd>
                     </div>
                     <div>
-                      <dt>Host</dt>
-                      <dd>{projectAgentRosterHost(session)}</dd>
+                      <dt>{translate("hostLabel")}</dt>
+                      <dd>
+                        {projectAgentRosterHost(session) ||
+                          translate("unknownValue")}
+                      </dd>
                     </div>
                     <div>
-                      <dt>Branch</dt>
+                      <dt>{translate("branchLabel")}</dt>
                       <dd title={agent.branch}>
-                        {projectAgentRosterValue(agent.branch)}
+                        {projectAgentRosterValue(agent.branch) ||
+                          translate("unknownValue")}
                       </dd>
                     </div>
                     <div>
-                      <dt>Worktree</dt>
+                      <dt>{translate("worktreeLabel")}</dt>
                       <dd title={agent.worktree_path}>
-                        {projectAgentRosterValue(agent.worktree_path)}
+                        {projectAgentRosterValue(agent.worktree_path) ||
+                          translate("unknownValue")}
                       </dd>
                     </div>
                     <div>
-                      <dt>Session</dt>
-                      <dd>{session ? "Exists" : "None"}</dd>
+                      <dt>{translate("sessionLabel")}</dt>
+                      <dd>
+                        {session ? translate("exists") : translate("none")}
+                      </dd>
                     </div>
                     <div>
-                      <dt>Run state</dt>
-                      <dd>{projectAgentRosterValue(session?.run_state)}</dd>
+                      <dt>{translate("runStateLabel")}</dt>
+                      <dd>{translateBackendValue(session?.run_state)}</dd>
                     </div>
                     <div>
-                      <dt>Stop reason</dt>
-                      <dd>{projectAgentRosterValue(session?.stop_reason)}</dd>
+                      <dt>{translate("stopReasonLabel")}</dt>
+                      <dd>{translateBackendValue(session?.stop_reason)}</dd>
                     </div>
                   </dl>
                   <div className="inline-actions">
@@ -10629,7 +10926,7 @@ function AgentRosterPane({
                         className="btn approval-primary"
                         onClick={() => onOpenSession(session)}
                       >
-                        Open session
+                        {translate("openSession")}
                       </button>
                     ) : (
                       <button
@@ -10638,8 +10935,8 @@ function AgentRosterPane({
                         onClick={() => void startSession(agent)}
                       >
                         {busyAgentId === agent.id
-                          ? "Starting…"
-                          : "Start session"}
+                          ? translate("starting")
+                          : translate("startSession")}
                       </button>
                     )}
                   </div>
@@ -10658,7 +10955,7 @@ function TasksPane({ events }: { events: TimelineEvent[] }) {
   if (!steps?.length) {
     return (
       <section className="tasks-pane">
-        <div className="tasks-empty">No tasks yet.</div>
+        <div className="tasks-empty">{translate("noTasksYet")}</div>
       </section>
     );
   }
@@ -10668,7 +10965,7 @@ function TasksPane({ events }: { events: TimelineEvent[] }) {
   return (
     <section className="tasks-pane">
       <div className="tasks-progress">
-        {completed} / {steps.length} tasks completed
+        {completed} / {steps.length} {translate("tasksCompleted")}
       </div>
       <div className="tasks-list">
         {steps.map((step, index) => {
@@ -10783,20 +11080,20 @@ function SessionRightPanel({
     label: string;
     icon: RailIconName;
   }> = [
-    { id: "info", label: "Info", icon: "info" },
-    { id: "shell", label: "Shell", icon: "terminal" },
-    { id: "changes", label: "Changes", icon: "diff" },
-    { id: "progress", label: "Progress", icon: "progress" },
-    { id: "tasks", label: "Tasks", icon: "tasks" },
-    { id: "agents", label: "Agents", icon: "agents" },
-    { id: "artifacts", label: "Artifacts", icon: "file" },
+    { id: "info", label: translate("information"), icon: "info" },
+    { id: "shell", label: translate("shell"), icon: "terminal" },
+    { id: "changes", label: translate("changes"), icon: "diff" },
+    { id: "progress", label: translate("progress"), icon: "progress" },
+    { id: "tasks", label: translate("panelTasks"), icon: "tasks" },
+    { id: "agents", label: translate("panelAgents"), icon: "agents" },
+    { id: "artifacts", label: translate("panelArtifacts"), icon: "file" },
     { id: "pr", label: "PR", icon: "branch" },
-    { id: "insights", label: "Insights", icon: "sparkle" },
+    { id: "insights", label: translate("insights"), icon: "sparkle" },
   ];
   if (selected.host_id !== "local") {
     informationTabs.splice(3, 0, {
       id: "worklog",
-      label: "Worklog",
+      label: translate("worklog"),
       icon: "progress",
     });
   }
@@ -10804,7 +11101,7 @@ function SessionRightPanel({
     id: typeof panelTab;
     label: string;
     icon: RailIconName;
-  }> = [{ id: "review", label: "Diff", icon: "diff" }];
+  }> = [{ id: "review", label: translate("diff"), icon: "diff" }];
   const remoteTabs: Array<{
     id: typeof panelTab;
     label: string;
@@ -10818,7 +11115,7 @@ function SessionRightPanel({
       : [
           {
             id: "desktop" as const,
-            label: "Desktop",
+            label: translate("panelDesktop"),
             icon: "monitor" as const,
           },
         ]),
@@ -10835,7 +11132,7 @@ function SessionRightPanel({
       : [
           {
             id: "terminal" as const,
-            label: "Terminal",
+            label: translate("panelTerminal"),
             icon: "terminal" as const,
           },
         ]),
@@ -10899,13 +11196,13 @@ function SessionRightPanel({
             <strong className="drawer-title">
               {tabs.find((item) => item.id === panelTab)?.label}
             </strong>
-            {running && <span className="live-pill">Live</span>}
+            {running && <span className="live-pill">{translate("live")}</span>}
             <div className="drawer-actions">
               {isWorkspaceTab && (
                 <button
                   className="drawer-action"
-                  title="放大（独立窗口打开）"
-                  aria-label="放大（独立窗口打开）"
+                  title={translate("enlargeWindow")}
+                  aria-label={translate("enlargeWindow")}
                   onClick={() => void openStandalonePane().catch(onError)}
                 >
                   <Icon name="windowOpen" />
@@ -10913,8 +11210,8 @@ function SessionRightPanel({
               )}
               <button
                 className="drawer-action"
-                title={translate("Collapse session panel")}
-                aria-label={translate("Collapse session panel")}
+                title={translate("collapseSessionPanel")}
+                aria-label={translate("collapseSessionPanel")}
                 onClick={() => {
                   onCollapsedChange?.(true);
                 }}
@@ -10930,25 +11227,25 @@ function SessionRightPanel({
                 style={{ display: panelTab === "info" ? "block" : "none" }}
               >
                 <div className="info">
-                  <Field k={translate("Session ID")} v={selected.id} />
+                  <Field k={translate("sessionId")} v={selected.id} />
                   <Field
-                    k={translate("Status")}
-                    v={running ? "Running" : "Ready"}
+                    k={translate("status")}
+                    v={running ? translate("running") : translate("ready")}
                   />
-                  <Field k={translate("Host")} v={selected.host_name} />
+                  <Field k={translate("host")} v={selected.host_name} />
                   <Field
-                    k={translate("Workspace")}
-                    v={selected.workspace || translate("Not set")}
+                    k={translate("workspace")}
+                    v={selected.workspace || translate("notSet")}
                   />
-                  <Field k={translate("Model")} v={selected.model} />
+                  <Field k={translate("model")} v={selected.model} />
                   <div className="field">
-                    <label>Provider</label>
+                    <label>{translate("provider")}</label>
                     <select
                       value={selected.provider || ""}
                       onChange={(event) => onProviderChange(event.target.value)}
-                      aria-label="Provider"
+                      aria-label={translate("provider")}
                     >
-                      <option value="">Global default</option>
+                      <option value="">{translate("globalDefault")}</option>
                       {providers.map((item) => (
                         <option
                           key={item.name}
@@ -10956,7 +11253,9 @@ function SessionRightPanel({
                           disabled={item.available === false}
                         >
                           {item.title}
-                          {item.available === false ? " (unavailable)" : ""}
+                          {item.available === false
+                            ? ` (${translate("unavailable")})`
+                            : ""}
                         </option>
                       ))}
                     </select>
@@ -10971,7 +11270,7 @@ function SessionRightPanel({
                           }).catch(onError)
                         }
                       >
-                        Interrupt
+                        {translate("interrupt")}
                       </button>
                     </div>
                   )}
@@ -10986,7 +11285,7 @@ function SessionRightPanel({
               >
                 <div className="p-4">
                   <h2 className="text-[15px] font-semibold text-ink">
-                    Insights
+                    {translate("insights")}
                   </h2>
                   {insights ? (
                     <dl className="mt-4 space-y-3 text-[13px]">
@@ -10994,17 +11293,15 @@ function SessionRightPanel({
                         .filter(([key]) => key !== "session_id")
                         .map(([key, value]) => (
                           <div key={key}>
-                            <dt className="text-muted">{key}</dt>
-                            <dd>
-                              {typeof value === "string"
-                                ? value
-                                : JSON.stringify(value)}
-                            </dd>
+                            <dt className="text-muted">
+                              {insightFieldLabel(key)}
+                            </dt>
+                            <dd>{formatInsightValue(key, value)}</dd>
                           </div>
                         ))}
                     </dl>
                   ) : (
-                    <div className="muted">Loading insights…</div>
+                    <div className="muted">{translate("loading")}</div>
                   )}
                 </div>
               </div>
@@ -11050,7 +11347,8 @@ function SessionRightPanel({
               <div className="session-pane">
                 {unavailableCapability ? (
                   <div className="rail-error">
-                    {unavailableCapability.reason || "Capability unavailable."}
+                    {unavailableCapability.reason ||
+                      translate("capabilityUnavailable")}
                   </div>
                 ) : (
                   <SurfaceView
@@ -11096,7 +11394,8 @@ function SessionRightPanel({
                   capabilities.browser?.state === "Unavailable" &&
                   !preserveSurfaceTabWhileSleeping(selected.sleep_state) ? (
                     <div className="rail-error">
-                      {capabilities.browser.reason || "Capability unavailable."}
+                      {capabilities.browser.reason ||
+                        translate("capabilityUnavailable")}
                     </div>
                   ) : (
                     <SurfaceView
@@ -11123,7 +11422,7 @@ function SessionRightPanel({
         />
       )}
       <div className="icon-rail session-icon-rail">
-        <div className="rail-group" aria-label="Information">
+        <div className="rail-group" aria-label={translate("information")}>
           {informationTabs.map((item) => (
             <button
               key={item.id}
@@ -11136,7 +11435,7 @@ function SessionRightPanel({
           ))}
         </div>
         <div className="rail-sep" />
-        <div className="rail-group" aria-label="Workspace">
+        <div className="rail-group" aria-label={translate("workspace")}>
           {workspaceTabs.map((item) => (
             <button
               key={item.id}
@@ -11149,7 +11448,10 @@ function SessionRightPanel({
           ))}
         </div>
         <div className="rail-sep" />
-        <div className="rail-group" aria-label="Remote host capabilities">
+        <div
+          className="rail-group"
+          aria-label={translate("remoteCapabilities")}
+        >
           {remoteTabs.map((item) => (
             <button
               key={item.id}
@@ -11207,11 +11509,15 @@ function InboxPane({
   return (
     <div className="surface-panel p-4">
       <div className="flex items-center justify-between mb-4">
-        <h2 className="text-base font-semibold">Inbox</h2>
-        <span className="text-xs text-faint">{pending.length} pending</span>
+        <h2 className="text-base font-semibold">{translate("inbox")}</h2>
+        <span className="text-xs text-faint">
+          {pending.length} {translate("pendingLabel")}
+        </span>
       </div>
       <div className="space-y-3">
-        {pending.length === 0 && <div className="muted">No pending items.</div>}
+        {pending.length === 0 && (
+          <div className="muted">{translate("noPendingItems")}</div>
+        )}
         {pending.map((item) => (
           <div
             key={`${item.session_id}:${item.call_id}`}
@@ -11220,10 +11526,10 @@ function InboxPane({
             <div className="flex items-center justify-between gap-2">
               <strong>
                 {item.kind === "question"
-                  ? "Question"
+                  ? translate("question")
                   : item.kind === "plan"
-                    ? "Plan confirmation"
-                    : "Approval"}
+                    ? translate("planConfirmation")
+                    : translate("approval")}
               </strong>
               <span className="text-xs text-faint">{item.tool}</span>
             </div>
@@ -11283,7 +11589,7 @@ function InboxPane({
                             [item.call_id]: event.target.value,
                           }))
                         }
-                        placeholder="Type your answer"
+                        placeholder={translate("typeAnswer")}
                       />
                       <button
                         className="btn approval-primary"
@@ -11297,7 +11603,7 @@ function InboxPane({
                           });
                         }}
                       >
-                        Answer
+                        {translate("answer")}
                       </button>
                     </>
                   ) : (
@@ -11306,13 +11612,13 @@ function InboxPane({
                         className="btn approval-primary"
                         onClick={() => onResolve(item, "allow")}
                       >
-                        Allow
+                        {translate("allow")}
                       </button>
                       <button
                         className="btn quiet-deny"
                         onClick={() => onResolve(item, "deny")}
                       >
-                        Deny
+                        {translate("deny")}
                       </button>
                     </>
                   )}
@@ -11352,8 +11658,8 @@ function QuestionCard({
         <button
           className="transcript-question-close"
           type="button"
-          aria-label="Collapse question"
-          title="Collapse question"
+          aria-label={translate("collapseQuestion")}
+          title={translate("collapseQuestion")}
           onClick={onCollapse}
         >
           ×
@@ -11397,7 +11703,11 @@ function QuestionCard({
               onClick={() => answerOption(JSON.stringify(selectedOptions))}
             >
               <span className="approval-option-key">↵</span>
-              <span>{submitting ? "Sending…" : "Submit selection"}</span>
+              <span>
+                {submitting
+                  ? translate("sending")
+                  : translate("submitSelection")}
+              </span>
             </button>
           )}
         </div>
@@ -12371,7 +12681,10 @@ function AppContent() {
           harness: homeHarness,
           workspace: homeWorkspace || null,
           systemPrompt:
-            [homeRole ? `你的角色是：${homeRole}` : "", homeSystemPrompt]
+            [
+              homeRole ? `${translate("rolePromptPrefix")}${homeRole}` : "",
+              homeSystemPrompt,
+            ]
               .filter(Boolean)
               .join("\n\n") || null,
         }),
@@ -12701,7 +13014,7 @@ function AppContent() {
                       className="session-title-input"
                       value={sessionTitleDraft}
                       autoFocus
-                      aria-label="Session title"
+                      aria-label={translate("sessionTitle")}
                       onChange={(event) =>
                         setSessionTitleDraft(event.target.value)
                       }
@@ -12729,7 +13042,7 @@ function AppContent() {
                   <span className="title-sub" data-testid="session-subtitle">
                     {[
                       selected.host_name,
-                      selected.workspace || "workspace not set",
+                      selected.workspace || translate("workspaceNotSet"),
                       selected.model,
                       sessionStatusLabel(
                         selected.run_state,
@@ -12748,12 +13061,12 @@ function AppContent() {
                 <div className="main-topbar-side main-topbar-actions">
                   {secretBackend && (
                     <span className="backend-badge">
-                      Secrets: {secretBackend}
+                      {translate("secretsLabel")} {secretBackend}
                     </span>
                   )}
                   <button
                     className="topbar-icon-btn"
-                    title={translate("Toggle session panel")}
+                    title={translate("toggleSessionPanel")}
                     onClick={() => setDrawerCollapsed((value) => !value)}
                   >
                     <Icon name="sidebarRight" size={16} />
@@ -12798,8 +13111,8 @@ function AppContent() {
                               selected.run_state,
                               selected.stop_reason,
                             ) === "restart"
-                              ? "Restart"
-                              : "Retry"
+                              ? translate("restart")
+                              : translate("retry")
                           }
                           onQuestionAnswer={(callId, answer) => {
                             void command("resolve_inbox", {
@@ -12815,8 +13128,8 @@ function AppContent() {
                       <button
                         className="transcript-jump-bottom"
                         type="button"
-                        aria-label="Jump to latest conversation"
-                        title="Jump to latest conversation"
+                        aria-label={translate("jumpLatest")}
+                        title={translate("jumpLatest")}
                         onClick={jumpToTranscriptBottom}
                       >
                         <svg
@@ -12865,7 +13178,7 @@ function AppContent() {
                   {pendingQuestion && pendingQuestionCollapsed && (
                     <div className="transcript-question-collapsed">
                       <span className="transcript-question-collapsed-copy">
-                        <strong>Question</strong>
+                        <strong>{translate("question")}</strong>
                         <span>{pendingQuestion.question}</span>
                       </span>
                       <button
@@ -12873,7 +13186,7 @@ function AppContent() {
                         type="button"
                         onClick={() => setPendingQuestionCollapsed(false)}
                       >
-                        Answer
+                        {translate("answer")}
                       </button>
                     </div>
                   )}
@@ -12998,7 +13311,7 @@ function AppContent() {
               </div>
             </>
           ) : (
-            <div className="session-loading">Loading session…</div>
+            <div className="session-loading">{translate("loadingSession")}</div>
           )
         ) : surface === "manage" ? (
           <SettingsView activeTab={settingsTab} onTabChange={setSettingsTab}>
@@ -13063,7 +13376,7 @@ function AppContent() {
                 <div className="composer-card hero">
                   <textarea
                     value={homeInput}
-                    placeholder="告诉 OPCOS 你想完成什么…"
+                    placeholder={translate("askGoal")}
                     onChange={(event) => setHomeInput(event.target.value)}
                     onKeyDown={(event) => {
                       if (
@@ -13082,7 +13395,7 @@ function AppContent() {
                         <button
                           className="pill-x"
                           type="button"
-                          title="移除附件"
+                          title={translate("removeAttachment")}
                           onClick={() => setHomeAttachment(null)}
                         >
                           ×
@@ -13110,7 +13423,7 @@ function AppContent() {
                     />
                     <select
                       className="chip"
-                      title="Agent 模板"
+                      title={translate("agentTemplateLabel")}
                       value={homeAgentTemplateId}
                       onChange={(event) => {
                         const id = event.target.value;
@@ -13146,11 +13459,13 @@ function AppContent() {
                           setHomeMode(content.mode || "Auto");
                           setHomeSystemPrompt(content.system_prompt || "");
                         } catch {
-                          onError("Agent 模板内容不是有效 JSON");
+                          onError(translate("agentTemplateInvalidJson"));
                         }
                       }}
                     >
-                      <option value="">Agent 模板</option>
+                      <option value="">
+                        {translate("agentTemplateLabel")}
+                      </option>
                       {homeAgentTemplates.map((template) => (
                         <option key={template.id} value={template.id}>
                           {template.name}
@@ -13159,38 +13474,48 @@ function AppContent() {
                     </select>
                     <input
                       className="chip"
-                      title="角色"
+                      title={translate("role")}
                       value={homeRole}
                       onChange={(event) => setHomeRole(event.target.value)}
-                      placeholder="Role"
+                      placeholder={translate("role")}
                     />
                     <select
                       className="chip"
-                      title="Harness"
+                      title={translate("harness")}
                       value={homeHarness}
                       onChange={(event) => setHomeHarness(event.target.value)}
                     >
                       {(harnessOptions.length
                         ? harnessOptions
-                        : [{ id: "builtin", label: "Builtin", available: true }]
+                        : [
+                            {
+                              id: "builtin",
+                              label: translate("builtIn"),
+                              available: true,
+                            },
+                          ]
                       ).map((option) => (
                         <option
                           key={option.id}
                           value={option.id}
                           disabled={!option.available}
                         >
-                          {option.label}
-                          {!option.available ? " (unavailable)" : ""}
+                          {option.id === "builtin"
+                            ? translate("builtIn")
+                            : option.label}
+                          {!option.available
+                            ? ` (${translate("unavailable")})`
+                            : ""}
                         </option>
                       ))}
                     </select>
                     <select
                       className="chip"
-                      title="绑定主机"
+                      title={translate("host")}
                       value={homeHostId}
                       onChange={(event) => setHomeHostId(event.target.value)}
                     >
-                      <option value="">未选择</option>
+                      <option value="">{translate("noSelection")}</option>
                       {hosts.map((host) => (
                         <option key={host.id} value={host.id}>
                           {host.name}
@@ -13199,11 +13524,11 @@ function AppContent() {
                     </select>
                     <select
                       className="chip"
-                      title="Provider"
+                      title={translate("provider")}
                       value={homeProvider}
                       onChange={(event) => setHomeProvider(event.target.value)}
                     >
-                      <option value="">默认</option>
+                      <option value="">{translate("defaultValue")}</option>
                       {providers.map((provider) => (
                         <option
                           key={provider.name}
@@ -13211,17 +13536,19 @@ function AppContent() {
                           disabled={provider.available === false}
                         >
                           {provider.title}
-                          {provider.available === false ? " (unavailable)" : ""}
+                          {provider.available === false
+                            ? ` (${translate("unavailable")})`
+                            : ""}
                         </option>
                       ))}
                     </select>
                     <select
                       className="chip"
-                      title="模型"
+                      title={translate("modelLabel")}
                       value={homeModel}
                       onChange={(event) => setHomeModel(event.target.value)}
                     >
-                      <option value="auto">Auto</option>
+                      <option value="auto">{translate("auto")}</option>
                       {models
                         .filter(
                           (model) =>
@@ -13230,7 +13557,9 @@ function AppContent() {
                         .map((model) => (
                           <option key={model.id} value={model.id}>
                             {model.label}
-                            {model.likely_non_chat ? " (非对话模型)" : ""}
+                            {model.likely_non_chat
+                              ? ` (${translate("nonChatModel")})`
+                              : ""}
                           </option>
                         ))}
                     </select>
@@ -13240,24 +13569,28 @@ function AppContent() {
                         type="button"
                         onClick={() => setShowAllHomeModels((value) => !value)}
                       >
-                        {showAllHomeModels ? "收起非对话" : "显示全部模型"}
+                        {showAllHomeModels
+                          ? translate("collapseNonChatHome")
+                          : translate("showAllModels")}
                       </button>
                     )}
                     <select
                       className="chip"
-                      title="模式"
+                      title={translate("modeLabel")}
                       value={homeMode}
                       onChange={(event) => setHomeMode(event.target.value)}
                     >
-                      <option value="Interactive">Interactive</option>
-                      <option value="Auto">Auto</option>
+                      <option value="Interactive">
+                        {translate("interactive")}
+                      </option>
+                      <option value="Auto">{translate("auto")}</option>
                     </select>
                     <input
                       className="chip workspace-chip"
-                      title="留空时使用默认本地 workspace"
+                      title={translate("workspaceDefaultTitle")}
                       value={homeWorkspace}
                       onChange={(event) => setHomeWorkspace(event.target.value)}
-                      placeholder="Workspace (默认 ~/OPCOS/workspaces/<id>)"
+                      placeholder={translate("workspaceDefaultPlaceholder")}
                     />
                     <span className="spacer" />
                     <SendButton
@@ -13265,14 +13598,16 @@ function AppContent() {
                       disabled={!homeInput.trim() || !homeHostId}
                       onSend={() => void submitHome()}
                       onInterrupt={() => undefined}
-                      title="发送并创建会话"
+                      title={translate("sendCreateSession")}
                     />
                   </div>
                 </div>
               </div>
               {sessions.length > 0 && (
                 <div className="recent">
-                  <div className="recent-head">最近会话</div>
+                  <div className="recent-head">
+                    {translate("recentSessions")}
+                  </div>
                   {sessions.slice(0, 8).map((item) => (
                     <button
                       className="recent-item"
@@ -13300,7 +13635,7 @@ function AppContent() {
           <div className="error-toast" role="alert" data-testid="error-toast">
             {error}
             <button
-              aria-label="Dismiss notification"
+              aria-label={translate("dismissNotification")}
               onClick={() => {
                 setError("");
                 if (errorTimer.current !== undefined)

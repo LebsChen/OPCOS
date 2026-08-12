@@ -17,12 +17,71 @@ import {
   lastActivityLabel,
   type TimelineEvent,
 } from "./timeline";
+import { getLocale, setLocale } from "./i18n";
+import { errorMessage } from "./gui";
+import { providerErrorPresentation } from "./transcript";
 
 const live = liveEnvelopes.map((entry) => entry.payload as TimelineEvent);
 const saved = persisted as TimelineEvent[];
 const opcos = opcosEvents as TimelineEvent[];
 
 describe("single event-log timeline", () => {
+  it("keeps provider notice and toast localized in the zh locale", () => {
+    const previousLocale = getLocale();
+    setLocale("zh");
+    try {
+      const code = "provider_request_failed: provider returned HTTP 400";
+      const nodes = buildTimeline([
+        {
+          type: "provider_error",
+          event_id: "provider-error-zh",
+          created_at_ms: 1,
+          working_event: {
+            event_type: "provider_error",
+            payload: { message: code },
+          },
+        },
+      ] as TimelineEvent[]);
+      const notice = nodes.find((node) => node.kind === "notice");
+      const toast = providerErrorPresentation(errorMessage(code)).toast;
+      expect(notice?.kind === "notice" && notice.text).not.toMatch(
+        /^provider /,
+      );
+      expect(notice?.kind === "notice" && notice.text).not.toContain(code);
+      expect(toast).not.toMatch(/^provider /);
+      expect(toast).not.toContain(code);
+      expect(toast).toContain("提供商请求失败");
+      expect(toast).toContain("HTTP 400");
+    } finally {
+      setLocale(previousLocale);
+    }
+  });
+
+  it("translates provider error notices before transcript rendering", () => {
+    const nodes = buildTimeline([
+      {
+        type: "provider_error",
+        event_id: "provider-error",
+        created_at_ms: 1,
+        working_event: {
+          event_type: "provider_error",
+          payload: {
+            message: "provider_request_failed: upstream overloaded",
+          },
+        },
+      },
+    ] as TimelineEvent[]);
+    const notice = nodes.find((node) => node.kind === "notice");
+    expect(notice).toMatchObject({
+      kind: "notice",
+      noticeKind: "provider_error",
+      text: "Provider request failed: upstream overloaded",
+    });
+    expect(notice?.kind === "notice" && notice.text).not.toContain(
+      "provider_request_failed:",
+    );
+  });
+
   it("replaces an optimistic user message with the persisted event", () => {
     const optimistic = optimisticUserMessageEvent("session-1", "  Hello  ");
     const persisted: TimelineEvent = {
