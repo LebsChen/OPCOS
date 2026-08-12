@@ -77,7 +77,7 @@ function UnseenBadge({ n, failed }: { n: number; failed?: boolean }) {
   );
 }
 
-// Liveness = working (in-flight turn) / sleeping (a self-wake is pending). A count-less dot that
+// Liveness = working (in-flight turn) / sleeping (the runtime is asleep). A count-less dot that
 // never bubbles — it says "this is alive", not "this needs you".
 function LiveDot({ state }: { state?: "working" | "sleeping" | "idle" }) {
   if (state !== "working" && state !== "sleeping") return null;
@@ -89,7 +89,7 @@ function LiveDot({ state }: { state?: "working" | "sleeping" | "idle" }) {
   ) : (
     <span
       className="w-1.5 h-1.5 rounded-full bg-faint/60 shrink-0"
-      title={translate("sleeping")}
+      title={translate("sessionAsleep")}
     />
   );
 }

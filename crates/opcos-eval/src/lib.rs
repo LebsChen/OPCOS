@@ -761,6 +761,9 @@ fn session(store: &SqliteStore, id: &str, workspace: &Path) -> Result<(), EvalEr
             provider_finish_reason: None,
             created_at: now,
             updated_at: now,
+            last_active_at: now,
+            sleep_state: "awake".into(),
+            slept_at: None,
             project_id: None,
             agent_id: None,
         })

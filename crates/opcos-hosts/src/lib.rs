@@ -198,7 +198,7 @@ pub trait HostStdioProcess: Send + Sync {
     async fn next_event(&self) -> Result<Option<StdioEvent>, HostError>;
     async fn write_stdin(&self, input: &[u8]) -> Result<(), HostError>;
     async fn interrupt(&self) -> Result<(), HostError>;
-    async fn shutdown(&mut self) -> Result<(), HostError> {
+    async fn shutdown(&self) -> Result<(), HostError> {
         self.interrupt().await
     }
 }

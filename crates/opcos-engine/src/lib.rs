@@ -8913,6 +8913,9 @@ mod tests {
                 provider_finish_reason: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                last_active_at: Utc::now(),
+                sleep_state: "awake".into(),
+                slept_at: None,
                 project_id: None,
                 agent_id: None,
             })
@@ -9190,6 +9193,9 @@ mod tests {
                 provider_finish_reason: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                last_active_at: Utc::now(),
+                sleep_state: "awake".into(),
+                slept_at: None,
                 project_id: None,
                 agent_id: None,
             })
@@ -10624,6 +10630,9 @@ mod tests {
                 provider_finish_reason: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                last_active_at: Utc::now(),
+                sleep_state: "awake".into(),
+                slept_at: None,
                 project_id: None,
                 agent_id: None,
             })

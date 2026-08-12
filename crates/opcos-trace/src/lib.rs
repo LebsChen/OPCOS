@@ -456,6 +456,9 @@ mod tests {
                 provider_finish_reason: None,
                 created_at: "2024-01-01T00:00:00Z".parse().unwrap(),
                 updated_at: "2024-01-01T00:00:00Z".parse().unwrap(),
+                last_active_at: "2024-01-01T00:00:00Z".parse().unwrap(),
+                sleep_state: "awake".into(),
+                slept_at: None,
                 project_id: None,
                 agent_id: None,
             })

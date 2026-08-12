@@ -107,7 +107,7 @@ export interface SessionInfo {
   archived?: boolean;
   // Inbox items awaiting this session (the amber attention count that bubbles up the sidebar).
   attention?: number;
-  // working = in-flight turn; sleeping = a self-wake is pending; idle = neither. A count-less dot.
+  // working = in-flight turn; sleeping = the runtime is asleep; idle = neither.
   liveness?: "working" | "sleeping" | "idle";
   stop_reason?: string;
   // Channels this session listens to (inbound subscriptions).
@@ -118,6 +118,8 @@ export interface SessionInfo {
   origin?: string;
   origin_label?: string;
   project_id?: string | null;
+  sleep_state?: "awake" | "asleep" | string;
+  slept_at?: string | null;
 }
 
 // Image and text attachments sent with a user message.

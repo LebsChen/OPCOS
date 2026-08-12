@@ -17,6 +17,14 @@ import {
   reconcileSelectedIdAfterRefresh,
   selectedSessionFromList,
   sessionViewSelection,
+  shouldRefreshForSessionLifecycleEvent,
+  shouldRetrySurfaceStart,
+  shouldResetSurfaceForSleep,
+  shouldShowSurfaceReconnect,
+  shouldShowSurfaceRetry,
+  preserveSurfaceTabWhileSleeping,
+  surfaceLifecycleEventMatches,
+  surfaceNeedsConnection,
   updateSessionRunState,
   projectAgentRosterHost,
   projectAgentRosterValue,
@@ -24,6 +32,82 @@ import {
 } from "./gui";
 
 describe("GUI boundary behavior", () => {
+  it("routes session lifecycle events through the shared Tauri event channel", () => {
+    expect(
+      shouldRefreshForSessionLifecycleEvent({ kind: "session-sleep" }),
+    ).toBe(true);
+    expect(
+      shouldRefreshForSessionLifecycleEvent({ kind: "session-wake" }),
+    ).toBe(true);
+    expect(shouldRefreshForSessionLifecycleEvent({ kind: "turn_done" })).toBe(
+      false,
+    );
+  });
+
+  it("resets a surface only on the transition into sleep", () => {
+    expect(shouldResetSurfaceForSleep("awake", "asleep")).toBe(true);
+    expect(shouldResetSurfaceForSleep("asleep", "asleep")).toBe(false);
+    expect(shouldResetSurfaceForSleep("asleep", "awake")).toBe(false);
+    expect(shouldShowSurfaceReconnect("asleep")).toBe(true);
+    expect(shouldShowSurfaceReconnect("awake")).toBe(false);
+    expect(surfaceNeedsConnection("terminal", null, false)).toBe(true);
+    expect(surfaceNeedsConnection("terminal", 1234, false)).toBe(false);
+    expect(surfaceNeedsConnection("terminal", null, true)).toBe(false);
+    expect(surfaceNeedsConnection("terminal", null, false, true)).toBe(false);
+    expect(
+      shouldRetrySurfaceStart({
+        invalidated: true,
+        port: null,
+        sleeping: false,
+        tab: "terminal",
+      }),
+    ).toBe(true);
+    expect(
+      shouldRetrySurfaceStart({
+        invalidated: true,
+        port: null,
+        sleeping: false,
+        tab: "terminal",
+        failed: true,
+      }),
+    ).toBe(false);
+    expect(
+      shouldShowSurfaceRetry({ port: null, sleeping: false, failed: true }),
+    ).toBe(true);
+    expect(
+      shouldShowSurfaceRetry({ port: null, sleeping: true, failed: true }),
+    ).toBe(false);
+    expect(
+      shouldShowSurfaceRetry({ port: null, sleeping: false, failed: false }),
+    ).toBe(false);
+    expect(preserveSurfaceTabWhileSleeping("asleep")).toBe(true);
+    expect(preserveSurfaceTabWhileSleeping("awake")).toBe(false);
+    expect(
+      surfaceLifecycleEventMatches({
+        eventSessionId: "s",
+        eventPort: 1234,
+        currentSessionId: "s",
+        currentPort: 1234,
+      }),
+    ).toBe(true);
+    expect(
+      surfaceLifecycleEventMatches({
+        eventSessionId: "other",
+        eventPort: 1234,
+        currentSessionId: "s",
+        currentPort: 1234,
+      }),
+    ).toBe(false);
+    expect(
+      surfaceLifecycleEventMatches({
+        eventSessionId: "s",
+        eventPort: 1235,
+        currentSessionId: "s",
+        currentPort: 1234,
+      }),
+    ).toBe(false);
+  });
+
   it("normalizes persisted permission modes at the frontend boundary", () => {
     expect(normalizePermissionMode("Interactive")).toBe("interactive");
     expect(normalizePermissionMode("Auto")).toBe("auto");
@@ -459,5 +543,33 @@ describe("GUI boundary behavior", () => {
     );
     expect(source).toContain('setHostVncPassword(password || "")');
     expect(source).toContain("vncPassword: hostVncPassword");
+  });
+
+  it("surfaces real sleep state and stops owned surfaces", () => {
+    const source = readFileSync(
+      fileURLToPath(new URL("./App.tsx", import.meta.url)),
+      "utf8",
+    );
+    expect(source).toContain('session.sleep_state === "asleep"');
+    expect(source).toContain('translate("sessionAsleep")');
+    expect(source).toContain('command("stop_surface", { port: activePort })');
+    expect(source).toContain(
+      'command("touch_session", { sessionId: selectedId })',
+    );
+    expect(source).toContain("lastTouchedSessionRef");
+    expect(source).toContain("60_000");
+    expect(source).toContain('selected?.sleep_state === "asleep"');
+    expect(source).toContain('listen<UiEvent>("opcos://event"');
+    expect(source).toContain("shouldRefreshForSessionLifecycleEvent(payload)");
+    expect(source).not.toContain('listen("session-sleep"');
+    expect(source).not.toContain('listen("session-wake"');
+    expect(source).toContain("surfaceSleepingDescription");
+    expect(source).toContain("reconnectSurface");
+    expect(source).toContain("surfaceUnavailable");
+    expect(source).toContain("retrySurface");
+    expect(source).toContain("surfaceRetryToken");
+    expect(source).toContain("surface-ended");
+    expect(source).toContain("preserveSurfaceTabWhileSleeping");
+    expect(source).toContain("touchSessionActivity");
   });
 });

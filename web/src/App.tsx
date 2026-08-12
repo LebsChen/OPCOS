@@ -35,6 +35,14 @@ import {
   selectedSessionFromList,
   sessionViewSelection,
   submitFailureMessage,
+  shouldRefreshForSessionLifecycleEvent,
+  shouldResetSurfaceForSleep,
+  shouldRetrySurfaceStart,
+  shouldShowSurfaceReconnect,
+  shouldShowSurfaceRetry,
+  preserveSurfaceTabWhileSleeping,
+  surfaceLifecycleEventMatches,
+  surfaceNeedsConnection,
   type PendingQuestionData,
   reconcileSelectedIdAfterRefresh,
   updateSessionRunState,
@@ -2522,8 +2530,13 @@ function SurfaceView({
   const terminalHost = useRef<HTMLDivElement>(null);
   const vncHost = useRef<HTMLDivElement>(null);
   const [port, setPort] = useState<number | null>(null);
+  const portRef = useRef<number | null>(null);
+  const surfaceGenerationRef = useRef(0);
   const [vncPassword, setVncPassword] = useState<string | null>(null);
   const [surfaceError, setSurfaceError] = useState("");
+  const [surfaceFailed, setSurfaceFailed] = useState(false);
+  const surfaceFailedRef = useRef(false);
+  const selectedSleepStateRef = useRef(selected.sleep_state);
   const [browserFrame, setBrowserFrame] = useState<{
     image: string;
     mime: string;
@@ -2535,10 +2548,51 @@ function SurfaceView({
   const [worklog, setWorklog] = useState<Record<string, unknown> | null>(null);
   const [busy, setBusy] = useState(false);
   const [ideError, setIdeError] = useState("");
+  const [sleeping, setSleeping] = useState(
+    shouldShowSurfaceReconnect(selected.sleep_state),
+  );
+  const startInFlightRef = useRef(false);
+  const retryAfterStartRef = useRef(false);
+  const sleepingRef = useRef(sleeping);
+  const surfaceTabRef = useRef(tab);
+  const [surfaceRetryToken, setSurfaceRetryToken] = useState(0);
+  const markSurfaceFailed = (reason: string) => {
+    surfaceFailedRef.current = true;
+    setSurfaceFailed(true);
+    setSurfaceError(reason);
+  };
+  const clearSurfaceFailure = () => {
+    surfaceFailedRef.current = false;
+    setSurfaceFailed(false);
+    setSurfaceError("");
+  };
+  const lastTouchRef = useRef(0);
+  sleepingRef.current = sleeping;
+  surfaceTabRef.current = tab;
+  const touchSessionActivity = () => {
+    const now = Date.now();
+    if (
+      selected.sleep_state !== "asleep" &&
+      now - lastTouchRef.current < 60_000
+    )
+      return;
+    lastTouchRef.current = now;
+    void command("touch_session", { sessionId: selected.id }).catch(onError);
+  };
   const start = async (surface: string) => {
+    if (surfaceFailedRef.current) return;
+    if (startInFlightRef.current) {
+      retryAfterStartRef.current = true;
+      return;
+    }
+    const generation = surfaceGenerationRef.current;
+    let invalidated = false;
     try {
+      startInFlightRef.current = true;
       setBusy(true);
+      clearSurfaceFailure();
       const nextPort = await command<number>("start_surface", {
+        sessionId: selected.id,
         hostId: selected.host_id,
         surface,
         cols: 100,
@@ -2546,6 +2600,12 @@ function SurfaceView({
         cwd: selected.workspace || null,
         projectId: selected.project_id || null,
       });
+      if (generation !== surfaceGenerationRef.current) {
+        invalidated = true;
+        await command("stop_surface", { port: nextPort });
+        return;
+      }
+      portRef.current = nextPort;
       setPort(nextPort);
       if (surface === "vnc") {
         setVncPassword(
@@ -2555,15 +2615,88 @@ function SurfaceView({
         );
       }
     } catch (error) {
-      setSurfaceError(errorMessage(error));
+      markSurfaceFailed(errorMessage(error));
       onError(error);
     } finally {
+      startInFlightRef.current = false;
       setBusy(false);
+      const retryRequested = invalidated || retryAfterStartRef.current;
+      const shouldRetry = shouldRetrySurfaceStart({
+        invalidated: retryRequested,
+        port: portRef.current,
+        sleeping: sleepingRef.current,
+        tab: surfaceTabRef.current,
+        failed: surfaceFailedRef.current,
+      });
+      retryAfterStartRef.current = false;
+      if (shouldRetry) setSurfaceRetryToken((token) => token + 1);
     }
   };
   useEffect(() => {
+    const previousSleepState = selectedSleepStateRef.current;
+    selectedSleepStateRef.current = selected.sleep_state;
+    if (shouldResetSurfaceForSleep(previousSleepState, selected.sleep_state)) {
+      surfaceGenerationRef.current += 1;
+      const activePort = portRef.current;
+      portRef.current = null;
+      setPort(null);
+      if (activePort !== null)
+        void command("stop_surface", { port: activePort });
+      setSleeping(true);
+      clearSurfaceFailure();
+    } else if (!shouldShowSurfaceReconnect(selected.sleep_state) && sleeping) {
+      setSleeping(false);
+      clearSurfaceFailure();
+    }
+  }, [selected.sleep_state, sleeping]);
+  useEffect(() => {
+    let cancelled = false;
+    const subscription = listen<UiEvent>("opcos://event", (event) => {
+      if (cancelled || event.payload.kind !== "surface-ended") return;
+      const surfacePayload = event.payload.payload as {
+        port?: unknown;
+        reason?: unknown;
+      };
+      const eventPort = surfacePayload.port;
+      if (
+        !surfaceLifecycleEventMatches({
+          eventSessionId: event.payload.session_id,
+          eventPort,
+          currentSessionId: selected.id,
+          currentPort: portRef.current,
+        })
+      )
+        return;
+      portRef.current = null;
+      setPort(null);
+      setBusy(false);
+      markSurfaceFailed(
+        typeof surfacePayload.reason === "string"
+          ? surfacePayload.reason
+          : translate("surfaceUnavailable"),
+      );
+    });
+    return () => {
+      cancelled = true;
+      void subscription.then((unlisten) => unlisten());
+    };
+  }, [selected.id]);
+  useEffect(() => {
+    return () => {
+      surfaceGenerationRef.current += 1;
+      const activePort = portRef.current;
+      portRef.current = null;
+      if (activePort !== null) {
+        void command("stop_surface", { port: activePort });
+      }
+    };
+  }, [selected.id, tab]);
+  useEffect(() => {
+    portRef.current = null;
     setPort(null);
     setVncPassword(null);
+    surfaceFailedRef.current = false;
+    setSurfaceFailed(false);
     setSurfaceError("");
     setBrowserFrame(null);
     setIdeUrl("");
@@ -2571,10 +2704,15 @@ function SurfaceView({
     setDiff(null);
     setWorklog(null);
     setIdeError("");
+    setSleeping(shouldShowSurfaceReconnect(selected.sleep_state));
+    selectedSleepStateRef.current = selected.sleep_state;
   }, [selected.id]);
   useEffect(() => {
+    clearSurfaceFailure();
+  }, [tab]);
+  useEffect(() => {
     if (tab === "terminal" || tab === "desktop" || tab === "browser") {
-      if (!port) {
+      if (surfaceNeedsConnection(tab, port, sleeping, surfaceFailed)) {
         void start(
           tab === "terminal" ? "pty" : tab === "desktop" ? "vnc" : "cdp",
         );
@@ -2605,6 +2743,9 @@ function SurfaceView({
     port,
     ideUrl,
     ideError,
+    sleeping,
+    surfaceFailed,
+    surfaceRetryToken,
   ]);
   useEffect(() => {
     if (tab !== "browser") return;
@@ -2619,7 +2760,7 @@ function SurfaceView({
         }>("capture_remote_browser_frame", { sessionId: selected.id });
         if (!cancelled) {
           setBrowserFrame(frame);
-          setSurfaceError("");
+          if (!surfaceFailedRef.current) setSurfaceError("");
         }
       } catch (error) {
         if (!cancelled) setSurfaceError(errorMessage(error));
@@ -2666,7 +2807,10 @@ function SurfaceView({
       terminal.resize(cols, rows);
       send(JSON.stringify({ type: "resize", cols, rows }));
     };
-    const input = terminal.onData((data) => send(encoder.encode(data)));
+    const input = terminal.onData((data) => {
+      touchSessionActivity();
+      send(encoder.encode(data));
+    });
     terminal.onResize(({ cols, rows }) =>
       send(JSON.stringify({ type: "resize", cols, rows })),
     );
@@ -2679,7 +2823,7 @@ function SurfaceView({
       socket.close();
       terminal.dispose();
     };
-  }, [selected.id, port]);
+  }, [selected.id, port, sleeping]);
   useEffect(() => {
     if (tab !== "desktop" || !port || !vncHost.current) return;
     const rfb = new RFB(vncHost.current, `ws://127.0.0.1:${port}`, {
@@ -2714,11 +2858,39 @@ function SurfaceView({
             : "Remote VNC disconnected before the desktop loaded.",
         );
     });
-    return () => rfb.disconnect();
-  }, [selected.id, port, tab, vncPassword]);
+    const host = vncHost.current;
+    const onUserInput = () => touchSessionActivity();
+    host?.addEventListener("pointerdown", onUserInput);
+    host?.addEventListener("keydown", onUserInput);
+    host?.addEventListener("wheel", onUserInput, { passive: true });
+    return () => {
+      host?.removeEventListener("pointerdown", onUserInput);
+      host?.removeEventListener("keydown", onUserInput);
+      host?.removeEventListener("wheel", onUserInput);
+      rfb.disconnect();
+    };
+  }, [selected.id, port, tab, vncPassword, sleeping]);
+  const reconnect = () => {
+    setSleeping(false);
+    clearSurfaceFailure();
+    if (tab === "terminal" || tab === "desktop" || tab === "browser")
+      void start(
+        tab === "terminal" ? "pty" : tab === "desktop" ? "vnc" : "cdp",
+      );
+  };
+  const retrySurface = () => {
+    clearSurfaceFailure();
+    setSurfaceRetryToken((token) => token + 1);
+  };
   if (tab === "terminal" || tab === "desktop" || tab === "browser")
     return (
       <div className="surface-panel">
+        {shouldShowSurfaceReconnect(selected.sleep_state) && sleeping && (
+          <div className="surface-status warning">
+            <p>{translate("surfaceSleepingDescription")}</p>
+            <Button onClick={reconnect}>{translate("reconnectSurface")}</Button>
+          </div>
+        )}
         {busy && (
           <div className="surface-status muted">
             Connecting to the bound remote host…
@@ -2727,9 +2899,10 @@ function SurfaceView({
         {surfaceError && (
           <div className="surface-status error">{surfaceError}</div>
         )}
-        {!busy && !port && (
+        {shouldShowSurfaceRetry({ port, sleeping, failed: surfaceFailed }) && (
           <div className="surface-status warning">
-            Remote surface unavailable.
+            <p>{translate("surfaceUnavailable")}</p>
+            <Button onClick={retrySurface}>{translate("retrySurface")}</Button>
           </div>
         )}
         {tab === "terminal" && (
@@ -10624,7 +10797,8 @@ function SessionRightPanel({
   }> = [
     ...(capabilities.vnc?.state === "Unavailable" &&
     capabilities.computer_use?.state === "Unavailable" &&
-    panelTab !== "desktop"
+    panelTab !== "desktop" &&
+    !preserveSurfaceTabWhileSleeping(selected.sleep_state)
       ? []
       : [
           {
@@ -10633,11 +10807,15 @@ function SessionRightPanel({
             icon: "monitor" as const,
           },
         ]),
-    ...(capabilities.ide?.state === "Unavailable" && panelTab !== "ide"
+    ...(capabilities.ide?.state === "Unavailable" &&
+    panelTab !== "ide" &&
+    !preserveSurfaceTabWhileSleeping(selected.sleep_state)
       ? []
       : [{ id: "ide" as const, label: "Editor", icon: "code" as const }]),
     ...(selected.host_id === "local" ||
-    (capabilities.pty?.state === "Unavailable" && panelTab !== "terminal")
+    (capabilities.pty?.state === "Unavailable" &&
+      panelTab !== "terminal" &&
+      !preserveSurfaceTabWhileSleeping(selected.sleep_state))
       ? []
       : [
           {
@@ -10647,13 +10825,18 @@ function SessionRightPanel({
           },
         ]),
     ...(selected.host_id === "local" ||
-    (capabilities.browser?.state === "Unavailable" && panelTab !== "browser")
+    (capabilities.browser?.state === "Unavailable" &&
+      panelTab !== "browser" &&
+      !preserveSurfaceTabWhileSleeping(selected.sleep_state))
       ? []
       : [{ id: "browser" as const, label: "Browser", icon: "grid" as const }]),
   ];
   const tabs = [...informationTabs, ...workspaceTabs, ...remoteTabs];
-  const unavailableCapability =
-    panelTab === "browser" && capabilities.browser?.state === "Unavailable"
+  const unavailableCapability = preserveSurfaceTabWhileSleeping(
+    selected.sleep_state,
+  )
+    ? null
+    : panelTab === "browser" && capabilities.browser?.state === "Unavailable"
       ? capabilities.browser
       : panelTab === "desktop" &&
           capabilities.vnc?.state === "Unavailable" &&
@@ -10889,7 +11072,8 @@ function SessionRightPanel({
                   style={{ display: panelTab === item.id ? "flex" : "none" }}
                 >
                   {item.id === "browser" &&
-                  capabilities.browser?.state === "Unavailable" ? (
+                  capabilities.browser?.state === "Unavailable" &&
+                  !preserveSurfaceTabWhileSleeping(selected.sleep_state) ? (
                     <div className="rail-error">
                       {capabilities.browser.reason || "Capability unavailable."}
                     </div>
@@ -11297,12 +11481,21 @@ function AppContent() {
   const titleEditingRef = useRef(false);
   const previousRunningRef = useRef(false);
   const submittingSessionIdRef = useRef<string | undefined>(undefined);
+  const lastTouchedSessionRef = useRef<Record<string, number>>({});
   useEffect(() => {
     titleEditingRef.current = false;
     setEditingSessionTitle(false);
   }, [selected?.id]);
   useEffect(() => {
     selectedIdRef.current = selectedId ?? undefined;
+    if (selectedId) {
+      const now = Date.now();
+      const lastTouched = lastTouchedSessionRef.current[selectedId] ?? 0;
+      if (selected?.sleep_state === "asleep" || now - lastTouched >= 60_000) {
+        lastTouchedSessionRef.current[selectedId] = now;
+        void command("touch_session", { sessionId: selectedId });
+      }
+    }
   }, [selectedId]);
   const effectiveRunning = effectiveRunningState(
     pendingQuestion !== null,
@@ -11800,6 +11993,10 @@ function AppContent() {
         typeof payload.payload.secret_backend === "string"
       ) {
         setSecretBackend(payload.payload.secret_backend);
+      }
+      if (shouldRefreshForSessionLifecycleEvent(payload)) {
+        void refresh().catch(onError);
+        return;
       }
       if (payload.session_id && payload.session_id !== selectedIdRef.current)
         return;
@@ -12361,7 +12558,12 @@ function AppContent() {
           pinned: false,
           archived: session.archived ?? false,
           attention: 0,
-          liveness: selected?.id === session.id && running ? "working" : "idle",
+          liveness:
+            selected?.id === session.id && running
+              ? "working"
+              : session.sleep_state === "asleep"
+                ? "sleeping"
+                : "idle",
           stop_reason: session.stop_reason,
           project_id: session.project_id,
         }))}
@@ -12513,6 +12715,12 @@ function AppContent() {
                         selected.terminal_cause,
                       ),
                     ].join(" · ")}
+                    {selected.sleep_state === "asleep" && (
+                      <span className="text-xs text-faint">
+                        {" · "}
+                        {translate("sessionAsleep")}
+                      </span>
+                    )}
                   </span>
                 </div>
                 <div className="main-topbar-side main-topbar-actions">

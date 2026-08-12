@@ -23,6 +23,8 @@ export type Session = {
   archived?: boolean;
   project_id?: string | null;
   agent_id?: string | null;
+  sleep_state?: "awake" | "asleep" | string;
+  slept_at?: string | null;
 };
 
 export function normalizePermissionMode(mode: string): string {
@@ -110,6 +112,91 @@ export type TranscriptItem = {
 
 export type SurfaceTab =
   "chat" | "terminal" | "desktop" | "browser" | "ide" | "review" | "worklog";
+
+export function shouldRefreshForSessionLifecycleEvent(payload: {
+  kind: string;
+}): boolean {
+  return payload.kind === "session-sleep" || payload.kind === "session-wake";
+}
+
+export function shouldResetSurfaceForSleep(
+  previousSleepState: string | undefined,
+  nextSleepState: string | undefined,
+): boolean {
+  return previousSleepState !== "asleep" && nextSleepState === "asleep";
+}
+
+export function shouldShowSurfaceReconnect(
+  sleepState: string | undefined,
+): boolean {
+  return sleepState === "asleep";
+}
+
+export function surfaceNeedsConnection(
+  tab: SurfaceTab | "pr",
+  port: number | null,
+  sleeping: boolean,
+  failed = false,
+): boolean {
+  return (
+    (tab === "terminal" || tab === "desktop" || tab === "browser") &&
+    port === null &&
+    !sleeping &&
+    !failed
+  );
+}
+
+export function shouldRetrySurfaceStart({
+  invalidated,
+  port,
+  sleeping,
+  tab,
+  failed = false,
+}: {
+  invalidated: boolean;
+  port: number | null;
+  sleeping: boolean;
+  tab: SurfaceTab | "pr";
+  failed?: boolean;
+}): boolean {
+  return invalidated && surfaceNeedsConnection(tab, port, sleeping, failed);
+}
+
+export function shouldShowSurfaceRetry({
+  port,
+  sleeping,
+  failed,
+}: {
+  port: number | null;
+  sleeping: boolean;
+  failed: boolean;
+}): boolean {
+  return !sleeping && failed && port === null;
+}
+
+export function preserveSurfaceTabWhileSleeping(
+  sleepState: string | undefined,
+): boolean {
+  return sleepState === "asleep";
+}
+
+export function surfaceLifecycleEventMatches({
+  eventSessionId,
+  eventPort,
+  currentSessionId,
+  currentPort,
+}: {
+  eventSessionId?: string;
+  eventPort: unknown;
+  currentSessionId: string;
+  currentPort: number | null;
+}): boolean {
+  return (
+    eventSessionId === currentSessionId &&
+    typeof eventPort === "number" &&
+    eventPort === currentPort
+  );
+}
 
 export type PendingQuestionData = {
   callId: string;

@@ -594,6 +594,12 @@ where
 {
     fn drop(&mut self) {
         self.state.shutdown.notify_waiters();
+        let process = Arc::clone(&self.state.process);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = process.shutdown().await;
+            });
+        }
     }
 }
 
@@ -1533,6 +1539,9 @@ mod tests {
                 provider_finish_reason: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                last_active_at: Utc::now(),
+                sleep_state: "awake".into(),
+                slept_at: None,
                 project_id: None,
                 agent_id: None,
             })
@@ -1757,6 +1766,9 @@ for line in sys.stdin:
                 provider_finish_reason: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                last_active_at: Utc::now(),
+                sleep_state: "awake".into(),
+                slept_at: None,
                 project_id: None,
                 agent_id: None,
             })
@@ -2609,6 +2621,9 @@ for line in sys.stdin:
                 provider_finish_reason: None,
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                last_active_at: Utc::now(),
+                sleep_state: "awake".into(),
+                slept_at: None,
                 project_id: None,
                 agent_id: None,
             })

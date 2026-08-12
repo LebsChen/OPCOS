@@ -1490,3 +1490,105 @@ Unavailable; Editor is hidden when `ide` is Unavailable. All four keep their tab
 currently open, and show the backend `reason` text when the open pane's capability is unavailable.
 So: to test the "reason instead of blank" path, open the pane first, then drop the capability and
 force a re-probe by switching session away and back.
+
+## Testing real idle sleep (`OPCOS_IDLE_SLEEP_SECONDS`)
+
+- Launch with `DISPLAY=:0 OPCOS_IDLE_SLEEP_SECONDS=25 OPCOS_DEV_URL=http://127.0.0.1:1420 setsid
+  nohup ./target/debug/opcos &` — the threshold is read **once at process start** and the scan tick
+  is `clamp(threshold/4, 1s, 60s)`, so 20–30 s gives a ~6 s tick. Always use `setsid`: a plain
+  backgrounded `nohup` dies with the exec-tool shell and the window never appears.
+- `sqlite3` CLI is not installed on the box; read state with
+  `python3 -c "import sqlite3; ..."` on `/home/ubuntu/.config/com.opcos.desktop/opcos.db`.
+  Useful columns on `sessions`: `run_state`, `sleep_state`, `slept_at`, `last_active_at`.
+- Sleep candidates require `archived=0 AND run_state='idle' AND sleep_state='awake' AND
+  last_active_at < now-threshold`; `session_can_idle_sleep` additionally refuses when a turn is
+  active or any `pending` row is still `pending`. A session waiting on an approval card has
+  `run_state='idle'`, so that pending guard is the only thing keeping it awake — test it explicitly.
+- These refresh `last_active_at`: `submit_turn`, `steering`, `resolve_approval`, `start_surface`,
+  `ide_url`, `touch_session`/`wake_session`. Since the surface-activity fix, real user input in a
+  panel (xterm `onData`, VNC `pointerdown`/`keydown`/`wheel`) also calls `touch_session`, but it is
+  throttled to **once per 60 s per session**. Consequence for test design: with a 25 s threshold
+  typing can never keep a session awake (the throttle swallows the touches) — use
+  `OPCOS_IDLE_SLEEP_SECONDS=90` and type every ~35–40 s to prove the keep-alive, then stop typing
+  and expect sleep ~threshold later. Merely having a panel open with no input does **not** renew.
+- Verify sleep really released resources from the shell, not the UI: the relay listener disappears
+  from `ss -ltnp | grep opcos` and the fixture log prints `pty-ws close pid=…`. Baseline (no surface
+  open) on this box is 3 opcos listeners; one extra port per open surface.
+- Re-selecting a session calls `touch_session`, but the frontend throttles it to **once per 60 s per
+  session** (`lastTouchedSessionRef`). To test wake-by-reselect, wait >60 s after the last selection
+  of that session, otherwise the click is silently swallowed and the session stays asleep.
+- Sleep/wake lifecycle events arrive only on the single Tauri event `opcos://event` with a `kind`
+  field (`fn emit` in `src-tauri/src/main.rs`); `kind` is `session-sleep` / `session-wake`. Anything
+  that subscribes to `listen("session-sleep")` literally never fires — a past regression. The
+  dispatch must also run *before* the handler's `payload.session_id !== selectedId` early return,
+  otherwise a non-selected session's sidebar dot won't light up. Test both: watch the selected
+  session sleep with zero interaction (subtitle + dot must change within a tick), and keep another
+  session selected while a background session sleeps.
+- After the surface-lifecycle fix a slept panel shows an explicit notice + Reconnect button instead
+  of a stale frame: EN "This panel was disconnected because the session is asleep. Reconnect to wake
+  it." / "Reconnect", ZH "会话休眠后此面板已断开。点击重连以唤醒会话。" / "重连"
+  (`surfaceSleepingDescription` / `reconnectSurface`). Reconnect goes through normal `start_surface`,
+  which wakes the session; verify with a *new* port in `ss -ltnp`, a fresh `pty-ws open pid=…` in the
+  fixture log, `sleep_state='awake'` in sqlite, and a real command echoing in the terminal.
+- `touch_session` throttling is bypassed when the session is already `asleep`, so "switch away and
+  back" wakes reliably even inside the 60 s window.
+- Intermittent first-connect trap seen twice (dev *and* production `vite preview` builds): React
+  Strict Mode or a session/tab transition can invalidate or overlap the first `start_surface`
+  attempt. SurfaceView now self-heals one invalidated/overlapped attempt when the panel is still
+  mounted, awake, and has no port; a genuine `start_surface` error is not retried in a loop. If
+  the panel remains unavailable, it must show the translated "Retry"/"重试" action. Check
+  `ss -ltnp` + fixture log before blaming sleep code, and use that action to trigger a fresh
+  `start_surface`.
+- Denying an approval (or interrupting a turn) does not leave an orphan `pending` row: the session
+  still sleeps ~threshold later. If a session refuses to sleep, query
+  `select state from pending where session_id=… and state='pending'` first — an outstanding approval
+  is the usual, correct reason.
+- Fixture caveat: `/api/exec-sync` in the local fixture times out around 60 s, so a `sleep 60` probe
+  fails host-side. Use `sleep 45` or shorter when you need a long-running turn to hold a session
+  awake.
+
+## Surface start failures: what the UI can and cannot show
+
+`start_surface` (`src-tauri/src/main.rs`, `async fn start_surface`) binds a local `TcpListener` and
+spawns `relay_surface` **before ever contacting the host**, then returns `Ok(port)`. A later relay
+failure emits `surface-ended`; the frontend enters an explicit failed state, keeps the safe reason,
+and stops automatic reconnect attempts until the user presses Retry or otherwise changes context.
+The `shouldShowSurfaceRetry({port, sleeping, failed})` banner (i18n `surfaceUnavailable` /
+`retrySurface`) must remain stable and mutually exclusive with the sleep banner.
+
+- A genuinely unreachable/erroring host (connection refused, HTTP 503, session bound to a dead host)
+  does not make `start_surface` fail synchronously. The relay later emits `surface-ended`; verify
+  that the panel keeps the safe reason and stable Retry action instead of becoming a blank panel or
+  opening another connection automatically.
+- Ways to fake an unavailable host, cheapest first: point the session at a host whose URL is a dead
+  port (a `DeadHost` entry with `http://127.0.0.1:9` is already in the local DB), stop the fixture
+  (`kill` the `python3 agent.py` PID — `pkill -f fixture-agent/agent.py` does **not** match, the
+  cmdline is just `python3 agent.py`), or run a logging stub on :8899 that 503s everything and appends
+  each request to a log file so you can count attempts.
+- Retry-storm check: count host-side requests. Use an untouched window of at least 25 s:
+  `a=$(wc -l < /tmp/stub.log); sleep 25; …`, then compare the line count and inspect `ss -ltnp`
+  for relay churn. A fixed failed state must produce one startup attempt and zero additional
+  requests until the user presses Retry; if the count grows repeatedly or relay ports
+  appear/disappear every second, the retry storm has regressed.
+- If a failure loop is running fast, any "reason" banner it renders can flicker faster than a
+  screenshot can catch — treat "no visible reason/Retry across several seconds of screenshots" as the
+  user-visible truth, and back it up with request counts / port churn.
+- From `70339e8` on, the surface has an explicit **failed state**: a `surface-ended` event or a
+  `start_surface` error freezes the panel on the backend reason (e.g. `RVM websocket failed: HTTP
+  error: 503 Service Unavailable`, `... IO error: Connection refused (os error 111)`, `Remote surface
+  disconnected.`) plus the localized unavailable text + Retry, and auto-connect stops firing. Testing
+  notes: one Retry click = exactly one host attempt; the failed state is cleared by clicking
+  Retry/Reconnect, switching panel tab, switching session, or waking from sleep — so if you need the
+  failed state to persist for measurement, do not touch tabs or the session list while timing.
+- Watch out for the panel spontaneously reverting to a different surface tab (observed once flipping
+  Terminal → Browser during an untouched idle wait). The Browser/CDP surface polls frames
+  continuously, which keeps the session `awake` past the idle threshold and leaves an extra relay
+  listener behind until the panel is closed — so before timing an idle-sleep test, screenshot the
+  panel to confirm it is still on the tab you expect, and treat any unexplained "did not sleep" result
+  as possibly a Browser-tab artifact.
+- Sessions with `run_state='error'` are never slept, no matter how long they idle. Pick a session with
+  `run_state='idle'` for sleep tests, or you will wait forever and mis-report a sleep regression.
+- Right-rail surface icon positions shift depending on which panel is open and which capabilities the
+  host reports (local-host sessions have no Terminal/Desktop icon at all). Always `zoom` the rail
+  (region ~`[995, 25, 1024, 400]`) to locate the monitor (Desktop) and `>_` (Terminal) icons before
+  clicking; clicking the already-active icon toggles the panel closed.
