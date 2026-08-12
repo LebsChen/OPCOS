@@ -19,6 +19,82 @@ pub const TRANSIENT_SESSION_EVENT_TYPES: &[&str] =
     &["assistant_delta", "reasoning_delta", "tool_call_delta"];
 const ACTION_IN_FLIGHT_LEASE_SECONDS: i64 = 300;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionActivity {
+    Activity,
+    NotActivity,
+}
+
+pub fn classify_session_event_type(event_type: &str) -> Result<SessionActivity, StoreError> {
+    match event_type {
+        "user_message"
+        | "assistant_delta"
+        | "reasoning_delta"
+        | "tool_call_delta"
+        | "tool_result"
+        | "approval_pending"
+        | "approval_requested"
+        | "approval_resolved"
+        | "approval_allowed"
+        | "approval_denied"
+        | "ask_user_pending"
+        | "question_requested"
+        | "question_pending"
+        | "user_question_answered"
+        | "devin_message"
+        | "devin_thoughts"
+        | "one_line_thoughts"
+        | "agent_message"
+        | "computer_use"
+        | "context_growth_update"
+        | "iteration_checkpoint"
+        | "iteration_stats"
+        | "multi_edit_result"
+        | "operational_blocker"
+        | "provider_retrying"
+        | "provider_waiting"
+        | "provider_waiting_cleared"
+        | "recording_annotation"
+        | "recording_started"
+        | "recording_stopped"
+        | "recovery_required"
+        | "resuming_session"
+        | "shell_process_completed"
+        | "shell_process_started"
+        | "simple_activity_update"
+        | "steering_applied"
+        | "steering_received"
+        | "terminal_update"
+        | "todo_update"
+        | "tool_call_denied"
+        | "tool_script_approval_required"
+        | "tool_script_call_abandoned"
+        | "tool_script_call_completed"
+        | "plan_update"
+        | "tool_call_update"
+        | "error"
+        | "coordination_report" => Ok(SessionActivity::Activity),
+        "model_switch"
+        | "compaction_summary_invalid"
+        | "compacted"
+        | "provider_error"
+        | "provider_stream_timeout"
+        | "turn_interrupted"
+        | "interrupted"
+        | "usage_limit"
+        | "read_file_completed"
+        | "write_file_completed"
+        | "propose_plan_completed"
+        | "provider_silent" => Ok(SessionActivity::Activity),
+        "status_update" | "turn" | "turn_finished" | "stream_reset" | "session_snapshot" => {
+            Ok(SessionActivity::NotActivity)
+        }
+        _ => Err(StoreError::Validation(format!(
+            "unclassified session event type: {event_type}"
+        ))),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("sqlite error: {0}")]
@@ -2440,6 +2516,11 @@ impl SqliteStore {
             .ok_or_else(|| {
                 StoreError::Validation("session event created_at_ms is required".into())
             })?;
+        let event_type = event
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| StoreError::Validation("session event type is required".into()))?;
+        let activity = classify_session_event_type(event_type)?;
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let sequence: i64 = connection.query_row(
             "SELECT COALESCE(MAX(sequence), 0) + 1 FROM session_events WHERE session_id=?1",
@@ -2457,6 +2538,28 @@ impl SqliteStore {
                 sequence
             ],
         )?;
+        if activity == SessionActivity::Activity {
+            let at = DateTime::from_timestamp_millis(created_at_ms)
+                .ok_or_else(|| StoreError::Validation("invalid session event timestamp".into()))?;
+            let session_exists = connection
+                .query_row(
+                    "SELECT 1 FROM sessions WHERE session_id=?1",
+                    [session_id],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .is_some();
+            if session_exists {
+                connection.execute(
+                    "INSERT INTO session_activity(session_id,last_activity_at) VALUES (?1,?2)
+                     ON CONFLICT(session_id) DO UPDATE SET last_activity_at=
+                       CASE WHEN excluded.last_activity_at > session_activity.last_activity_at
+                            THEN excluded.last_activity_at
+                            ELSE session_activity.last_activity_at END",
+                    params![session_id, at.to_rfc3339()],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -4740,6 +4843,10 @@ impl SqliteStore {
                session_id TEXT PRIMARY KEY,
                unattended INTEGER NOT NULL DEFAULT 0,
                progressive_tool_disclosure INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS session_activity (
+               session_id TEXT PRIMARY KEY REFERENCES sessions(session_id) ON DELETE CASCADE,
+               last_activity_at TEXT NOT NULL
              );",
             )?;
             if !table_columns(&connection, "session_preferences")?
@@ -4751,6 +4858,12 @@ impl SqliteStore {
                     [],
                 )?;
             }
+            connection.execute(
+                "INSERT OR IGNORE INTO session_activity(session_id,last_activity_at)
+                 SELECT session_id, COALESCE(NULLIF(last_active_at,''), created_at)
+                 FROM sessions",
+                [],
+            )?;
             if !table_columns(&connection, "project_agents")?
                 .iter()
                 .any(|column| column == "template_id")
@@ -5573,7 +5686,8 @@ impl SqliteStore {
     }
 
     pub fn save_session(&self, session: &SessionRecord) -> Result<(), StoreError> {
-        self.connection.lock().expect("sqlite mutex poisoned").execute(
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection.execute(
             "INSERT OR REPLACE INTO sessions(session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,terminal_cause,provider_finish_reason,created_at,updated_at,last_active_at,sleep_state,slept_at,project_id,agent_id) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27)",
             params![
                 session.session_id,
@@ -5604,6 +5718,14 @@ impl SqliteStore {
                 session.project_id,
                 session.agent_id,
             ],
+        )?;
+        connection.execute(
+            "INSERT INTO session_activity(session_id,last_activity_at) VALUES (?1,?2)
+             ON CONFLICT(session_id) DO UPDATE SET last_activity_at=
+               CASE WHEN excluded.last_activity_at > session_activity.last_activity_at
+                    THEN excluded.last_activity_at
+                    ELSE session_activity.last_activity_at END",
+            params![session.session_id, session.last_active_at.to_rfc3339()],
         )?;
         Ok(())
     }
@@ -5637,18 +5759,40 @@ impl SqliteStore {
         session_id: &str,
         now: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        let changed = self
-            .connection
-            .lock()
-            .expect("sqlite mutex poisoned")
-            .execute(
-                "UPDATE sessions SET last_active_at=?1,updated_at=?1 WHERE session_id=?2",
-                params![now.to_rfc3339(), session_id],
-            )?;
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE sessions SET last_active_at=?1,updated_at=?1 WHERE session_id=?2",
+            params![now.to_rfc3339(), session_id],
+        )?;
         if changed == 0 {
             return Err(StoreError::SessionNotFound(session_id.into()));
         }
+        connection.execute(
+            "INSERT INTO session_activity(session_id,last_activity_at) VALUES (?1,?2)
+             ON CONFLICT(session_id) DO UPDATE SET last_activity_at=excluded.last_activity_at",
+            params![session_id, now.to_rfc3339()],
+        )?;
         Ok(())
+    }
+
+    pub fn session_last_activity(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<DateTime<Utc>>, StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        connection
+            .query_row(
+                "SELECT last_activity_at FROM session_activity WHERE session_id=?1",
+                [session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map(|value| {
+                value.parse().map_err(|error| {
+                    StoreError::Validation(format!("invalid session activity timestamp: {error}"))
+                })
+            })
+            .transpose()
     }
 
     pub fn set_session_sleep_state(
@@ -5668,15 +5812,64 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn mark_session_sleeping(
+        &self,
+        session_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE sessions
+             SET run_state='sleeping', stop_reason='idle_timeout',
+                 terminal_cause=NULL, provider_finish_reason=NULL,
+                 sleep_state='asleep', slept_at=?1, updated_at=?1
+             WHERE session_id=?2",
+            params![now.to_rfc3339(), session_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::SessionNotFound(session_id.into()));
+        }
+        Ok(())
+    }
+
+    pub fn mark_session_awake_idle(
+        &self,
+        session_id: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let connection = self.connection.lock().expect("sqlite mutex poisoned");
+        let changed = connection.execute(
+            "UPDATE sessions
+             SET run_state='idle', stop_reason='finished',
+                 terminal_cause=NULL, provider_finish_reason=NULL,
+                 sleep_state='awake', slept_at=NULL,
+                 last_active_at=?1, updated_at=?1
+             WHERE session_id=?2",
+            params![now.to_rfc3339(), session_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::SessionNotFound(session_id.into()));
+        }
+        connection.execute(
+            "INSERT INTO session_activity(session_id,last_activity_at) VALUES (?1,?2)
+             ON CONFLICT(session_id) DO UPDATE SET last_activity_at=excluded.last_activity_at",
+            params![session_id, now.to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
     pub fn list_idle_sleep_candidates(
         &self,
         before: DateTime<Utc>,
     ) -> Result<Vec<SessionRecord>, StoreError> {
         let connection = self.connection.lock().expect("sqlite mutex poisoned");
         let mut statement = connection.prepare(
-            "SELECT session_id,workspace,model,mode,harness,title,extra_roots,grants,pinned,archived,origin,origin_label,compaction,host_id,provider,external_session_id,run_state,stop_reason,terminal_cause,provider_finish_reason,created_at,updated_at,last_active_at,sleep_state,slept_at,project_id,agent_id
-             FROM sessions WHERE archived=0 AND run_state='idle' AND sleep_state='awake' AND last_active_at < ?1
-             ORDER BY last_active_at ASC",
+            "SELECT s.session_id,s.workspace,s.model,s.mode,s.harness,s.title,s.extra_roots,s.grants,s.pinned,s.archived,s.origin,s.origin_label,s.compaction,s.host_id,s.provider,s.external_session_id,s.run_state,s.stop_reason,s.terminal_cause,s.provider_finish_reason,s.created_at,s.updated_at,s.last_active_at,s.sleep_state,s.slept_at,s.project_id,s.agent_id
+             FROM sessions s
+             JOIN session_activity a ON a.session_id=s.session_id
+             WHERE s.archived=0 AND s.run_state='idle' AND s.sleep_state='awake'
+               AND a.last_activity_at < ?1
+             ORDER BY a.last_activity_at ASC",
         )?;
         let rows = statement.query_map([before.to_rfc3339()], session_from_row)?;
         rows.collect::<Result<Vec<_>, _>>()
@@ -7167,6 +7360,64 @@ mod tests {
         let loaded = store.load_session("sleep-state").unwrap().unwrap();
         assert_eq!(loaded.sleep_state, "awake");
         assert!(loaded.slept_at.is_none());
+    }
+
+    #[test]
+    fn session_event_activity_classification_is_explicit() {
+        assert_eq!(
+            classify_session_event_type("user_message").unwrap(),
+            SessionActivity::Activity
+        );
+        assert_eq!(
+            classify_session_event_type("turn_finished").unwrap(),
+            SessionActivity::NotActivity
+        );
+        assert!(classify_session_event_type("new_event_without_classification").is_err());
+    }
+
+    #[test]
+    fn session_activity_tracks_events_without_refreshing_status() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let session = test_session("activity-events");
+        store.save_session(&session).unwrap();
+        let old = Utc::now() - chrono::Duration::hours(2);
+        store
+            .touch_session_activity(&session.session_id, old)
+            .unwrap();
+        let now = Utc::now();
+        store
+            .append_session_event(
+                &session.session_id,
+                &serde_json::json!({
+                    "type": "turn_finished",
+                    "event_id": "finished",
+                    "created_at_ms": now.timestamp_millis(),
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .list_idle_sleep_candidates(Utc::now() - chrono::Duration::hours(1))
+                .unwrap()
+                .len(),
+            1
+        );
+        store
+            .append_session_event(
+                &session.session_id,
+                &serde_json::json!({
+                    "type": "user_message",
+                    "event_id": "message",
+                    "created_at_ms": now.timestamp_millis(),
+                }),
+            )
+            .unwrap();
+        assert!(
+            store
+                .list_idle_sleep_candidates(Utc::now() - chrono::Duration::hours(1))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

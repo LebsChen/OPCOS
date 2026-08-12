@@ -2599,6 +2599,7 @@ function SurfaceView({
   const surfaceUrlRef = useRef("");
   const surfaceGenerationRef = useRef(0);
   const [vncPassword, setVncPassword] = useState<string | null>(null);
+  const surfaceRuntimeIdRef = useRef<number | null>(null);
   const [surfaceError, setSurfaceError] = useState("");
   const [surfaceFailed, setSurfaceFailed] = useState(false);
   const surfaceFailedRef = useRef(false);
@@ -2609,6 +2610,7 @@ function SurfaceView({
     target_url: string;
   } | null>(null);
   const [ideUrl, setIdeUrl] = useState("");
+  const ideRuntimeIdRef = useRef<number | null>(null);
   const [review, setReview] = useState<Record<string, unknown> | null>(null);
   const [diff, setDiff] = useState<Record<string, unknown> | null>(null);
   const [worklog, setWorklog] = useState<Record<string, unknown> | null>(null);
@@ -2662,6 +2664,7 @@ function SurfaceView({
       const connection = await command<{
         url: string;
         vnc_password: string | null;
+        runtime_id: number;
       }>("surface_url", {
         sessionId: selected.id,
         hostId: selected.host_id,
@@ -2673,11 +2676,15 @@ function SurfaceView({
       });
       if (generation !== surfaceGenerationRef.current) {
         invalidated = true;
+        void command("release_surface_runtime", {
+          runtimeId: connection.runtime_id,
+        });
         surfaceUrlRef.current = "";
         setSurfaceUrl("");
         return;
       }
       surfaceUrlRef.current = connection.url;
+      surfaceRuntimeIdRef.current = connection.runtime_id;
       setSurfaceUrl(connection.url);
       setVncPassword(connection.vnc_password);
     } catch (error) {
@@ -2717,8 +2724,42 @@ function SurfaceView({
     return () => {
       surfaceGenerationRef.current += 1;
       surfaceUrlRef.current = "";
+      if (surfaceRuntimeIdRef.current !== null) {
+        void command("release_surface_runtime", {
+          runtimeId: surfaceRuntimeIdRef.current,
+        });
+        surfaceRuntimeIdRef.current = null;
+      }
+      if (ideRuntimeIdRef.current !== null) {
+        void command("release_ide_runtime", {
+          runtimeId: ideRuntimeIdRef.current,
+        });
+        ideRuntimeIdRef.current = null;
+      }
     };
   }, [selected.id, tab]);
+  useEffect(() => {
+    const runtimeId = surfaceRuntimeIdRef.current;
+    return () => {
+      if (runtimeId !== null) {
+        void command("release_surface_runtime", { runtimeId });
+        if (surfaceRuntimeIdRef.current === runtimeId) {
+          surfaceRuntimeIdRef.current = null;
+        }
+      }
+    };
+  }, [surfaceUrl, selected.id, tab]);
+  useEffect(() => {
+    const runtimeId = ideRuntimeIdRef.current;
+    return () => {
+      if (runtimeId !== null) {
+        void command("release_ide_runtime", { runtimeId });
+        if (ideRuntimeIdRef.current === runtimeId) {
+          ideRuntimeIdRef.current = null;
+        }
+      }
+    };
+  }, [ideUrl, selected.id, tab]);
   useEffect(() => {
     surfaceUrlRef.current = "";
     setSurfaceUrl("");
@@ -2757,11 +2798,14 @@ function SurfaceView({
         return;
       }
       setBusy(true);
-      void command<string>("ide_url", {
+      void command<{ url: string; runtime_id: number }>("ide_url", {
         sessionId: selected.id,
         folderUri: selected.workspace,
       })
-        .then(setIdeUrl)
+        .then((connection) => {
+          ideRuntimeIdRef.current = connection.runtime_id;
+          setIdeUrl(connection.url);
+        })
         .catch((error) => {
           setIdeError(errorMessage(error));
           onError(error);
