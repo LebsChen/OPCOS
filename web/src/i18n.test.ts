@@ -146,6 +146,8 @@ describe("i18n source coverage", () => {
       appSource.match(
         /const OPENWORKER_CONNECTORS:[\s\S]*?\n\];\n\nfunction relativeTime/,
       )?.[0] ?? "";
+    const categoryBlock =
+      composerSource.match(/const categories = \[[\s\S]*?\n  \];/)?.[0] ?? "";
     const toolVerbBlock =
       approvalSource.match(
         /const TOOL_VERBS[\s\S]*?=\s*\{([\s\S]*?)\};/,
@@ -157,6 +159,7 @@ describe("i18n source coverage", () => {
       ),
       ...toolVerbBlock.matchAll(/:\s*"([^"]+)"/g),
       ...connectorBlock.matchAll(/description:\s*"([^"]+)"/g),
+      ...categoryBlock.matchAll(/label:\s*"([^"]+)"/g),
     ].map((match) => match[1]);
     staticLabels.push("light", "dark", "auto");
     expect(staticLabels.filter((key) => !keys.has(key))).toEqual([]);
