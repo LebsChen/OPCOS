@@ -207,6 +207,22 @@ export const messages: Record<Locale, Record<string, string>> = {
     chooseHost: "Choose a bound host and create an OPCOS workspace.",
     workbenchError: "The workbench could not render this view.",
     customModel: "Custom model ID",
+    providerModelRequired: "Enter a model ID before saving provider settings.",
+    unknownProvider: "The provider is not configured.",
+    providerNameRequired: "Enter a provider name.",
+    providerBaseUrlRequired: "Enter a provider base URL.",
+    providerBaseUrlInvalid: "Enter a valid provider base URL.",
+    providerDialectUnsupported: "The provider dialect is unsupported.",
+    providerIdCollision:
+      "The custom provider ID conflicts with a built-in provider.",
+    providerAccountIdRequired: "Enter a provider account ID.",
+    providerAccountIdNotConfigured:
+      "The provider account ID is not configured.",
+    providerKeyEmpty: "Enter a provider key.",
+    providerBaseUrlNotConfigured:
+      "The provider base URL is not configured; enter one in Provider settings.",
+    providerModelDiscoveryUnsupported:
+      "Model discovery is unsupported for this provider.",
     recent: "Recent",
     noMatchingConversations: "No matching conversations.",
     showLess: "Show less",
@@ -1027,6 +1043,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     providerRequestFailed: "Provider request failed{status}",
     providerKeyNotConfigured:
       "Provider key is not configured; open Provider settings first.",
+    providerValidationFailed: "Provider validation failed: {error}",
     policyDenied: "Policy denied",
     contextExhausted: "Context exhausted",
     internalError: "Internal error",
@@ -1342,6 +1359,18 @@ export const messages: Record<Locale, Record<string, string>> = {
     chooseHost: "选择已绑定的主机并创建 OPCOS 工作区。",
     workbenchError: "工作台无法渲染此页面。",
     customModel: "自定义模型 ID",
+    providerModelRequired: "保存供应商设置前请输入模型 ID。",
+    unknownProvider: "未配置该供应商。",
+    providerNameRequired: "请输入供应商名称。",
+    providerBaseUrlRequired: "请输入供应商基址。",
+    providerBaseUrlInvalid: "请输入有效的供应商基址。",
+    providerDialectUnsupported: "不支持该供应商协议。",
+    providerIdCollision: "自定义供应商 ID 与内置供应商冲突。",
+    providerAccountIdRequired: "请输入供应商账户 ID。",
+    providerAccountIdNotConfigured: "未配置供应商账户 ID。",
+    providerKeyEmpty: "请输入供应商密钥。",
+    providerBaseUrlNotConfigured: "未配置供应商基址；请在供应商设置中输入。",
+    providerModelDiscoveryUnsupported: "该供应商不支持模型发现。",
     recent: "最近",
     noMatchingConversations: "没有匹配的会话。",
     showLess: "收起",
@@ -2135,6 +2164,7 @@ export const messages: Record<Locale, Record<string, string>> = {
     providerError: "模型服务错误",
     providerRequestFailed: "提供商请求失败{status}",
     providerKeyNotConfigured: "未配置提供商密钥；请先打开提供商设置。",
+    providerValidationFailed: "提供商校验失败：{error}",
     policyDenied: "策略拒绝",
     contextExhausted: "上下文已耗尽",
     internalError: "内部错误",
@@ -2326,8 +2356,22 @@ export function translateBackendValue(value: unknown): string {
 const backendErrorKeys: Record<string, string> = {
   "provider key is not configured; open provider settings first":
     "providerKeyNotConfigured",
+  "provider key is not configured": "providerKeyNotConfigured",
   "the local host does not provide remote mcp tools; bind a remote host.":
     "mcpToolsUnavailable",
+  "provider model id is required": "providerModelRequired",
+  "unknown provider": "unknownProvider",
+  "provider name is required": "providerNameRequired",
+  "provider base url is required": "providerBaseUrlRequired",
+  "provider base url is invalid": "providerBaseUrlInvalid",
+  "provider dialect is unsupported": "providerDialectUnsupported",
+  "custom provider id collides with a built-in provider": "providerIdCollision",
+  "provider account id is required": "providerAccountIdRequired",
+  "provider account id is not configured": "providerAccountIdNotConfigured",
+  "provider key is empty": "providerKeyEmpty",
+  "provider base url is not configured": "providerBaseUrlNotConfigured",
+  "provider model discovery is unsupported":
+    "providerModelDiscoveryUnsupported",
 };
 
 export function translateBackendError(value: unknown): string {

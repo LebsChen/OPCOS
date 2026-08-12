@@ -4184,12 +4184,28 @@ function ManageSections({
       .catch(onError);
   }, [tab, settingsProjectId, selected, onError]);
   useEffect(() => {
-    void command<
-      Array<{ provider: string; base_url?: string; configured: boolean }>
-    >("provider_configurations")
-      .then(setProviderConfigs)
-      .catch(onError);
+    void refreshProviderConfigurations();
   }, []);
+
+  const refreshProviderConfigurations = async () => {
+    const configs = await command<
+      Array<{
+        provider: string;
+        base_url?: string;
+        account_id?: string;
+        model?: string;
+        configured: boolean;
+      }>
+    >("provider_configurations");
+    setProviderConfigs(configs);
+    setProviderModels(
+      Object.fromEntries(
+        configs
+          .filter((config) => config.model)
+          .map((config) => [config.provider, config.model as string]),
+      ),
+    );
+  };
   useEffect(() => {
     if (!providers.length) return;
     void Promise.all(
@@ -5083,31 +5099,34 @@ function ManageSections({
                     )}
                     <label>
                       {translate("model")}
-                      <SelectMenu
+                      <input
+                        list={`provider-models-${descriptor.name}`}
                         value={
-                          providerModels[descriptor.name] ||
-                          descriptor.recommended_model ||
+                          providerModels[descriptor.name] ??
+                          descriptor.recommended_model ??
                           ""
                         }
-                        onChange={(value) =>
+                        onChange={(event) =>
                           setProviderModels((items) => ({
                             ...items,
-                            [descriptor.name]: value,
+                            [descriptor.name]: event.target.value,
                           }))
                         }
-                        options={(
-                          providerModelOptions[descriptor.name]?.models || []
-                        )
+                        placeholder={descriptor.recommended_model || ""}
+                      />
+                      <datalist id={`provider-models-${descriptor.name}`}>
+                        {(providerModelOptions[descriptor.name]?.models || [])
                           .filter(
                             (item) =>
                               showAllProviderModels[descriptor.name] ||
                               !item.likely_non_chat,
                           )
-                          .map((item) => ({
-                            value: item.id,
-                            label: `${item.label}${item.capabilities_known ? "" : ` (${translate("unknownCapabilities")})`}`,
-                          }))}
-                      />
+                          .map((item) => (
+                            <option key={item.id} value={item.id}>
+                              {item.label}
+                            </option>
+                          ))}
+                      </datalist>
                     </label>
                   </div>
                   {providerModelOptions[descriptor.name] && (
@@ -5156,12 +5175,29 @@ function ManageSections({
                   <div className="flex items-center gap-2 mt-4">
                     <Button
                       className="primary"
-                      onClick={() =>
-                        command("save_provider_settings", {
+                      onClick={() => {
+                        const enteredModel = providerModels[descriptor.name];
+                        if (
+                          enteredModel !== undefined &&
+                          !enteredModel.trim()
+                        ) {
+                          setProviderStatuses((items) => ({
+                            ...items,
+                            [descriptor.name]: translate(
+                              "providerModelRequired",
+                            ),
+                          }));
+                          return;
+                        }
+                        const model =
+                          enteredModel?.trim() ||
+                          descriptor.recommended_model ||
+                          null;
+                        void command("save_provider_settings", {
                           provider: descriptor.name,
                           baseUrl: currentUrl || null,
                           accountId: config?.account_id || null,
-                          model: providerModels[descriptor.name] || null,
+                          model,
                         })
                           .then(() =>
                             providerKeys[descriptor.name]
@@ -5199,10 +5235,13 @@ function ManageSections({
                           .catch((error) =>
                             setProviderStatuses((items) => ({
                               ...items,
-                              [descriptor.name]: `Provider validation failed: ${errorMessage(error)}`,
+                              [descriptor.name]: translate(
+                                "providerValidationFailed",
+                                { error: errorMessage(error) },
+                              ),
                             })),
-                          )
-                      }
+                          );
+                      }}
                     >
                       {translate("testSave")}
                     </Button>
@@ -5460,7 +5499,8 @@ function ManageSections({
                                 })
                               : undefined,
                           )
-                          .then(() => onRefresh());
+                          .then(() => onRefresh())
+                          .then(() => refreshProviderConfigurations());
                       })
                       .then(() => {
                         setCustomProviderKey("");

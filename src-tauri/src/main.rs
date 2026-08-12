@@ -18667,41 +18667,15 @@ async fn provider_models(
     provider_models_for_state(&state, provider, refresh, None).await
 }
 
-async fn current_session_provider(
-    state: &DesktopState,
-    session: &SessionRecord,
-) -> Result<String, String> {
-    if let Some(provider) = session.provider.clone() {
-        return Ok(provider);
-    }
-    let connection = state
-        .database
-        .lock()
-        .map_err(|_| "database lock poisoned")?;
-    connection
-        .query_row(
-            "SELECT value FROM settings WHERE key='provider.id'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .or_else(|_| Ok::<String, rusqlite::Error>("openai".into()))
-        .map_err(|error| error.to_string())
-}
-
 async fn validate_session_model(
-    state: &DesktopState,
-    session: &SessionRecord,
+    _state: &DesktopState,
+    _session: &SessionRecord,
     model: &str,
 ) -> Result<(), String> {
-    let provider = current_session_provider(state, session).await?;
-    let discovery = provider_models_for_state(state, provider.clone(), Some(false), None).await?;
-    if discovery.models.iter().any(|item| item.id == model) {
-        Ok(())
-    } else {
-        Err(format!(
-            "model {model} is not available for provider {provider}"
-        ))
+    if model.trim().is_empty() {
+        return Err("provider model id is required".to_owned());
     }
+    Ok(())
 }
 
 #[tauri::command]
@@ -28928,7 +28902,7 @@ fn save_provider_key(
     project_id: Option<String>,
 ) -> Result<(), String> {
     if key.trim().is_empty() {
-        return Err("provider key cannot be empty".into());
+        return Err("provider key is empty".into());
     }
     let secret_key_value = project_id
         .as_deref()
@@ -29068,13 +29042,19 @@ fn save_custom_provider(
     model: String,
 ) -> Result<String, String> {
     if !matches!(dialect.as_str(), "openai-compatible" | "cloudflare") {
-        return Err("unsupported provider dialect".to_owned());
+        return Err("provider dialect is unsupported".to_owned());
     }
     let name = name.trim();
     let base_url = base_url.trim();
     let model = model.trim();
-    if name.is_empty() || base_url.is_empty() || model.is_empty() {
-        return Err("provider name, base URL, and model are required".to_owned());
+    if name.is_empty() {
+        return Err("provider name is required".to_owned());
+    }
+    if base_url.is_empty() {
+        return Err("provider base URL is required".to_owned());
+    }
+    if model.is_empty() {
+        return Err("provider model id is required".to_owned());
     }
     url::Url::parse(base_url).map_err(|_| "provider base URL is invalid".to_owned())?;
     let provider_id = id.unwrap_or_else(|| format!("custom-{}", Uuid::new_v4().simple()));
@@ -29404,7 +29384,7 @@ fn save_provider_settings(
         Some(
             account_id
                 .filter(|v| !v.trim().is_empty())
-                .ok_or_else(|| "Cloudflare account ID is required".to_owned())?,
+                .ok_or_else(|| "provider account id is required".to_owned())?,
         )
     } else {
         None
@@ -29451,23 +29431,34 @@ fn save_provider_model_settings(
     provider: &str,
     model: Option<&str>,
 ) -> Result<(), String> {
-    let Some(model) = model.filter(|v| !v.trim().is_empty()) else {
+    let Some(model) = normalize_provider_model(model)? else {
         return Ok(());
     };
     connection
         .execute(
             "INSERT OR REPLACE INTO settings(key,value) VALUES ('provider.model',?1)",
-            [model],
+            [&model],
         )
         .map_err(|e| e.to_string())?;
     let scoped_key = format!("provider.model.{provider}");
     connection
         .execute(
             "INSERT OR REPLACE INTO settings(key,value) VALUES (?1,?2)",
-            [&scoped_key, model],
+            [&scoped_key, &model],
         )
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+fn normalize_provider_model(model: Option<&str>) -> Result<Option<String>, String> {
+    let Some(model) = model else {
+        return Ok(None);
+    };
+    let model = model.trim();
+    if model.is_empty() {
+        return Err("provider model id is required".to_owned());
+    }
+    Ok(Some(model.to_owned()))
 }
 
 fn provider_base_url(
@@ -29483,7 +29474,7 @@ fn provider_base_url(
         .filter(|v| !v.trim().is_empty())
         .or(default)
         .map(str::to_owned)
-        .ok_or_else(|| "provider base URL is not configured; enter one in Provider settings".into())
+        .ok_or_else(|| "provider base URL is not configured".into())
 }
 
 #[tauri::command]
@@ -29528,7 +29519,7 @@ async fn validate_provider_key(
                     [],
                     |row| row.get::<_, String>(0),
                 )
-                .map_err(|_| "Cloudflare account ID is not configured".to_owned())?,
+                .map_err(|_| "provider account id is not configured".to_owned())?,
         )
     } else {
         None
@@ -29541,7 +29532,7 @@ async fn validate_provider_key(
         configured_base_url.or(descriptor.default_base_url)
     };
     if provider == "vertex" {
-        return Err("model discovery is unsupported for Vertex AI".into());
+        return Err("provider model discovery is unsupported".into());
     }
     let region = if provider == "bedrock" {
         std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into())
@@ -30146,6 +30137,23 @@ fn main() {
 #[cfg(test)]
 mod m7_tests {
     use super::*;
+
+    #[test]
+    fn provider_model_ids_accept_custom_values_and_reject_blank_values() {
+        assert_eq!(
+            normalize_provider_model(Some(" deepseek-v4-flash ")).unwrap(),
+            Some("deepseek-v4-flash".to_owned())
+        );
+        assert_eq!(normalize_provider_model(None).unwrap(), None);
+        assert_eq!(
+            normalize_provider_model(Some("")).unwrap_err(),
+            "provider model id is required"
+        );
+        assert_eq!(
+            normalize_provider_model(Some("   ")).unwrap_err(),
+            "provider model id is required"
+        );
+    }
 
     #[test]
     fn computer_use_arguments_accept_flat_nested_and_report_missing_action() {

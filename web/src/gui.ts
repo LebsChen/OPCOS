@@ -1,5 +1,4 @@
 import { translate, translateBackendError } from "./i18n";
-
 export type Host = {
   id: string;
   name: string;
