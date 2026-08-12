@@ -3074,8 +3074,11 @@ has failed {} times and the last error code was {}",
         if let Some(identity) = self.limit_identity.lock().await.as_mut() {
             identity.2 = model.clone();
         }
-        self.notice("model_switch", format!("Switched to model {model}"))
-            .await
+        self.notice(
+            "model_switch",
+            structured_ui_message("model_switch", json!({"model": model})),
+        )
+        .await
     }
 
     pub async fn compact_now(&self) -> Result<(), EngineError> {
@@ -3225,8 +3228,11 @@ has failed {} times and the last error code was {}",
                 )
                 .await;
             if self.interrupted.load(Ordering::SeqCst) {
-                self.notice("interrupted", "Turn interrupted".into())
-                    .await?;
+                self.notice(
+                    "interrupted",
+                    structured_ui_message("turn_interrupted", json!({})),
+                )
+                .await?;
                 return Err(EngineError::Interrupted);
             }
             self.drain_steering(&mut messages, iteration + 1).await?;
@@ -3502,13 +3508,19 @@ has failed {} times and the last error code was {}",
                         .await?;
                     }
                     if self.interrupted.load(Ordering::SeqCst) {
-                        self.notice("interrupted", "Turn interrupted".into())
-                            .await?;
+                        self.notice(
+                            "interrupted",
+                            structured_ui_message("turn_interrupted", json!({})),
+                        )
+                        .await?;
                         return Err(EngineError::Interrupted);
                     }
                     self.notice(
                         "provider_error",
-                        format!("provider_request_failed: {error}"),
+                        structured_ui_message(
+                            "provider_request_failed",
+                            json!({"detail": error.to_string()}),
+                        ),
                     )
                     .await?;
                     if matches!(error, ProviderError::ContextOverflow { .. })
@@ -3680,7 +3692,10 @@ has failed {} times and the last error code was {}",
                             let _ = self.working_event(
                                 "provider_waiting_cleared",
                                 "status",
-                                json!({"message": "Provider response resumed"}),
+                                json!({"message": structured_ui_message(
+                                    "provider_waiting_cleared",
+                                    json!({}),
+                                )}),
                             ).await;
                         }
                         waiting_started = now;
@@ -3711,7 +3726,10 @@ has failed {} times and the last error code was {}",
                         let _ = self.working_event(
                             "provider_waiting_cleared",
                             "status",
-                            json!({"message": "Provider response resumed"}),
+                            json!({"message": structured_ui_message(
+                                "provider_waiting_cleared",
+                                json!({}),
+                            )}),
                         ).await;
                     }
                     waiting_started = now;
@@ -3761,11 +3779,13 @@ has failed {} times and the last error code was {}",
                     {
                         continue;
                     }
-                    let message = if first_chunk_received {
-                        format!("Waiting for provider stream ({elapsed}s)")
-                    } else {
-                        format!("Waiting for provider response ({elapsed}s)")
-                    };
+                    let message = structured_ui_message(
+                        "provider_waiting",
+                        json!({
+                            "elapsed": elapsed.to_string(),
+                            "phase": if first_chunk_received { "stream" } else { "response" },
+                        }),
+                    );
                     let _ = self.working_event(
                         "provider_waiting",
                         "status",
@@ -5985,6 +6005,16 @@ fn strip_internal_result_fields(value: &mut Value) {
     }
 }
 
+fn structured_ui_message(code: &str, params: Value) -> String {
+    if params.as_object().is_some_and(serde_json::Map::is_empty) {
+        return code.to_owned();
+    }
+    format!(
+        "{code} {}",
+        serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_owned())
+    )
+}
+
 fn thought_summary(message: &str) -> String {
     let first_line = message.lines().next().unwrap_or_default().trim();
     let mut summary = first_line.chars().take(120).collect::<String>();
@@ -7117,6 +7147,44 @@ struct PartialOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_flow_ui_messages_use_structured_codes() {
+        let messages = [
+            structured_ui_message("provider_request_failed", json!({"detail": "upstream"})),
+            structured_ui_message(
+                "provider_waiting",
+                json!({"elapsed": "25", "phase": "response"}),
+            ),
+            structured_ui_message("provider_waiting_cleared", json!({})),
+            structured_ui_message("turn_interrupted", json!({})),
+            structured_ui_message("model_switch", json!({"model": "custom-model"})),
+            structured_ui_message("approval_request_sent_to_inbox", json!({})),
+            structured_ui_message("approval_tool_action_requires", json!({})),
+            structured_ui_message("approval_required_before_tool_continue", json!({})),
+            structured_ui_message("coordination_worker_approval_required", json!({})),
+        ];
+        let codes = [
+            "provider_request_failed",
+            "provider_waiting",
+            "provider_waiting_cleared",
+            "turn_interrupted",
+            "model_switch",
+            "approval_request_sent_to_inbox",
+            "approval_tool_action_requires",
+            "approval_required_before_tool_continue",
+            "coordination_worker_approval_required",
+        ];
+        for (message, code) in messages.iter().zip(codes) {
+            assert!(
+                message == code || message.starts_with(&format!("{code} {{")),
+                "{message:?} does not start with structured code {code:?}"
+            );
+            assert!(!message.contains("Waiting for provider"));
+            assert!(!message.contains("Turn interrupted"));
+            assert!(!message.contains("Tool action requires approval"));
+        }
+    }
 
     #[test]
     fn connector_tools_are_all_catalogued() {

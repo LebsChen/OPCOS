@@ -5,6 +5,8 @@ import ts from "typescript";
 import {
   backendValueKeys,
   messages,
+  getLocale,
+  setLocale,
   translateBackendError,
   translateBackendValue,
 } from "./i18n";
@@ -53,6 +55,52 @@ const allowlist = [
     reason: "feed URL example",
   },
 ];
+
+describe("structured backend UI messages", () => {
+  it("translates the normal-flow codes with JSON parameters", () => {
+    const previousLocale = getLocale();
+    setLocale("zh");
+    try {
+      const messages = [
+        'provider_request_failed {"detail":"upstream overloaded"}',
+        'provider_waiting {"elapsed":"25","phase":"response"}',
+        "provider_waiting_cleared",
+        "turn_interrupted",
+        'model_switch {"model":"custom-model"}',
+        "approval_request_sent_to_inbox",
+        "approval_tool_action_requires",
+        "approval_required_before_tool_continue",
+        "question_requires_answer_before_tool_continue",
+        "question_delivered_to_inbox",
+        "plan_confirmation_delivered_to_inbox",
+        "coordination_worker_approval_required",
+      ];
+      for (const value of messages) {
+        const translated = translateBackendError(value);
+        expect(translated).not.toBe(value);
+        expect(translated).not.toContain(value.split(" ")[0]);
+      }
+      expect(
+        translateBackendError(
+          'provider_request_failed {"detail":"upstream overloaded"}',
+        ),
+      ).toContain("提供商请求失败");
+      expect(
+        translateBackendError(
+          'provider_waiting {"elapsed":"25","phase":"response"}',
+        ),
+      ).toContain("25 秒");
+      expect(
+        translateBackendError('future_backend_code {"detail":"raw"}'),
+      ).toBe('future_backend_code {"detail":"raw"}');
+      for (const text of ["open", "command", "error"]) {
+        expect(translateBackendError(text)).toBe(text);
+      }
+    } finally {
+      setLocale(previousLocale);
+    }
+  });
+});
 const zhEnglishKeyAllowlist = new Set([
   "english",
   "mcp",
@@ -415,42 +463,49 @@ describe("i18n source coverage", () => {
   });
 
   it("translates every provider save and validation error returned to the UI", () => {
-    const backendSource = readFileSync(
-      `${sourceRoot}../../src-tauri/src/main.rs`,
-      "utf8",
-    );
-    const providerSource = [
-      backendSource.slice(
-        backendSource.indexOf("fn provider_descriptor_for"),
-        backendSource.indexOf("fn save_provider_key"),
-      ),
-      backendSource.slice(
-        backendSource.indexOf("fn save_provider_key"),
-        backendSource.indexOf("fn agent_settings"),
-      ),
-      backendSource.slice(
-        backendSource.indexOf("fn save_provider_settings"),
-        backendSource.indexOf("fn main"),
-      ),
-    ].join("\n");
-    const providerErrors = [
-      "provider key is empty",
-      "unknown provider",
-      "provider dialect is unsupported",
-      "provider name is required",
-      "provider base URL is required",
-      "provider model id is required",
-      "provider base URL is invalid",
-      "custom provider id collides with a built-in provider",
-      "provider account id is required",
-      "provider account id is not configured",
-      "provider key is not configured",
-      "provider base URL is not configured",
-      "provider model discovery is unsupported",
-    ];
-    for (const error of providerErrors) {
-      expect(providerSource).toContain(error);
-      expect(translateBackendError(error)).not.toBe(error);
+    const previousLocale = getLocale();
+    setLocale("zh");
+    try {
+      const backendSource = readFileSync(
+        `${sourceRoot}../../src-tauri/src/main.rs`,
+        "utf8",
+      );
+      const providerSource = [
+        backendSource.slice(
+          backendSource.indexOf("fn provider_descriptor_for"),
+          backendSource.indexOf("fn save_provider_key"),
+        ),
+        backendSource.slice(
+          backendSource.indexOf("fn save_provider_key"),
+          backendSource.indexOf("fn agent_settings"),
+        ),
+        backendSource.slice(
+          backendSource.indexOf("fn save_provider_settings"),
+          backendSource.indexOf("fn main"),
+        ),
+      ].join("\n");
+      const providerErrors = [
+        "provider key is empty",
+        "unknown provider",
+        "provider dialect is unsupported",
+        "provider name is required",
+        "provider base URL is required",
+        "provider model id is required",
+        "provider base URL is invalid",
+        "custom provider id collides with a built-in provider",
+        "provider account id is required",
+        "provider account id is not configured",
+        "provider key is not configured",
+        "provider base URL is not configured",
+        "provider model discovery is unsupported",
+      ];
+      for (const error of providerErrors) {
+        expect(providerSource).toContain(error);
+        expect(translateBackendError(error)).not.toBe(error);
+        expect(translateBackendError(error)).toMatch(/[\u4e00-\u9fff]/);
+      }
+    } finally {
+      setLocale(previousLocale);
     }
   });
 
@@ -623,6 +678,17 @@ describe("i18n source coverage", () => {
     );
   });
 
+  it("matches approval-flow suppression by backend code, not translated copy", () => {
+    const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
+    expect(appSource).toContain("isApprovalFlowError(reason)");
+    expect(appSource).not.toContain(
+      'message.includes(translate("approvalRequiredBeforeToolContinue"))',
+    );
+    expect(appSource).not.toContain(
+      'message.includes(translate("questionRequiresAnswerBeforeToolContinue"))',
+    );
+  });
+
   it("formats insight durations with their millisecond unit", () => {
     const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
     expect(appSource).toMatch(
@@ -654,14 +720,14 @@ describe("i18n source coverage", () => {
     );
     expect(appSource).toContain("providerErrorPresentation");
     expect(appSource).toContain("errorMessage(reason)");
-    expect(engineSource).toContain(
-      'format!("provider_request_failed: {error}")',
-    );
+    expect(engineSource).toContain('"provider_request_failed"');
     expect(backendSources).not.toMatch(
       /format!\(\s*"Provider request failed(?::|\\s)/,
     );
     expect(
-      translateBackendError("provider_request_failed: upstream down"),
+      translateBackendError(
+        'provider_request_failed {"detail":"upstream down"}',
+      ),
     ).toBe("Provider request failed: upstream down");
     expect(appSource).toMatch(
       /options=\{\["active", "sleep", "paused"\]\.map\(\(value\) => \(\{\s*value,\s*label: translateBackendValue\(value\)/s,
@@ -685,9 +751,7 @@ describe("i18n source coverage", () => {
     // before toast or transcript rendering so the detail stays raw but the
     // visible prefix is translated.
     expect(engineSource).toContain('#[error("provider: {0}")]');
-    expect(tauriSource).toContain(
-      'EngineError::Provider(provider) => format!("provider_request_failed: {provider}")',
-    );
+    expect(tauriSource).toContain('"provider_request_failed"');
     expect(tauriSource).toContain("fn engine_error_message");
   });
 

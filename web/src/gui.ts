@@ -387,6 +387,24 @@ export function submitFailureMessage(error: unknown): string {
     : message;
 }
 
+export function isApprovalFlowError(error: unknown): boolean {
+  const message =
+    typeof error === "string"
+      ? error
+      : error instanceof Error
+        ? error.message
+        : error &&
+            typeof error === "object" &&
+            "message" in error &&
+            typeof error.message === "string"
+          ? error.message
+          : "";
+  return [
+    "approval_required_before_tool_continue",
+    "question_requires_answer_before_tool_continue",
+  ].some((code) => message === code || message.startsWith(`${code} `));
+}
+
 export function errorMessage(error: unknown): string {
   if (error instanceof Error && error.message.trim())
     return translateBackendError(error.message);

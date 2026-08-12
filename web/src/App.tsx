@@ -24,6 +24,7 @@ import {
   projectAgentRosterRows,
   SurfaceTab,
   hostFailureMessage,
+  isApprovalFlowError,
   hostStatusLabel,
   errorMessage,
   effectiveRunningState,
@@ -12056,14 +12057,8 @@ function AppContent() {
   const showErrorToast = (reason: unknown) => {
     const runtime = (window as Window & { __TAURI_INTERNALS__?: unknown })
       .__TAURI_INTERNALS__;
+    if (isApprovalFlowError(reason)) return;
     const message = errorMessage(reason);
-    if (
-      message.includes("Approval required before this tool can continue") ||
-      message.includes(
-        "Question requires an answer before this tool can continue",
-      )
-    )
-      return;
     if (!runtime && /invoke|tauri/i.test(message)) return;
     const providerLike =
       /provider|HTTP\s+\d{3}|bad_response|overloaded|request failed/i.test(
@@ -13201,7 +13196,7 @@ function AppContent() {
                           callId: pendingApproval.callId,
                           name: pendingApproval.name,
                           args: pendingApproval.args,
-                          reason: "Tool action requires approval",
+                          reason: translate("approvalToolActionRequires"),
                         }}
                         hostName={selected.host_name}
                         onApprove={(decision, optionId) => {
