@@ -1,5 +1,6 @@
 import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { translate } from "../i18n";
 import { Icon } from "./Icon";
 
 // §34 (UX-016): the agent ends a deliverable turn with plain markdown —
@@ -30,7 +31,7 @@ function ArtifactChip({ path, title }: { path: string; title: string }) {
         <b>{title || file}</b>
         {title && title !== file && <span>{file}</span>}
       </span>
-      <span className="art-chip-open">Open ›</span>
+      <span className="art-chip-open">{translate("artifactOpen")} ›</span>
     </button>
   );
 }

@@ -121,6 +121,35 @@ const messages: Record<Locale, Record<string, string>> = {
     noConversations: "No conversations yet.",
     showLess: "Show less",
     showMore: "Show more",
+    artifactOpen: "Open",
+    actsOnConnectedService: "acts on a connected service",
+    leavesRemoteHost: "leaves the remote host → {destination}",
+    connectedChat: "a connected chat",
+    runsOnHost: "runs on {host}",
+    boundHost: "the bound host",
+    overwritesExistingFile: "overwrites the existing file",
+    showAllLines: "show all {count} lines",
+    showFullMessage: "show the full message",
+    preview: "preview",
+    allow: "Allow",
+    deny: "Deny",
+    withMessage: "With the message",
+    file: "file",
+    asPngScreenshot: "as a PNG screenshot",
+    alwaysAllowedOnceApproved: "always allowed once you approve",
+    readOnly: "read-only",
+    writeFileVerb: "Write a file",
+    editFileVerb: "Edit a file",
+    applyPatchVerb: "Apply a patch",
+    runCommandVerb: "Run a command",
+    sendMessageVerb: "Send a message",
+    sendFileVerb: "Send a file",
+    alwaysAllowed: "always allowed once you approve",
+    approved: "Approved",
+    declined: "Declined",
+    allowOnce: "Allow once",
+    searchChats: "Search chats",
+    noChatsFound: "No chats found.",
   },
   zh: {
     general: "通用",
@@ -235,6 +264,35 @@ const messages: Record<Locale, Record<string, string>> = {
     noConversations: "暂无会话。",
     showLess: "收起",
     showMore: "显示更多",
+    artifactOpen: "打开",
+    actsOnConnectedService: "作用于已连接的服务",
+    leavesRemoteHost: "离开远程主机 → {destination}",
+    connectedChat: "已连接的聊天",
+    runsOnHost: "在 {host} 上运行",
+    boundHost: "已绑定的主机",
+    overwritesExistingFile: "覆盖现有文件",
+    showAllLines: "显示全部 {count} 行",
+    showFullMessage: "显示完整消息",
+    preview: "预览",
+    allow: "允许",
+    deny: "拒绝",
+    withMessage: "附带消息",
+    file: "文件",
+    asPngScreenshot: "作为 PNG 截图",
+    alwaysAllowedOnceApproved: "批准后始终允许",
+    readOnly: "只读",
+    writeFileVerb: "写入文件",
+    editFileVerb: "编辑文件",
+    applyPatchVerb: "应用补丁",
+    runCommandVerb: "运行命令",
+    sendMessageVerb: "发送消息",
+    sendFileVerb: "发送文件",
+    alwaysAllowed: "批准后始终允许",
+    approved: "已批准",
+    declined: "已拒绝",
+    allowOnce: "仅允许一次",
+    searchChats: "搜索聊天",
+    noChatsFound: "没有找到聊天记录。",
   },
 };
 
@@ -254,19 +312,26 @@ export function subscribeLocale(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
-export function translate(key: string): string {
+export function translate(
+  key: string,
+  params?: Record<string, string | number>,
+): string {
   const normalized = key
     .trim()
     .replace(/[^A-Za-z0-9]+(.)/g, (_, character: string) =>
       character.toUpperCase(),
     );
-  return (
+  const message =
     messages[locale][key] ||
     messages[locale][normalized] ||
     messages.en[key] ||
     messages.en[normalized] ||
-    key
-  );
+    key;
+  return params
+    ? message.replace(/\{(\w+)\}/g, (_, name: string) =>
+        String(params[name] ?? `{${name}}`),
+      )
+    : message;
 }
 
 setLocale(locale);
