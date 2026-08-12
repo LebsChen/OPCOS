@@ -6537,7 +6537,9 @@ function ManageSections({
                     </>
                   }
                   empty={
-                    kind === "agents" ? "暂无规则。" : `No ${label} assets yet.`
+                    kind === "agents"
+                      ? translate("noRules")
+                      : translate("noAssetsForLabel", { label })
                   }
                 />
               ))}
@@ -6715,15 +6717,15 @@ function ManageSections({
                   >
                     {assetTabKind === "agents"
                       ? editingAssetId
-                        ? "保存更改"
-                        : "创建规则"
+                        ? translate("saveChanges")
+                        : translate("createRule")
                       : assetTabKind === "instructions"
                         ? editingAssetId
-                          ? "保存更改"
-                          : "保存全局指令"
+                          ? translate("saveChanges")
+                          : translate("saveGlobalInstructions")
                         : editingAssetId
-                          ? "Save changes"
-                          : "Create asset"}
+                          ? translate("saveChanges")
+                          : translate("createAsset")}
                   </Button>
                 </div>
               </div>
@@ -13341,7 +13343,7 @@ function AppContent() {
                       value={homeModel}
                       onChange={(event) => setHomeModel(event.target.value)}
                     >
-                      <option value="auto">Auto</option>
+                      <option value="auto">{translate("auto")}</option>
                       {models
                         .filter(
                           (model) =>
@@ -13360,7 +13362,9 @@ function AppContent() {
                         type="button"
                         onClick={() => setShowAllHomeModels((value) => !value)}
                       >
-                        {showAllHomeModels ? "收起非对话" : "显示全部模型"}
+                        {showAllHomeModels
+                          ? translate("collapseNonChatHome")
+                          : translate("showAllModels")}
                       </button>
                     )}
                     <select
