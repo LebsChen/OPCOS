@@ -5214,9 +5214,9 @@ function ManageSections({
           <div className="divide-y divide-line">
             <div className="settings-row">
               <div>
-                <strong>{translate("Provider")}</strong>
+                <strong>{translate("provider")}</strong>
                 <small>
-                  {translate("Choose the model provider for new sessions.")}
+                  {translate("providerDescription")}
                 </small>
               </div>
               <SelectMenu
@@ -5232,9 +5232,9 @@ function ManageSections({
             </div>
             <div className="settings-row">
               <div>
-                <strong>{translate("Base URL")}</strong>
+                <strong>{translate("baseUrl")}</strong>
                 <small>
-                  {translate("Optional provider-compatible endpoint.")}
+                  {translate("optionalProviderEndpoint")}
                 </small>
               </div>
               <input
@@ -5245,9 +5245,9 @@ function ManageSections({
             </div>
             <div className="settings-row">
               <div>
-                <strong>{translate("Provider key")}</strong>
+                <strong>{translate("providerKey")}</strong>
                 <small>
-                  {translate("Stored securely and never returned to the UI.")}
+                  {translate("secureProviderKeyNotice")}
                 </small>
               </div>
               <input
@@ -5347,8 +5347,10 @@ function ManageSections({
                       setCustomProviderDialect(event.target.value)
                     }
                   >
-                    <option value="openai-compatible">OpenAI-compatible</option>
-                    <option value="cloudflare">Cloudflare</option>
+                    <option value="openai-compatible">
+                      {translate("openaiCompatible")}
+                    </option>
+                    <option value="cloudflare">{translate("cloudflare")}</option>
                   </select>
                 </label>
                 <label>
@@ -5493,7 +5495,9 @@ function ManageSections({
                       }}
                       description={
                         host.online === false ? (
-                          <span className="status-offline">Offline</span>
+                          <span className="status-offline">
+                            {translate("offline")}
+                          </span>
                         ) : undefined
                       }
                       actions={
@@ -5581,7 +5585,7 @@ function ManageSections({
                   <input
                     value={vncPassword}
                     onChange={(event) => setVncPassword(event.target.value)}
-                    placeholder="Optional VNC password"
+                      placeholder={translate("optionalVncPassword")}
                     type="password"
                   />
                   <Button type="submit" className="primary">
