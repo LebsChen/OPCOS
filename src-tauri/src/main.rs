@@ -34376,6 +34376,7 @@ agents:
                 .count(),
             1
         );
+        assert!(store.load_tool_calls("acp-lifecycle").unwrap().is_empty());
         assert_eq!(event["type"], "user_message");
         assert_eq!(event["working_event"]["payload"]["message"], "hello");
     }
