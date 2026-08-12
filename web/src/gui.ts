@@ -81,7 +81,7 @@ export type ProjectAgentRosterRow = {
 export function projectAgentRosterValue(
   value: string | null | undefined,
 ): string {
-  return value?.trim() || "Unknown";
+  return value?.trim() || "";
 }
 
 export function projectAgentRosterHost(session: Session | null): string {

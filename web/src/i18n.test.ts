@@ -122,8 +122,6 @@ const zhEnglishWordAllowlist = new Set([
   "Secret",
   "Persona",
   "Playbook",
-  "Skill",
-  "Devin",
   "OPCOS",
   "RVM",
   "DevBox",
@@ -151,16 +149,12 @@ const zhEnglishWordAllowlist = new Set([
   "PR",
   "English",
   "Bearer",
-  "OpenCode",
-  "opencode",
   "Harness",
-  "schema",
   "Rust",
   "Cloudflare",
   "Streamable",
   "server",
   "Account",
-  "working_event",
   "KEY",
   "VALUE",
   "task",
@@ -170,8 +164,6 @@ const zhEnglishWordAllowlist = new Set([
   "Box",
   "Drive",
   "Cloud",
-  "webhook",
-  "SecretStore",
 ]);
 
 describe("i18n source coverage", () => {
@@ -298,15 +290,52 @@ describe("i18n source coverage", () => {
       /translateBackendValue\(\s*server\.status\s*\|\|\s*"configured"\s*,?\s*\)/,
     );
     expect(appSource).toMatch(/translateBackendValue\(workflow\.status\)/);
-    expect(appSource).toMatch(
-      /projectAgentRosterHost\(session\) === "Unknown"[\s\S]*translate\("unknownValue"\)/,
-    );
     expect(appSource).toMatch(/insightFieldLabel\(key\)/);
     expect(appSource).not.toMatch(
       /translateBackendValue\(\s*projectAgentRosterHost/,
     );
     expect(appSource).not.toMatch(
-      /translateBackendValue\(\s*(?:selected\.)?(?:host_name|workspace|model|name|branch|worktree)/,
+      /translateBackendValue\(\s*(?:selected\.)?(?:host_name|workspace|model|name|branch|worktree|worktree_path)/,
+    );
+  });
+
+  it("covers every backend-produced session insight field", () => {
+    const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
+    const backendSource = readFileSync(
+      `${sourceRoot}../../src-tauri/src/main.rs`,
+      "utf8",
+    );
+    const insightObject = appSource.match(
+      /const insightFieldKeys:[\s\S]*?=\s*\{([\s\S]*?)\n\};/,
+    );
+    expect(insightObject).not.toBeNull();
+    const mappedFields = new Set(
+      [...(insightObject?.[1] ?? "").matchAll(/^\s+([a-z_]+):/gm)].map(
+        (match) => match[1],
+      ),
+    );
+    const insightsFunction = backendSource.match(
+      /fn session_insights[\s\S]*?Ok\(json!\(\{([\s\S]*?)\}\)\)/,
+    );
+    expect(insightsFunction).not.toBeNull();
+    const expectedFields = new Set([
+      "message_count",
+      "tool_calls",
+      "approval_count",
+      "token_usage",
+      "duration_ms",
+    ]);
+    const backendFields = new Set(
+      [...expectedFields].filter((field) =>
+        insightsFunction?.[1]?.includes(`"${field}"`),
+      ),
+    );
+    expect(backendFields).toEqual(expectedFields);
+    expect([...expectedFields].filter((key) => !mappedFields.has(key))).toEqual(
+      [],
+    );
+    expect(appSource).toMatch(
+      /return translationKey \? translate\(translationKey\) : key;/,
     );
   });
 

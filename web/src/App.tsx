@@ -9992,7 +9992,7 @@ const insightFieldKeys: Record<string, string> = {
 
 function insightFieldLabel(key: string): string {
   const translationKey = insightFieldKeys[key];
-  return translationKey ? translate(translationKey) : translate("unknownValue");
+  return translationKey ? translate(translationKey) : key;
 }
 
 function StandaloneInsights({
@@ -10808,7 +10808,10 @@ function AgentRosterPane({
               return (
                 <div className="rail-event-card" key={agent.id}>
                   <div className="rail-event-head">
-                    <strong>{projectAgentRosterValue(agent.name)}</strong>
+                    <strong>
+                      {projectAgentRosterValue(agent.name) ||
+                        translate("unknownValue")}
+                    </strong>
                     <span className="rail-muted">
                       {translateBackendValue(agent.state)}
                     </span>
@@ -10821,21 +10824,22 @@ function AgentRosterPane({
                     <div>
                       <dt>{translate("hostLabel")}</dt>
                       <dd>
-                        {projectAgentRosterHost(session) === "Unknown"
-                          ? translate("unknownValue")
-                          : projectAgentRosterHost(session)}
+                        {projectAgentRosterHost(session) ||
+                          translate("unknownValue")}
                       </dd>
                     </div>
                     <div>
                       <dt>{translate("branchLabel")}</dt>
                       <dd title={agent.branch}>
-                        {projectAgentRosterValue(agent.branch)}
+                        {projectAgentRosterValue(agent.branch) ||
+                          translate("unknownValue")}
                       </dd>
                     </div>
                     <div>
                       <dt>{translate("worktreeLabel")}</dt>
                       <dd title={agent.worktree_path}>
-                        {projectAgentRosterValue(agent.worktree_path)}
+                        {projectAgentRosterValue(agent.worktree_path) ||
+                          translate("unknownValue")}
                       </dd>
                     </div>
                     <div>
