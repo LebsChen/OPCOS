@@ -76,7 +76,7 @@
 
 ### 2.3 缺有状态的外部世界交互 —— 电商场景的硬门槛
 
-浏览器现在的形态主要是 **surface relay**：暴露 VNC / CDP 通道（`WsKind::{Pty,Vnc,Cdp}`），`connector_browser_check` 也只是探测 host 是否暴露了 browser 能力；尚未看到更高层的确定性浏览器业务原语。
+浏览器现在的形态主要是 **远端 surface WebSocket 直连 / 截图轮询**：远端暴露 VNC / CDP 通道（`WsKind::{Pty,Vnc,Cdp}`），Terminal/Desktop webview 直连其 surface URL，Browser 保留 `capture_remote_browser_frame` 截图轮询；`connector_browser_check` 也只是探测 host 是否暴露了 browser 能力，尚未看到更高层的确定性浏览器业务原语。
 
 RVM 的 Host 能力适配器确实在 `crates/opcos-hosts/src/lib.rs:1171-1215` 的 `remote_capabilities` 已知名称列表中包含 `vnc`、`cdp`、`browser`、`computer_use` 和 `screenshot`。但这里的语义必须区分清楚：这些是 OPCOS 能识别的能力名，`available` 只有在远端 RVM 的 `RvmCapabilities.available` 声明对应名称时才为 true；它不是 OPCOS 已经验证了截图、定位、点击和校验动作链。LocalHost 反而在 `crates/opcos-hosts/src/lib.rs:501-518` 明确把 `computer_use`、`screenshot` 和 `vnc` 标为不可用。
 

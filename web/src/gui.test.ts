@@ -23,7 +23,6 @@ import {
   shouldShowSurfaceReconnect,
   shouldShowSurfaceRetry,
   preserveSurfaceTabWhileSleeping,
-  surfaceLifecycleEventMatches,
   surfaceNeedsConnection,
   updateSessionRunState,
   projectAgentRosterHost,
@@ -50,14 +49,17 @@ describe("GUI boundary behavior", () => {
     expect(shouldResetSurfaceForSleep("asleep", "awake")).toBe(false);
     expect(shouldShowSurfaceReconnect("asleep")).toBe(true);
     expect(shouldShowSurfaceReconnect("awake")).toBe(false);
-    expect(surfaceNeedsConnection("terminal", null, false)).toBe(true);
-    expect(surfaceNeedsConnection("terminal", 1234, false)).toBe(false);
-    expect(surfaceNeedsConnection("terminal", null, true)).toBe(false);
-    expect(surfaceNeedsConnection("terminal", null, false, true)).toBe(false);
+    expect(surfaceNeedsConnection("terminal", false, false)).toBe(true);
+    expect(surfaceNeedsConnection("terminal", false, false, false, false)).toBe(
+      false,
+    );
+    expect(surfaceNeedsConnection("terminal", true, false)).toBe(false);
+    expect(surfaceNeedsConnection("terminal", false, true)).toBe(false);
+    expect(surfaceNeedsConnection("terminal", false, false, true)).toBe(false);
     expect(
       shouldRetrySurfaceStart({
         invalidated: true,
-        port: null,
+        connected: false,
         sleeping: false,
         tab: "terminal",
       }),
@@ -65,47 +67,35 @@ describe("GUI boundary behavior", () => {
     expect(
       shouldRetrySurfaceStart({
         invalidated: true,
-        port: null,
+        connected: false,
         sleeping: false,
         tab: "terminal",
         failed: true,
       }),
     ).toBe(false);
     expect(
-      shouldShowSurfaceRetry({ port: null, sleeping: false, failed: true }),
+      shouldShowSurfaceRetry({
+        connected: false,
+        sleeping: false,
+        failed: true,
+      }),
     ).toBe(true);
     expect(
-      shouldShowSurfaceRetry({ port: null, sleeping: true, failed: true }),
+      shouldShowSurfaceRetry({
+        connected: false,
+        sleeping: true,
+        failed: true,
+      }),
     ).toBe(false);
     expect(
-      shouldShowSurfaceRetry({ port: null, sleeping: false, failed: false }),
+      shouldShowSurfaceRetry({
+        connected: false,
+        sleeping: false,
+        failed: false,
+      }),
     ).toBe(false);
     expect(preserveSurfaceTabWhileSleeping("asleep")).toBe(true);
     expect(preserveSurfaceTabWhileSleeping("awake")).toBe(false);
-    expect(
-      surfaceLifecycleEventMatches({
-        eventSessionId: "s",
-        eventPort: 1234,
-        currentSessionId: "s",
-        currentPort: 1234,
-      }),
-    ).toBe(true);
-    expect(
-      surfaceLifecycleEventMatches({
-        eventSessionId: "other",
-        eventPort: 1234,
-        currentSessionId: "s",
-        currentPort: 1234,
-      }),
-    ).toBe(false);
-    expect(
-      surfaceLifecycleEventMatches({
-        eventSessionId: "s",
-        eventPort: 1235,
-        currentSessionId: "s",
-        currentPort: 1234,
-      }),
-    ).toBe(false);
   });
 
   it("normalizes persisted permission modes at the frontend boundary", () => {
@@ -443,7 +433,12 @@ describe("GUI boundary behavior", () => {
       '{opened.includes("ide") && panelTab === "ide" && (',
     );
     expect(source).toContain(
-      '<SurfaceView tab="ide" selected={selected} onError={onError} />',
+      `<SurfaceView
+                  tab="ide"
+                  selected={selected}
+                  onError={onError}
+                  visible
+                />`,
     );
     expect(source).not.toContain('<PlannedPane title="Desktop">');
     expect(source).not.toContain('<PlannedPane title="Editor">');
@@ -510,7 +505,25 @@ describe("GUI boundary behavior", () => {
       fileURLToPath(new URL("./App.tsx", import.meta.url)),
       "utf8",
     );
-    expect(source).toContain("ws://127.0.0.1:${port}");
+    expect(source).toContain("command<{\n        url: string;");
+    expect(source).not.toContain("ws://127.0.0.1:");
+    expect(source).not.toContain("surface-ended");
+    expect(source).not.toMatch(
+      /<(?:code|iframe|img)[^>]*(?:\{surfaceUrl\}|(?:src|href|title|aria-label)=\{surfaceUrl\})/,
+    );
+    expect(source).not.toContain('start("cdp"');
+    expect(source).toContain("new WebSocket(surfaceUrl)");
+    expect(source).toContain("new RFB(vncHost.current, surfaceUrl");
+    expect(source).toContain("intentionallyClosed = true");
+    expect(source).toContain("visible={panelTab === item.id}");
+    expect(source).toContain(
+      "surfaceNeedsConnection(\n        tab,\n        Boolean(surfaceUrl),\n        sleeping,\n        surfaceFailed,\n        visible,",
+    );
+    expect(source).toContain(
+      'if (tab !== "browser" || !visible || sleeping) return;',
+    );
+    expect(source).toContain('translate("surfaceDisconnected")');
+    expect(source).toContain("!showSurfaceRetry");
     expect(source).toContain('command<string>("ide_url"');
     expect(source).toContain("Remote IDE workspace is not configured");
     expect(source).not.toContain(
@@ -552,7 +565,7 @@ describe("GUI boundary behavior", () => {
     );
     expect(source).toContain('session.sleep_state === "asleep"');
     expect(source).toContain('translate("sessionAsleep")');
-    expect(source).toContain('command("stop_surface", { port: activePort })');
+    expect(source).not.toContain('command("stop_surface"');
     expect(source).toContain(
       'command("touch_session", { sessionId: selectedId })',
     );
@@ -568,7 +581,8 @@ describe("GUI boundary behavior", () => {
     expect(source).toContain("surfaceUnavailable");
     expect(source).toContain("retrySurface");
     expect(source).toContain("surfaceRetryToken");
-    expect(source).toContain("surface-ended");
+    expect(source).toContain("if (!cancelled && !failed)");
+    expect(source).toContain("!surfaceFailed");
     expect(source).toContain("preserveSurfaceTabWhileSleeping");
     expect(source).toContain("touchSessionActivity");
   });
