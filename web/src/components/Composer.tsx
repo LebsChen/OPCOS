@@ -1385,7 +1385,7 @@ function UsageChip({
               ))}
             </div>
             <div className="mt-2 pt-2 border-t border-line flex items-baseline justify-between text-[11.5px]">
-              <span className="text-faint">{translate("totalInput")}</span>
+              <span className="text-faint">{translate("total")}</span>
               <span className="text-ink tabular-nums">
                 {formatTokens(total)} {translate("tokens")}
               </span>

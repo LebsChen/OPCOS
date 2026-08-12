@@ -182,6 +182,7 @@ const messages: Record<Locale, Record<string, string>> = {
     totalInput: "Total input",
     input: "Input",
     output: "Output",
+    total: "Total",
     customModelContextUnavailable:
       "Context meter unavailable for custom models.",
     sendApprovalsInbox: "Send approvals to Inbox",
@@ -372,6 +373,7 @@ const messages: Record<Locale, Record<string, string>> = {
     totalInput: "输入总量",
     input: "输入",
     output: "输出",
+    total: "总计",
     customModelContextUnavailable: "自定义模型无法提供上下文用量计量。",
     sendApprovalsInbox: "将审批发送到收件箱",
     approvalsQuestionsContinue: "审批和问题会进入收件箱；Agent 将继续工作。",
