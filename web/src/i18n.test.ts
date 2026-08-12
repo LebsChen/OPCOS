@@ -414,6 +414,46 @@ describe("i18n source coverage", () => {
     expect(backendSource).toContain("normalize_provider_model");
   });
 
+  it("translates every provider save and validation error returned to the UI", () => {
+    const backendSource = readFileSync(
+      `${sourceRoot}../../src-tauri/src/main.rs`,
+      "utf8",
+    );
+    const providerSource = [
+      backendSource.slice(
+        backendSource.indexOf("fn provider_descriptor_for"),
+        backendSource.indexOf("fn save_provider_key"),
+      ),
+      backendSource.slice(
+        backendSource.indexOf("fn save_provider_key"),
+        backendSource.indexOf("fn agent_settings"),
+      ),
+      backendSource.slice(
+        backendSource.indexOf("fn save_provider_settings"),
+        backendSource.indexOf("fn main"),
+      ),
+    ].join("\n");
+    const providerErrors = [
+      "provider key is empty",
+      "unknown provider",
+      "provider dialect is unsupported",
+      "provider name is required",
+      "provider base URL is required",
+      "provider model id is required",
+      "provider base URL is invalid",
+      "custom provider id collides with a built-in provider",
+      "provider account id is required",
+      "provider account id is not configured",
+      "provider key is not configured",
+      "provider base URL is not configured",
+      "provider model discovery is unsupported",
+    ];
+    for (const error of providerErrors) {
+      expect(providerSource).toContain(error);
+      expect(translateBackendError(error)).not.toBe(error);
+    }
+  });
+
   it("renders insight fields individually with formatted token usage", () => {
     const appSource = readFileSync(`${sourceRoot}App.tsx`, "utf8");
     expect(appSource).toContain("function formatInsightValue");

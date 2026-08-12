@@ -28902,7 +28902,7 @@ fn save_provider_key(
     project_id: Option<String>,
 ) -> Result<(), String> {
     if key.trim().is_empty() {
-        return Err("provider key cannot be empty".into());
+        return Err("provider key is empty".into());
     }
     let secret_key_value = project_id
         .as_deref()
@@ -29042,13 +29042,19 @@ fn save_custom_provider(
     model: String,
 ) -> Result<String, String> {
     if !matches!(dialect.as_str(), "openai-compatible" | "cloudflare") {
-        return Err("unsupported provider dialect".to_owned());
+        return Err("provider dialect is unsupported".to_owned());
     }
     let name = name.trim();
     let base_url = base_url.trim();
     let model = model.trim();
-    if name.is_empty() || base_url.is_empty() || model.is_empty() {
-        return Err("provider name, base URL, and model are required".to_owned());
+    if name.is_empty() {
+        return Err("provider name is required".to_owned());
+    }
+    if base_url.is_empty() {
+        return Err("provider base URL is required".to_owned());
+    }
+    if model.is_empty() {
+        return Err("provider model id is required".to_owned());
     }
     url::Url::parse(base_url).map_err(|_| "provider base URL is invalid".to_owned())?;
     let provider_id = id.unwrap_or_else(|| format!("custom-{}", Uuid::new_v4().simple()));
@@ -29378,7 +29384,7 @@ fn save_provider_settings(
         Some(
             account_id
                 .filter(|v| !v.trim().is_empty())
-                .ok_or_else(|| "Cloudflare account ID is required".to_owned())?,
+                .ok_or_else(|| "provider account id is required".to_owned())?,
         )
     } else {
         None
@@ -29468,7 +29474,7 @@ fn provider_base_url(
         .filter(|v| !v.trim().is_empty())
         .or(default)
         .map(str::to_owned)
-        .ok_or_else(|| "provider base URL is not configured; enter one in Provider settings".into())
+        .ok_or_else(|| "provider base URL is not configured".into())
 }
 
 #[tauri::command]
@@ -29513,7 +29519,7 @@ async fn validate_provider_key(
                     [],
                     |row| row.get::<_, String>(0),
                 )
-                .map_err(|_| "Cloudflare account ID is not configured".to_owned())?,
+                .map_err(|_| "provider account id is not configured".to_owned())?,
         )
     } else {
         None
@@ -29526,7 +29532,7 @@ async fn validate_provider_key(
         configured_base_url.or(descriptor.default_base_url)
     };
     if provider == "vertex" {
-        return Err("model discovery is unsupported for Vertex AI".into());
+        return Err("provider model discovery is unsupported".into());
     }
     let region = if provider == "bedrock" {
         std::env::var("AWS_REGION").unwrap_or_else(|_| "us-east-1".into())
