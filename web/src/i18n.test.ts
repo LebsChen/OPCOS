@@ -6,6 +6,7 @@ import {
   backendValueKeys,
   messages,
   getLocale,
+  resolveInitialLocale,
   setLocale,
   translateBackendError,
   translateBackendValue,
@@ -57,6 +58,14 @@ const allowlist = [
 ];
 
 describe("structured backend UI messages", () => {
+  it("chooses the system language only when no locale is stored", () => {
+    expect(resolveInitialLocale(null, ["zh-CN", "en-US"])).toBe("zh");
+    expect(resolveInitialLocale(null, ["en-US", "en"])).toBe("en");
+    expect(resolveInitialLocale(null, ["fr-FR", "de"])).toBe("en");
+    expect(resolveInitialLocale("zh", ["en-US"])).toBe("zh");
+    expect(resolveInitialLocale("en", ["zh-CN"])).toBe("en");
+  });
+
   it("translates the normal-flow codes with JSON parameters", () => {
     const previousLocale = getLocale();
     setLocale("zh");
