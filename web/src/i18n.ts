@@ -1,9 +1,25 @@
 export type Locale = "en" | "zh";
 
 const storageKey = "opcos.locale";
+export function resolveInitialLocale(
+  storedLocale: string | null,
+  languages: readonly string[],
+): Locale {
+  if (storedLocale === "zh" || storedLocale === "en") {
+    return storedLocale;
+  }
+  return languages.some((language) => /^zh(?:-|$)/i.test(language))
+    ? "zh"
+    : "en";
+}
+
 const storedLocale =
   typeof localStorage === "undefined" ? null : localStorage.getItem(storageKey);
-let locale: Locale = storedLocale === "zh" ? "zh" : "en";
+const systemLanguages =
+  typeof navigator === "undefined"
+    ? []
+    : [navigator.language, ...(navigator.languages ?? [])];
+let locale: Locale = resolveInitialLocale(storedLocale, systemLanguages);
 const listeners = new Set<() => void>();
 
 export const messages: Record<Locale, Record<string, string>> = {
