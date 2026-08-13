@@ -4091,7 +4091,7 @@ dependencies = [
 
 [[package]]
 name = "opcos"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -4136,7 +4136,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-acp-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -4148,7 +4148,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-assets"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "opcos-policy",
@@ -4163,7 +4163,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-computer-use"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64 0.22.1",
  "png 0.17.16",
@@ -4173,7 +4173,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-engine"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "agent-client-protocol",
  "async-trait",
@@ -4200,7 +4200,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-eval"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4217,7 +4217,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-hosts"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4240,7 +4240,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-lsp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4254,7 +4254,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-mcp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4272,7 +4272,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-mcp-server"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -4284,7 +4284,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-policy"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "serde",
@@ -4294,7 +4294,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-provider"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -4315,7 +4315,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-rvm"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -4335,7 +4335,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "keyring",
@@ -4349,7 +4349,7 @@ dependencies = [
 
 [[package]]
 name = "opcos-trace"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "opcos-store",
  "serde",
